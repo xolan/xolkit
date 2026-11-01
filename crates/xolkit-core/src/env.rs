@@ -180,6 +180,11 @@ impl Env {
         PathBuf::from(program)
     }
 
+    /// Whether `program` is on `PATH`.
+    pub fn has_tool(&self, program: &str) -> bool {
+        self.tool_path(program).is_some()
+    }
+
     /// Where `program` is on `PATH`, if it is.
     fn tool_path(&self, program: &str) -> Option<PathBuf> {
         let path = self.path.clone().or_else(|| std::env::var_os("PATH"))?;

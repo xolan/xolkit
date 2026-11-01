@@ -53,6 +53,20 @@ pub fn registration(env: &Env, provider: Provider, exe: &Path) -> Registration {
     }
 }
 
+/// Whether `provider`'s config has a `xolkit` server entry. Fails when the config can't be read,
+/// so an unreadable file never passes for "no entry".
+pub(crate) fn has_entry(env: &Env, provider: Provider) -> anyhow::Result<bool> {
+    Ok(match provider {
+        Provider::Claude => read_json(&env.claude_json())?["mcpServers"]
+            .get(XOLKIT)
+            .is_some(),
+        Provider::Codex => read_toml(&env.codex_config())?
+            .get("mcp_servers")
+            .and_then(|servers| servers.get(XOLKIT))
+            .is_some(),
+    })
+}
+
 /// Steps that register xolkit with `provider`, replacing an entry that starts another program.
 pub fn register(env: &Env, provider: Provider, exe: &Path) -> Vec<Action> {
     let mut actions = Vec::new();
@@ -99,14 +113,27 @@ pub fn router_is_ours(env: &Env, provider: Provider) -> bool {
         .is_ok_and(|text| text.contains(ROUTER_MARK))
 }
 
+/// Whether the router's folder holds nothing of the user's: it is xolkit's, missing, or empty
+/// but for a write of xolkit's cut short. Only then may xolkit write or remove it.
+fn router_free(env: &Env, provider: Provider) -> bool {
+    let dir = router_dir(env, provider);
+    if !dir.exists() || router_is_ours(env, provider) {
+        return true;
+    }
+    std::fs::read_dir(&dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .all(|e| e.file_name() == ".SKILL.md.xolkit-tmp")
+    })
+}
+
 /// Writes the router skill for `provider`, or removes it when `skill` is `None`. Leaves the file
 /// alone when it already says the same, so the agent's file watcher has nothing to report, and
 /// never touches a skill named `xolkit` that xolkit didn't write.
 pub fn write_router(env: &Env, provider: Provider, skill: Option<&str>) -> anyhow::Result<()> {
     let dir = router_dir(env, provider);
     let path = dir.join("SKILL.md");
-    // A folder without SKILL.md (emptied by a removal cut short) is free to use.
-    if path.exists() && !router_is_ours(env, provider) {
+    if !router_free(env, provider) {
         anyhow::ensure!(
             skill.is_none(),
             "{} holds a skill of your own; rename it to use the router skill",
@@ -150,7 +177,7 @@ pub fn unregister(
         });
     }
     let router = router_dir(env, provider);
-    if router_is_ours(env, provider) || (router.exists() && !router.join("SKILL.md").exists()) {
+    if router.exists() && router_free(env, provider) {
         actions.push(Action::Remove { path: router });
     }
     let run = |args: &[&str], gone: Gone| Action::Undo {
@@ -225,6 +252,27 @@ mod tests {
             registration(&env, Provider::Codex, &exe),
             Registration::Other("/old/xolkit".into())
         );
+    }
+
+    #[test]
+    fn leaves_a_users_own_xolkit_folder_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        let dir = router_dir(&env, Provider::Claude);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.md"), "mine").unwrap();
+        let settings = Settings::default();
+        let lock = Lock::default();
+        let exe = Path::new("/usr/bin/xolkit");
+        // No SKILL.md, but files of the user's: neither removed nor written over.
+        assert!(unregister(&env, Provider::Claude, exe, &lock, &settings).is_empty());
+        assert!(write_router(&env, Provider::Claude, Some("x")).is_err());
+        write_router(&env, Provider::Claude, None).unwrap();
+        assert!(dir.join("notes.md").exists());
+        // An empty leftover is xolkit's to use.
+        fs::remove_file(dir.join("notes.md")).unwrap();
+        write_router(&env, Provider::Claude, Some(ROUTER_MARK)).unwrap();
+        assert!(router_is_ours(&env, Provider::Claude));
     }
 
     #[test]

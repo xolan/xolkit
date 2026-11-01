@@ -426,18 +426,28 @@ pub fn native_install(
 pub fn native_toggle(plugin: &Plugin, provider: Provider, enabled: bool) -> Action {
     let id = native_id(plugin);
     match provider {
-        Provider::Claude => Action::Run {
-            provider,
-            args: vec![
-                "plugin".into(),
-                if enabled { "enable" } else { "disable" }.into(),
-                id,
-                "--scope".into(),
-                "user".into(),
-            ],
-        },
+        Provider::Claude => Action::SetClaudePlugin { id, enabled },
         Provider::Codex => Action::SetCodexPlugin { id, enabled },
     }
+}
+
+/// Whether `provider` has plugin `id` installed (at user scope, for Claude Code), and if so,
+/// whether it is on: `None` when it isn't installed. Fails when the agent's list can't be read
+/// in full, so a partial answer never passes for "not installed".
+pub(crate) fn native_state(env: &Env, provider: Provider, id: &str) -> Result<Option<bool>> {
+    let args = ["plugin", "list", "--json"].map(String::from);
+    let list: Value = serde_json::from_str(&env.run(provider.cli(), &args)?)
+        .context("the agent's plugin list isn't valid JSON")?;
+    let (entries, key) = match provider {
+        Provider::Claude => (list.as_array(), "id"),
+        // Codex lists what it offers under `available`; only `installed` counts.
+        Provider::Codex => (list["installed"].as_array(), "pluginId"),
+    };
+    let entries = entries.context("unexpected plugin list from the agent")?;
+    let entry = entries
+        .iter()
+        .find(|e| e[key] == id && (provider == Provider::Codex || e["scope"] == "user"));
+    Ok(entry.map(|e| e["enabled"].as_bool().unwrap_or(true)))
 }
 
 /// Steps that uninstall a native plugin from `provider`, and take xolkit's marketplace out of

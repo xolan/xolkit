@@ -69,6 +69,12 @@ pub enum Action {
         provider: Provider,
         args: Vec<String>,
     },
+    /// Turns a plugin on or off in Claude Code. Claude refuses to turn on what is on already, so
+    /// a failure counts as done when the plugin is as wanted, or no longer installed.
+    SetClaudePlugin {
+        id: String,
+        enabled: bool,
+    },
     /// Runs an agent's tool to take something out. A failure counts as done when the agent no
     /// longer has `gone`: it was removed there already, which mustn't block removing it here.
     Undo {
@@ -91,17 +97,19 @@ pub enum Gone {
 }
 
 impl Gone {
+    /// Whether the agent no longer has it. Only a clear answer counts: a config or listing that
+    /// can't be read means "maybe not".
     fn is_gone(&self, env: &Env, provider: Provider) -> bool {
+        // Without the agent's tool nothing can be taken out through it, and an agent that is
+        // gone doesn't run what's left.
+        if !env.has_tool(provider.cli()) {
+            return true;
+        }
         match self {
-            Gone::McpEntry => {
-                crate::registration(env, provider, Path::new("")) == crate::Registration::Missing
+            Gone::McpEntry => crate::registration::has_entry(env, provider).is_ok_and(|has| !has),
+            Gone::Plugin { id } => {
+                crate::marketplace::native_state(env, provider, id).is_ok_and(|s| s.is_none())
             }
-            Gone::Plugin { id } => env
-                .run(
-                    provider.cli(),
-                    &["plugin".into(), "list".into(), "--json".into()],
-                )
-                .is_ok_and(|list| !list.contains(&format!("\"{id}\""))),
             Gone::Marketplace => true,
         }
     }
@@ -154,6 +162,9 @@ impl Action {
                 format!("Remove server {name} from {}", show(&env.servers_file()))
             }
             Action::SaveSettings { .. } => format!("Save {}", show(&env.settings_file())),
+            Action::SetClaudePlugin { id, enabled } => {
+                format!("Turn {} plugin {id} in Claude Code", on_off(enabled))
+            }
             Action::SetCodexPlugin { id, enabled } => format!(
                 "Turn {} plugin {id} in {}",
                 on_off(enabled),
@@ -244,6 +255,20 @@ fn run(env: &Env, action: &Action) -> Result<()> {
             Ok(())
         }),
         Action::Run { provider, args } => env.run(provider.cli(), args).map(drop),
+        Action::SetClaudePlugin { id, enabled } => {
+            let verb = if *enabled { "enable" } else { "disable" };
+            let args = ["plugin", verb, id, "--scope", "user"].map(String::from);
+            match env.run(Provider::Claude.cli(), &args) {
+                Ok(_) => Ok(()),
+                Err(_)
+                    if crate::marketplace::native_state(env, Provider::Claude, id)
+                        .is_ok_and(|state| state.is_none_or(|on| on == *enabled)) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        }
         Action::Undo {
             provider,
             args,
