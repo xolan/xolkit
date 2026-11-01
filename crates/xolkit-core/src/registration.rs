@@ -73,7 +73,7 @@ fn remove_entry(provider: Provider) -> Action {
         Provider::Claude => &["mcp", "remove", "--scope", "user", XOLKIT],
         Provider::Codex => &["mcp", "remove", XOLKIT],
     };
-    Action::Run {
+    Action::Undo {
         provider,
         args: args.iter().map(|a| (*a).to_owned()).collect(),
     }
@@ -88,11 +88,29 @@ pub(crate) fn router_dir(env: &Env, provider: Provider) -> PathBuf {
     .join(XOLKIT)
 }
 
+/// Marks a router skill as xolkit's, so a skill of the user's own named `xolkit` is left alone.
+pub(crate) const ROUTER_MARK: &str = "This skill is written by xolkit";
+
+/// Whether the router skill in `provider`'s folder is one xolkit wrote.
+pub fn router_is_ours(env: &Env, provider: Provider) -> bool {
+    std::fs::read_to_string(router_dir(env, provider).join("SKILL.md"))
+        .is_ok_and(|text| text.contains(ROUTER_MARK))
+}
+
 /// Writes the router skill for `provider`, or removes it when `skill` is `None`. Leaves the file
-/// alone when it already says the same, so the agent's file watcher has nothing to report.
+/// alone when it already says the same, so the agent's file watcher has nothing to report, and
+/// never touches a skill named `xolkit` that xolkit didn't write.
 pub fn write_router(env: &Env, provider: Provider, skill: Option<&str>) -> anyhow::Result<()> {
     let dir = router_dir(env, provider);
     let path = dir.join("SKILL.md");
+    if dir.exists() && !router_is_ours(env, provider) {
+        anyhow::ensure!(
+            skill.is_none(),
+            "{} holds a skill of your own; rename it to use the router skill",
+            env.tilde(&dir)
+        );
+        return Ok(());
+    }
     match skill {
         Some(text) => {
             if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
@@ -129,10 +147,10 @@ pub fn unregister(
         });
     }
     let router = router_dir(env, provider);
-    if router.exists() {
+    if router_is_ours(env, provider) {
         actions.push(Action::Remove { path: router });
     }
-    let run = |args: &[&str]| Action::Run {
+    let run = |args: &[&str]| Action::Undo {
         provider,
         args: args.iter().map(|a| (*a).to_owned()).collect(),
     };
@@ -207,7 +225,9 @@ mod tests {
         let env = Env::at(home.path());
         let exe = Path::new("/usr/bin/xolkit");
         let line = |a: &Action| match a {
-            Action::Run { provider, args } => format!("{} {}", provider.cli(), args.join(" ")),
+            Action::Run { provider, args } | Action::Undo { provider, args } => {
+                format!("{} {}", provider.cli(), args.join(" "))
+            }
             other => format!("{other:?}"),
         };
         let claude: Vec<_> = register(&env, Provider::Claude, exe)
@@ -243,6 +263,11 @@ mod tests {
         let env = Env::at(home.path());
         let exe = Path::new("/usr/bin/xolkit");
         fs::create_dir_all(router_dir(&env, Provider::Claude)).unwrap();
+        fs::write(
+            router_dir(&env, Provider::Claude).join("SKILL.md"),
+            format!("---\nname: xolkit\n---\n{ROUTER_MARK}\n"),
+        )
+        .unwrap();
         fs::write(
             env.claude_json(),
             r#"{"mcpServers": {"xolkit": {"command": "x"}}}"#,

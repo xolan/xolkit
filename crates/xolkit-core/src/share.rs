@@ -124,7 +124,13 @@ impl Shared {
         }
         for plugin in &library.plugins {
             let on = agents_on(profile.plugins.get(&plugin.id));
-            let Some(pin) = library.lock.plugins.get(&plugin.id) else {
+            // A plugin placed by hand has no source to share.
+            let Some(pin) = library
+                .lock
+                .plugins
+                .get(&plugin.id)
+                .filter(|p| !p.pin.source.is_empty())
+            else {
                 continue;
             };
             if on.is_empty() {
@@ -181,6 +187,10 @@ impl Shared {
         for (name, item, valid) in skills.chain(plugins) {
             // Names become folder names and command arguments.
             ensure!(valid, "unsafe name in the profile: {name}");
+            ensure!(
+                !item.is_local() || self.skills.contains_key(name.as_str()),
+                "the profile's plugin {name} has no source"
+            );
             if !item.is_local() {
                 crate::discover::check_source(&item.source)?;
                 ensure!(

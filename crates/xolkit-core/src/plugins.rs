@@ -107,8 +107,19 @@ fn manifest_paths(dir: &Path, value: &Value) -> Vec<PathBuf> {
         Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
     };
+    // Only paths inside the plugin: "/" or "../.." would have xolkit read the whole disk, or
+    // the user's own files.
     list.into_iter()
-        .map(|p| dir.join(p.trim_start_matches("./")))
+        .map(Path::new)
+        .filter(|p| {
+            p.components().all(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        })
+        .map(|p| dir.join(p))
         .collect()
 }
 
@@ -277,6 +288,16 @@ mod tests {
             Some(format!("{}/bin/tool", dir.display()).as_str())
         );
         assert!(!plugin.needs_native());
+    }
+
+    #[test]
+    fn manifest_paths_stay_inside_the_plugin() {
+        let dir = Path::new("/p");
+        let paths = manifest_paths(
+            dir,
+            &serde_json::json!(["./extra", "/", "../x", "a/../../b", "more/cmds"]),
+        );
+        assert_eq!(paths, [dir.join("./extra"), dir.join("more/cmds")]);
     }
 
     #[test]

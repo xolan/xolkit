@@ -26,8 +26,21 @@ use crate::settings;
 
 /// Most steps the switch dialog lists.
 const MAX_STEPS: usize = 14;
-/// Most lines the import dialog lists.
-const MAX_PREVIEW: usize = 24;
+/// Most skill and plugin lines the import dialog lists.
+const MAX_PREVIEW: usize = 16;
+/// Most detail lines the import dialog lists under one server.
+const MAX_DETAILS: usize = 4;
+/// Longest quoted value the import dialog shows.
+const MAX_VALUE: usize = 120;
+
+/// `text` quoted, with control characters escaped, and shortened to `MAX_VALUE` characters.
+fn quoted(text: &str) -> String {
+    let mut short: String = text.chars().take(MAX_VALUE).collect();
+    if text.chars().count() > MAX_VALUE {
+        short.push('…');
+    }
+    format!("{short:?}")
+}
 
 /// A profile on its way in: from a code, or from a file with its local skills unpacked.
 #[derive(Clone)]
@@ -442,37 +455,49 @@ impl Shelf {
     fn preview_import(&mut self, incoming: Incoming, window: &mut Window, cx: &mut Context<Self>) {
         let shared = &incoming.shared;
         let library = &self.library;
-        // Servers first: they run commands, so they must not scroll out of view. Values are
-        // quoted, so a newline in one can't pass for another line.
+        // Every server, first: they run commands, so none may be cut off. Each one's details, and
+        // the skills and plugins after, are capped. Everything typed by the sharer is quoted and
+        // shortened, so no value can pass for another line or push the rest out of view.
         let mut lines: Vec<String> = Vec::new();
         for (name, server) in &shared.servers {
             if library.servers.contains_key(name) {
                 lines.push(format!("Server {name}: kept as you have it"));
                 continue;
             }
-            // Everything the server would run with, so nothing hides in its environment.
             let config = &server.config;
-            lines.push(format!("Server {name}: add {:?}", config.summary()));
+            lines.push(format!("Server {name}: add {}", quoted(&config.summary())));
             let plain = if config.is_remote() {
                 &config.headers
             } else {
                 &config.env
             };
-            for (key, value) in plain {
-                lines.push(format!("    {key} = {value:?}"));
-            }
+            let mut details: Vec<String> = plain
+                .iter()
+                .map(|(key, value)| format!("    {} = {}", quoted(key), quoted(value)))
+                .collect();
             if let Some(cwd) = &config.cwd {
-                lines.push(format!("    in the folder {:?}", cwd.display().to_string()));
-            }
-            if !config.secrets.is_empty() {
-                lines.push(format!(
-                    "    then save {} under MCP servers",
-                    config.secrets.join(", ")
+                details.push(format!(
+                    "    in the folder {}",
+                    quoted(&cwd.display().to_string())
                 ));
             }
+            if !config.secrets.is_empty() {
+                let keys: Vec<String> = config.secrets.iter().map(|k| quoted(k)).collect();
+                details.push(format!(
+                    "    then save {} under MCP servers",
+                    keys.join(", ")
+                ));
+            }
+            if details.len() > MAX_DETAILS {
+                let more = details.len() - MAX_DETAILS;
+                details.truncate(MAX_DETAILS);
+                details.push(format!("    …and {more} more"));
+            }
+            lines.extend(details);
         }
+        let mut rest: Vec<String> = Vec::new();
         for (name, item) in &shared.skills {
-            let line = if library.skill(name).is_some() {
+            rest.push(if library.skill(name).is_some() {
                 format!("Skill {name}: installed already")
             } else if item.is_local() {
                 match incoming.staged {
@@ -487,22 +512,30 @@ impl Shelf {
                 } else {
                     format!("{}/{}", item.source, item.folder)
                 };
-                format!("Skill {name}: download {place} at {}", item.commit)
-            };
-            lines.push(line);
-        }
-        for (id, item) in &shared.plugins {
-            lines.push(if library.plugin(id).is_some() {
-                format!("Plugin {id}: installed already")
-            } else {
-                format!("Plugin {id}: download {} at {}", item.source, item.commit)
+                format!(
+                    "Skill {name}: download {} at {}",
+                    quoted(&place),
+                    item.commit
+                )
             });
         }
-        if lines.len() > MAX_PREVIEW {
-            let more = lines.len() - MAX_PREVIEW;
-            lines.truncate(MAX_PREVIEW);
-            lines.push(format!("…and {more} more"));
+        for (id, item) in &shared.plugins {
+            rest.push(if library.plugin(id).is_some() {
+                format!("Plugin {id}: installed already")
+            } else {
+                format!(
+                    "Plugin {id}: download {} at {}",
+                    quoted(&item.source),
+                    item.commit
+                )
+            });
         }
+        if rest.len() > MAX_PREVIEW {
+            let more = rest.len() - MAX_PREVIEW;
+            rest.truncate(MAX_PREVIEW);
+            rest.push(format!("…and {more} more"));
+        }
+        lines.extend(rest);
 
         let name = self.settings().free_name(&shared.name);
         let title = format!("Import “{name}”?");
@@ -519,6 +552,9 @@ impl Shelf {
                         .child("It is added as a new profile. Downloads come from GitHub, pinned to the commits listed; review what you don't know.")
                         .child(
                             v_flex()
+                                .id("import-preview")
+                                .max_h(px(360.))
+                                .overflow_y_scroll()
                                 .gap_1()
                                 .p_2()
                                 .rounded(theme.radius)
@@ -863,8 +899,9 @@ impl Shelf {
                             .child(section("Share"))
                             .child(div().text_sm().text_color(muted).child(
                                 "A code or link lists where each skill and plugin comes from, \
-                                 never their files or your secrets. A file also carries skills \
-                                 that exist only on this computer.",
+                                 never their files or your secrets. Server settings not saved as \
+                                 secrets are shared as typed. A file also carries skills that \
+                                 exist only on this computer.",
                             ))
                             .child(share)
                             .child(divider(cx))

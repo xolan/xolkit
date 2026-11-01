@@ -151,6 +151,11 @@ pub(crate) fn connect_or_start_blocking(env: &Env, exe: &Path) -> Result<Stream>
 /// Starts `exe daemon` on its own: no terminal, and it outlives whoever started it.
 fn start(exe: &Path) -> Result<()> {
     let mut command = Command::new(exe);
+    // From home, not the folder of whichever session started it; nothing of a project's leaks
+    // into the daemon, and on Windows the project's folder isn't kept open.
+    if let Some(home) = std::env::home_dir() {
+        command.current_dir(home);
+    }
     command
         .arg("daemon")
         .stdin(Stdio::null())

@@ -499,19 +499,21 @@ pub(crate) fn extract(
     Ok(files)
 }
 
-/// Whether Windows can store a file named `name` as it is; elsewhere every name is fine. Windows
-/// would fail on the others halfway through, or worse: `C:` or `name:stream` lead out of the
-/// folder or into a hidden stream, and a trailing dot or space is dropped, so `SKILL.md.` would
-/// overwrite `SKILL.md`.
+/// Whether this computer can store a file named `name` as it is: on Windows, whether
+/// [`windows_storable`] is; elsewhere every name is fine.
 fn storable(name: &str) -> bool {
+    !cfg!(windows) || windows_storable(name)
+}
+
+/// Whether Windows can store a file named `name` as it is. Windows would fail on the others
+/// halfway through, or worse: `C:` or `name:stream` lead out of the folder or into a hidden
+/// stream, and a trailing dot or space is dropped, so `SKILL.md.` would overwrite `SKILL.md`.
+fn windows_storable(name: &str) -> bool {
     const DEVICES: &[&str] = &[
         "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3", "COM4",
         "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT0", "LPT1", "LPT2",
         "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
     ];
-    if !cfg!(windows) {
-        return true;
-    }
     // Device names are taken with any extension too (`nul.txt`) on Windows 10.
     let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
     !name.ends_with(['.', ' '])
@@ -529,7 +531,8 @@ pub(crate) fn valid_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-        && storable(name)
+        // On every system, so what is shared from one installs on all of them.
+        && windows_storable(name)
 }
 
 /// `name@marketplace`, both safe names.

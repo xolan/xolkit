@@ -69,6 +69,12 @@ pub enum Action {
         provider: Provider,
         args: Vec<String>,
     },
+    /// Runs an agent's tool to take something out, and goes on if it fails: it may already be
+    /// gone from the agent, and that mustn't block removing it from xolkit.
+    Undo {
+        provider: Provider,
+        args: Vec<String>,
+    },
 }
 
 impl Action {
@@ -130,6 +136,11 @@ impl Action {
             Action::Run { provider, args } => {
                 format!("Run `{} {}`", provider.cli(), args.join(" "))
             }
+            Action::Undo { provider, args } => format!(
+                "Run `{} {}`, if it's still there",
+                provider.cli(),
+                args.join(" ")
+            ),
         }
     }
 }
@@ -203,6 +214,10 @@ fn run(env: &Env, action: &Action) -> Result<()> {
             Ok(())
         }),
         Action::Run { provider, args } => env.run(provider.cli(), args).map(drop),
+        Action::Undo { provider, args } => {
+            let _ = env.run(provider.cli(), args);
+            Ok(())
+        }
     }
 }
 

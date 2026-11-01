@@ -18,14 +18,22 @@ pub struct Library {
     pub servers: BTreeMap<String, ServerConfig>,
     pub lock: Lock,
     pub settings: Settings,
+    /// Servers in `servers.toml` whose names can't be used, left out.
+    pub ignored_servers: Vec<String>,
 }
 
 impl Library {
     pub fn load(env: &Env) -> Result<Library> {
+        // A name typed into servers.toml by hand may not split back out of `<server>__<tool>`.
+        let (servers, ignored): (BTreeMap<_, _>, BTreeMap<_, _>) =
+            read_servers(&env.servers_file())?
+                .into_iter()
+                .partition(|(name, _)| valid_server_name(name));
         Ok(Library {
+            ignored_servers: ignored.into_keys().collect(),
             skills: scan_skills(&env.skills_dir()),
             plugins: scan_plugins(&env.plugins_dir()),
-            servers: read_servers(&env.servers_file())?,
+            servers,
             lock: Lock::read(&env.lock_file())?,
             settings: Settings::load(&env.settings_file())?,
         })

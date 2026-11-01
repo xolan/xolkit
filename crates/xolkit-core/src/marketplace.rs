@@ -443,7 +443,7 @@ pub fn native_toggle(plugin: &Plugin, provider: Provider, enabled: bool) -> Acti
 /// the agent when it was the last.
 fn native_uninstall(env: &Env, lock: &Lock, plugin: &Plugin, provider: Provider) -> Vec<Action> {
     let id = native_id(plugin);
-    let run = |args: &[&str]| Action::Run {
+    let run = |args: &[&str]| Action::Undo {
         provider,
         args: args.iter().map(|a| (*a).to_owned()).collect(),
     };
@@ -583,7 +583,7 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::Run { provider, args } => {
+                Action::Run { provider, args } | Action::Undo { provider, args } => {
                     Some(format!("{} {}", provider.cli(), args.join(" ")))
                 }
                 _ => None,
@@ -609,7 +609,7 @@ mod tests {
         // Only the plugin's files and the marketplace listing are written; no agent runs here.
         let local: Vec<Action> = claude
             .iter()
-            .filter(|a| !matches!(a, Action::Run { .. }))
+            .filter(|a| !matches!(a, Action::Run { .. } | Action::Undo { .. }))
             .cloned()
             .collect();
         crate::execute(&env, &local).unwrap();

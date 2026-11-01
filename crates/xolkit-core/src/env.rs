@@ -207,41 +207,52 @@ impl Env {
 
 /// How long an agent's tool may run before it counts as hung and is stopped.
 const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// How long to wait for a pipe to close once the process exited: a helper it left running can
+/// hold the pipe open for good.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A pipe read on its own thread into a buffer, so a full pipe never stalls the process, and
+/// whatever arrived can be taken without waiting for the pipe to close.
+struct Drain {
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl Drain {
+    fn new(pipe: Option<impl std::io::Read + Send + 'static>) -> Drain {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sender, done) = std::sync::mpsc::channel();
+        let filling = buffer.clone();
+        std::thread::spawn(move || {
+            if let Some(mut pipe) = pipe {
+                let mut chunk = [0; 8192];
+                while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                    filling.lock().unwrap().extend_from_slice(&chunk[..n]);
+                }
+            }
+            let _ = sender.send(());
+        });
+        Drain { buffer, done }
+    }
+
+    /// What was read, once the pipe closes or `grace` passes.
+    fn take(self, grace: std::time::Duration) -> Vec<u8> {
+        let _ = self.done.recv_timeout(grace);
+        std::mem::take(&mut *self.buffer.lock().unwrap())
+    }
+}
 
 /// Runs `command` to the end and collects its output, killing it after `timeout`.
 fn output_within(
     mut command: Command,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output> {
-    use std::io::Read;
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    // Read both pipes on their own threads, so a full pipe never stalls the child.
-    let read = |pipe: Option<Box<dyn Read + Send>>| {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut out = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut out);
-            }
-            let _ = sender.send(out);
-        });
-        receiver
-    };
-    let stdout = read(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let stderr = read(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
+    let stdout = Drain::new(child.stdout.take());
+    let stderr = Drain::new(child.stderr.take());
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -257,15 +268,10 @@ fn output_within(
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    // A helper the tool left running can hold the pipes open; don't wait for it past a moment.
-    let collect = |pipe: std::sync::mpsc::Receiver<Vec<u8>>| {
-        pipe.recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap_or_default()
-    };
     Ok(std::process::Output {
         status,
-        stdout: collect(stdout),
-        stderr: collect(stderr),
+        stdout: stdout.take(DRAIN_GRACE),
+        stderr: stderr.take(DRAIN_GRACE),
     })
 }
 
@@ -319,17 +325,18 @@ fn login_shell_path() -> Option<OsString> {
         });
     }
     let mut child = command.spawn().ok()?;
-    // shortcut: `env` output over the pipe buffer (64 KiB) stalls until the timeout; read it on a thread if that happens.
+    let stdout = Drain::new(child.stdout.take());
     let deadline = Instant::now() + Duration::from_secs(5);
     while child.try_wait().ok()?.is_none() {
         if Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             return None;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let output = child.wait_with_output().ok()?;
-    String::from_utf8_lossy(&output.stdout)
+    let output = stdout.take(DRAIN_GRACE);
+    String::from_utf8_lossy(&output)
         .lines()
         .find_map(|line| line.strip_prefix("PATH="))
         .map(OsString::from)

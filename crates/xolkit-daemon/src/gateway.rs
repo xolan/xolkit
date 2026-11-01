@@ -271,9 +271,9 @@ impl Gateway {
                     command.env("PATH", path);
                 }
                 command.args(&config.args).envs(&config.env);
-                if let Some(cwd) = &config.cwd {
-                    command.current_dir(cwd);
-                }
+                // From home unless the server says otherwise: not from whichever project's
+                // session happened to start the daemon, which could put its own `npx` first.
+                command.current_dir(config.cwd.as_deref().unwrap_or(&self.env.home));
                 #[cfg(windows)]
                 command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
                 let (transport, stderr) = TokioChildProcess::builder(command)
@@ -304,16 +304,22 @@ impl Gateway {
     }
 
     async fn refresh_tools(&self, name: &str) {
-        let service = {
+        let (service, generation) = {
             let connections = self.connections.lock().unwrap();
-            connections.get(name).and_then(|c| c.service.clone())
+            match connections.get(name) {
+                Some(c) => (c.service.clone(), c.generation),
+                None => return,
+            }
         };
         let Some(service) = service else {
             return;
         };
         match service.list_all_tools().await {
             Ok(tools) => {
-                if let Some(c) = self.connections.lock().unwrap().get_mut(name) {
+                // Only for the connection that asked: it may have been stopped or replaced since.
+                if let Some(c) = self.connections.lock().unwrap().get_mut(name)
+                    && c.generation == generation
+                {
                     c.tools = tools;
                 }
                 (self.notify)(Notice::ToolsChanged);

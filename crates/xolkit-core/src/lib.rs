@@ -36,7 +36,9 @@ pub use marketplace::{
 pub use ops::{Action, execute};
 pub use plugins::{Command, Parts, Plugin};
 pub use profiles::{Kind, Profile, States};
-pub use registration::{Registration, register, registration, unregister, write_router};
+pub use registration::{
+    Registration, register, registration, router_is_ours, unregister, write_router,
+};
 pub use secrets::{GITHUB_TOKEN, get_secret, set_secret};
 pub use servers::{
     Server, ServerConfig, XOLKIT, agent_servers, read_servers, secret_key, valid_server_name,

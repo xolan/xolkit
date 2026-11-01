@@ -41,6 +41,16 @@ pub fn catalogue(library: &Library, agent: Agent) -> Catalogue {
         }
     }
     for plugin in &library.plugins {
+        // Two plugins of one name from different marketplaces get the marketplace in theirs.
+        let shared_name = library
+            .plugins
+            .iter()
+            .any(|p| p.name == plugin.name && p.id != plugin.id);
+        let prefix = if shared_name {
+            format!("{}@{}", plugin.name, plugin.marketplace)
+        } else {
+            plugin.name.clone()
+        };
         let native = agent
             .provider()
             .is_some_and(|p| library.lock.native(&plugin.id).contains(&p));
@@ -49,13 +59,13 @@ pub fn catalogue(library: &Library, agent: Agent) -> Catalogue {
         }
         for skill in &plugin.parts.skills {
             catalogue.skills.push(Skill {
-                name: format!("{}:{}", plugin.name, skill.name),
+                name: format!("{prefix}:{}", skill.name),
                 ..skill.clone()
             });
         }
         for command in &plugin.parts.commands {
             catalogue.commands.push(Command {
-                name: format!("{}:{}", plugin.name, command.name),
+                name: format!("{prefix}:{}", command.name),
                 ..command.clone()
             });
         }

@@ -76,10 +76,16 @@ pub fn names(cx: &App) -> Vec<(SharedString, ThemeMode)> {
 
 /// Applies a theme and remembers it for the next start.
 pub fn select(name: &str, cx: &mut App) {
-    if apply(name, cx) {
-        let mut saved = settings::load(cx);
-        saved.set("theme", name);
-        settings::save_in_background(saved, cx);
+    if !apply(name, cx) {
+        return;
+    }
+    // An unreadable settings file stays as it is rather than being replaced by defaults.
+    match xolkit_core::Settings::load(&settings::store(cx).env.settings_file()) {
+        Ok(mut saved) => {
+            saved.set("theme", name);
+            settings::save_in_background(saved, cx);
+        }
+        Err(e) => eprintln!("xolkit: not saving the theme: {e:#}"),
     }
 }
 

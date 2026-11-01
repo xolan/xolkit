@@ -16,8 +16,8 @@ use rmcp::ServiceExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::sync::watch;
 use xolkit_core::{
-    Agent, Catalogue, Env, Library, Provider, catalogue, execute, router_skill, set_secret,
-    write_router,
+    Agent, Catalogue, Env, Library, Provider, catalogue, execute, router_is_ours, router_skill,
+    set_secret, write_router,
 };
 
 use crate::gateway::{Gateway, Notice};
@@ -25,8 +25,8 @@ use crate::ipc;
 use crate::protocol::{Event, Hello, Request, Response, SessionStatus, Status, now};
 use crate::session::{SEPARATOR, Session};
 
-/// Most files of one plugin the watcher looks at.
-const MAX_WATCHED: usize = 2000;
+/// Most plugin files the watcher looks at, all plugins together.
+const MAX_WATCHED: usize = 5000;
 /// Largest `daemon.log` before it starts over.
 const MAX_LOG: u64 = 5 * 1024 * 1024;
 /// Events kept for the Connections page.
@@ -228,6 +228,13 @@ impl Daemon {
             return;
         }
         let library = self.library();
+        for name in &library.ignored_servers {
+            self.event(
+                "daemon",
+                format!("left out the server {name}: use letters, digits, - and _, without __ or a _ at either end"),
+                true,
+            );
+        }
         let mut wanted = Vec::new();
         for agent in Agent::ALL {
             for server in catalogue(&library, agent).servers {
@@ -289,7 +296,11 @@ impl Daemon {
                     .context("the change stopped unexpectedly")
                     .and_then(|r| r);
                 self.reload();
-                done
+                // Saved, but if the library can't be read, nothing of it takes effect; say so.
+                done.and_then(|()| match Library::load(&self.env) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e.context("saved, but the library can't be read")),
+                })
             }
             Request::SetSecret { key, value } => {
                 let done = tokio::task::spawn_blocking(move || set_secret(&key, value.as_deref()))
@@ -467,16 +478,6 @@ fn rotate_log(env: &Env) -> Option<std::fs::File> {
         .ok()
 }
 
-/// Whether the router skill in `provider`'s folder is one xolkit wrote, so it may be removed.
-fn router_is_ours(env: &Env, provider: Provider) -> bool {
-    let dir = match provider {
-        Provider::Claude => env.claude_skills(),
-        Provider::Codex => env.codex_skills(),
-    };
-    std::fs::read_to_string(dir.join(xolkit_core::XOLKIT).join("SKILL.md"))
-        .is_ok_and(|text| text.contains("This skill is written by xolkit"))
-}
-
 /// The modification times of everything the library is read from.
 fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
     let mtime = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
@@ -500,22 +501,21 @@ fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
     for skill in folders(&env.skills_dir()) {
         times.extend([mtime(&skill), mtime(&skill.join("SKILL.md"))]);
     }
-    // Every file of every plugin, as its manifest may point anywhere inside it. Plugins are
-    // small; the cap keeps a huge one from making each look slow.
-    for plugin in folders(&env.plugins_dir()) {
-        let mut stack = vec![plugin];
-        let mut seen = 0;
-        while let Some(dir) = stack.pop() {
-            for entry in folders(&dir) {
-                seen += 1;
-                if seen > MAX_WATCHED {
-                    break;
-                }
-                times.push(mtime(&entry));
-                if entry.is_dir() {
-                    stack.push(entry);
-                }
-            }
+    // Every file of every plugin, as its manifest may point anywhere inside it. The cap is for
+    // all plugins together, and dependency and Git folders are skipped.
+    let mut stack = folders(&env.plugins_dir());
+    let mut seen = 0;
+    while let Some(entry) = stack.pop() {
+        seen += 1;
+        if seen > MAX_WATCHED {
+            break;
+        }
+        times.push(mtime(&entry));
+        let skip = entry
+            .file_name()
+            .is_some_and(|n| n == "node_modules" || n == ".git");
+        if entry.is_dir() && !skip {
+            stack.extend(folders(&entry));
         }
     }
     times
@@ -540,7 +540,13 @@ pub async fn run(env: Env) -> Result<()> {
         let daemon = daemon.clone();
         let env = env.clone();
         tokio::spawn(async move {
-            let mut last = fingerprint(&env);
+            let look = |env: Env| async move {
+                // Many stat calls; keep them off the async workers.
+                tokio::task::spawn_blocking(move || fingerprint(&env))
+                    .await
+                    .unwrap_or_default()
+            };
+            let mut last = look(env.clone()).await;
             loop {
                 tokio::time::sleep(WATCH_INTERVAL).await;
                 daemon.gateway().reap();
@@ -548,7 +554,7 @@ pub async fn run(env: Env) -> Result<()> {
                 let Ok(_idle) = daemon.executing.try_lock() else {
                     continue;
                 };
-                let now = fingerprint(&env);
+                let now = look(env.clone()).await;
                 if now != last {
                     last = now;
                     daemon.reload();
