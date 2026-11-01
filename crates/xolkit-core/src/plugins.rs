@@ -271,9 +271,10 @@ mod tests {
             "Review main.rs carefully.\n"
         );
         let tool = &plugin.parts.servers["tool"];
+        // The plugin's own `/` stays, after the folder in the platform's separators.
         assert_eq!(
             tool.command.as_deref(),
-            Some(dir.join("bin/tool").to_str().unwrap())
+            Some(format!("{}/bin/tool", dir.display()).as_str())
         );
         assert!(!plugin.needs_native());
     }
