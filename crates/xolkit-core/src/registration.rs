@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{read_json, read_toml};
 use crate::lock::Lock;
 use crate::marketplace::MARKETPLACE;
-use crate::{Action, Env, Provider, XOLKIT};
+use crate::{Action, Env, Provider, Settings, XOLKIT};
 
 /// How xolkit is registered with an agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,11 +108,25 @@ pub fn write_router(env: &Env, provider: Provider, skill: Option<&str>) -> anyho
 }
 
 /// Steps that take everything xolkit wrote out of `provider`: its MCP server entry, the router
-/// skill, and the plugins it installed natively, with xolkit's marketplace.
-pub fn unregister(env: &Env, provider: Provider, exe: &Path, lock: &Lock) -> Vec<Action> {
+/// skill (turned off first, so the daemon doesn't write it again), and the plugins it installed
+/// natively, with xolkit's marketplace.
+pub fn unregister(
+    env: &Env,
+    provider: Provider,
+    exe: &Path,
+    lock: &Lock,
+    settings: &Settings,
+) -> Vec<Action> {
     let mut actions = Vec::new();
     if registration(env, provider, exe) != Registration::Missing {
         actions.push(remove_entry(provider));
+    }
+    if settings.router.contains(&provider) {
+        let mut settings = settings.clone();
+        settings.router.retain(|p| *p != provider);
+        actions.push(Action::SaveSettings {
+            settings: Box::new(settings),
+        });
     }
     let router = router_dir(env, provider);
     if router.exists() {
@@ -242,14 +256,22 @@ mod tests {
                 ..PluginPin::default()
             },
         );
-        let actions = unregister(&env, Provider::Claude, exe, &lock);
-        assert_eq!(actions.len(), 5, "{actions:?}");
+        let settings = Settings {
+            router: vec![Provider::Claude],
+            ..Settings::default()
+        };
+        let actions = unregister(&env, Provider::Claude, exe, &lock, &settings);
+        assert_eq!(actions.len(), 6, "{actions:?}");
+        let Action::SaveSettings { settings: saved } = &actions[1] else {
+            panic!("{actions:?}");
+        };
+        assert!(saved.router.is_empty());
         assert_eq!(
-            actions[1],
+            actions[2],
             Action::Remove {
                 path: router_dir(&env, Provider::Claude)
             }
         );
-        assert!(unregister(&env, Provider::Codex, exe, &lock).is_empty());
+        assert!(unregister(&env, Provider::Codex, exe, &lock, &settings).is_empty());
     }
 }

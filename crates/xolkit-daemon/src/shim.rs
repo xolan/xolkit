@@ -127,7 +127,7 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
             failures += 1;
             continue;
         }
-        failures = 0;
+        let connected = std::time::Instant::now();
         let mut daemon_lines = BufReader::new(recv).lines();
         loop {
             tokio::select! {
@@ -151,6 +151,17 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
                     _ => break,
                 },
             }
+        }
+        // A connection that keeps ending at once counts as a failure, so the shim backs off and
+        // gives up instead of spinning.
+        if connected.elapsed() > Duration::from_secs(10) {
+            failures = 0;
+        } else {
+            failures += 1;
+            if failures > RECONNECTS {
+                anyhow::bail!("xolkit keeps closing the session");
+            }
+            tokio::time::sleep(Duration::from_millis(500 * u64::from(failures))).await;
         }
         for line in session.abandon() {
             stdout.write_all(format!("{line}\n").as_bytes()).await?;

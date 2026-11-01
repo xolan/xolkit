@@ -24,6 +24,15 @@ Usage:
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Release builds on Windows have no console of their own; print to the terminal that ran
+    // them. Not for `mcp`, whose output is the agent's pipe.
+    #[cfg(windows)]
+    if args
+        .first()
+        .is_some_and(|a| a != "mcp" && a != "daemon" && !a.starts_with("xolkit://"))
+    {
+        attach_console();
+    }
     match args.first().map(String::as_str) {
         Some("mcp") => exit_with(shim(&args[1..])),
         Some("daemon") => exit_with(Env::detect().and_then(xolkit_daemon::run_daemon)),
@@ -35,6 +44,15 @@ fn main() {
             std::process::exit(2);
         }
         _ => app(None),
+    }
+}
+
+#[cfg(windows)]
+fn attach_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: AttachConsole takes a process id and has no other preconditions.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
     }
 }
 

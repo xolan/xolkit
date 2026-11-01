@@ -77,7 +77,8 @@ pub fn scan_skills(root: &Path) -> Vec<Skill> {
     let mut skills: Vec<Skill> = entries
         .flatten()
         .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        // Following links, so skills kept in a dotfiles repository count.
+        .filter(|e| e.path().is_dir())
         .filter_map(|e| Skill::read(&e.path()))
         .collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));

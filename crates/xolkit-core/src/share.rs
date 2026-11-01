@@ -12,7 +12,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
-use crate::discover::{extract, fetch_skill_at, unique, valid_name};
+use crate::discover::{extract, fetch_skill_at, unique, valid_name, valid_plugin_id};
 use crate::lock::{Pin, PluginPin};
 use crate::marketplace::{FetchedPlugin, fetch_plugin_at};
 use crate::servers::valid_server_name;
@@ -169,9 +169,17 @@ impl Shared {
     /// Refuses anything that would be unsafe to act on: names that aren't plain folder names,
     /// sources that aren't GitHub repositories, servers with bad names or configs.
     fn check(&self) -> Result<()> {
-        for (name, item) in self.skills.iter().chain(&self.plugins) {
-            let plain = name.split_once('@').map_or(name.as_str(), |(n, _)| n);
-            ensure!(valid_name(plain), "unsafe name in the profile: {name}");
+        let skills = self
+            .skills
+            .iter()
+            .map(|(name, item)| (name, item, valid_name(name)));
+        let plugins = self
+            .plugins
+            .iter()
+            .map(|(id, item)| (id, item, valid_plugin_id(id)));
+        for (name, item, valid) in skills.chain(plugins) {
+            // Names become folder names and command arguments.
+            ensure!(valid, "unsafe name in the profile: {name}");
             if !item.is_local() {
                 crate::discover::check_source(&item.source)?;
                 ensure!(
@@ -284,7 +292,11 @@ pub fn read_export(env: &Env, path: &Path) -> Result<(Shared, PathBuf)> {
     }
 }
 
-/// The `.xolkit` archive re-packed under one top folder, the shape `extract` reads.
+/// Most entries a `.xolkit` file may hold.
+const MAX_ENTRIES: usize = 10_000;
+
+/// The `.xolkit` archive re-packed under one top folder, the shape `extract` reads. Stops at
+/// `MAX_FILE` unpacked bytes in all, so a small file can't unpack into gigabytes.
 fn wrap_in_folder(path: &Path) -> Result<Vec<u8>> {
     let file = fs::File::open(path)?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
@@ -292,12 +304,23 @@ fn wrap_in_folder(path: &Path) -> Result<Vec<u8>> {
         Vec::new(),
         flate2::Compression::fast(),
     ));
-    for entry in archive.entries().context("not a .xolkit file")? {
+    let mut total = 0;
+    for (count, entry) in archive.entries().context("not a .xolkit file")?.enumerate() {
+        ensure!(count < MAX_ENTRIES, "the file holds too many entries");
         let mut entry = entry?;
         let mut header = entry.header().clone();
         let name = format!("x/{}", entry.path()?.display());
         let mut data = Vec::new();
-        entry.by_ref().take(MAX_FILE).read_to_end(&mut data)?;
+        entry
+            .by_ref()
+            .take(MAX_FILE - total + 1)
+            .read_to_end(&mut data)?;
+        total += data.len() as u64;
+        ensure!(
+            total <= MAX_FILE,
+            "the file unpacks to more than {} MB",
+            MAX_FILE >> 20
+        );
         out.append_data(&mut header, name, &data[..])?;
     }
     Ok(out.into_inner()?.finish()?)
@@ -411,12 +434,18 @@ pub fn import_steps(
         let Some(dir) = local_dir else {
             bail!("the profile's skill {name} isn't on this computer, and the code can't carry it");
         };
+        ensure!(valid_name(name), "unsafe skill name: {name}");
         actions.push(Action::Copy {
             from: dir.join("skills").join(name),
             to: env.skills_dir().join(name),
         });
     }
     for plugin in &downloads.plugins {
+        ensure!(
+            valid_plugin_id(&plugin.plugin.id),
+            "unsafe plugin id: {}",
+            plugin.plugin.id
+        );
         let target = env.plugins_dir().join(&plugin.plugin.id);
         ensure!(
             !target.exists(),
@@ -529,6 +558,40 @@ mod tests {
         let mut evil = back.clone();
         evil.skills.get_mut("remote").unwrap().folder = "../..".into();
         assert!(decode_code(&encode_code(&evil)).is_err());
+    }
+
+    #[test]
+    fn refuses_names_that_leave_the_library() {
+        let item = SharedItem {
+            source: "o/r".into(),
+            commit: "0123456789ab".into(),
+            ..SharedItem::default()
+        };
+        for skill in ["x@/../../../.config/autostart", "../x", "-x", "a/b", ".x"] {
+            let shared = Shared {
+                skills: [(skill.to_owned(), item.clone())].into(),
+                ..Shared::default()
+            };
+            assert!(decode_code(&encode_code(&shared)).is_err(), "{skill}");
+        }
+        for plugin in ["p@m/../../x", "p", "-p@m", "p@-m"] {
+            let shared = Shared {
+                plugins: [(plugin.to_owned(), item.clone())].into(),
+                ..Shared::default()
+            };
+            assert!(decode_code(&encode_code(&shared)).is_err(), "{plugin}");
+        }
+        // Installing checks too, whatever the name came from.
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        let skill = FetchedSkill {
+            name: "x@/../../escaped".into(),
+            dir: env.staging_dir().join("1"),
+            pin: Pin::default(),
+            skill_md: String::new(),
+            files: Vec::new(),
+        };
+        assert!(crate::install_skill(&env, &skill).is_err());
     }
 
     #[test]

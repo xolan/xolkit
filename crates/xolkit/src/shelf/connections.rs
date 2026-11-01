@@ -358,14 +358,15 @@ impl Shelf {
             .filter(|e| e.source == source)
             .take(40)
             .collect();
-        let disconnect = Button::new("disconnect")
-            .danger()
-            .label("Disconnect")
+        // The agent's shim reconnects at once, so this starts the session over.
+        let disconnect = Button::new("restart-session")
+            .label("Restart session")
+            .tooltip("End the session; the agent reconnects with a fresh one")
             .disabled(self.busy)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.request(
                     Request::Disconnect { session: id },
-                    Some("Disconnected".into()),
+                    Some("Session restarted".into()),
                     window,
                     cx,
                 )

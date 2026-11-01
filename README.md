@@ -43,7 +43,8 @@ Each agent session starts a small `xolkit mcp` process, the shim. The shim conne
 xolkit daemon over a socket only you can open, starting the daemon first when it isn't running.
 The daemon serves the session, connects to MCP servers, runs the changes the app asks for, and
 keeps a log. The app is a window onto the daemon: it reads `~/.xolkit`, and every change it
-makes goes through the daemon.
+makes goes through the daemon. The one exception is `~/.xolkit/staging`, where the app puts
+downloads while you review them.
 
 How a skill reaches an agent:
 
@@ -216,7 +217,7 @@ set it:
 | `lock.json` | Where each skill and plugin came from, pinned to a commit, and which agents have a plugin natively |
 | `servers.toml` | The MCP servers xolkit connects to |
 | `run/` | The daemon's socket, pid file and log |
-| `staging/` | Downloads under review; cleared each time the app starts |
+| `staging/` | Downloads under review; ones over an hour old are cleared when the app starts |
 | `themes/` | Extra Base16 themes you add |
 
 Tokens and other secrets are in the OS keyring, never in `~/.xolkit`, so the folder is safe to

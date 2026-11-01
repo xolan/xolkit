@@ -40,6 +40,15 @@ fn prompt_name(name: &str) -> String {
         .collect()
 }
 
+/// Whether agents accept `name` for a tool of xolkit's: Claude Code names it
+/// `mcp__xolkit__<name>`, and tool names are limited to 64 letters, digits, `_` and `-`.
+fn usable_tool_name(name: &str) -> bool {
+    "mcp__xolkit__".len() + name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 fn schema(value: serde_json::Value) -> Arc<JsonObject> {
     Arc::new(value.as_object().cloned().unwrap_or_default())
 }
@@ -225,8 +234,21 @@ impl ServerHandler for Session {
         let mut tools = Session::own_tools();
         for server in self.catalogue().servers {
             for tool in self.daemon.gateway().tools(&server.name) {
+                let name = format!("{}{SEPARATOR}{}", server.name, tool.name);
+                // Agents refuse a whole request over one bad tool name, so leave such tools out.
+                if !usable_tool_name(&name) {
+                    self.daemon.event(
+                        &server.name,
+                        format!(
+                            "left out the tool {}: its name is too long or unusual",
+                            tool.name
+                        ),
+                        true,
+                    );
+                    continue;
+                }
                 let mut tool = tool.clone();
-                tool.name = format!("{}{SEPARATOR}{}", server.name, tool.name).into();
+                tool.name = name.into();
                 tools.push(tool);
             }
         }
@@ -374,6 +396,13 @@ impl ServerHandler for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_names_fit_what_agents_accept() {
+        assert!(usable_tool_name("github__create_issue"));
+        assert!(!usable_tool_name(&format!("server__{}", "x".repeat(50))));
+        assert!(!usable_tool_name("server__has.dot"));
+    }
 
     #[test]
     fn prompt_names_lose_colons() {

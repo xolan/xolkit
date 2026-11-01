@@ -13,7 +13,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientHandler, RoleClient, ServiceExt};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use xolkit_core::{Server, ServerConfig, get_secret, secret_key};
+use xolkit_core::{Env, Server, ServerConfig, get_secret, secret_key};
 
 use crate::protocol::{ServerState, ServerStatus};
 
@@ -52,6 +52,8 @@ struct Connection {
 pub(crate) struct Gateway {
     connections: Arc<Mutex<BTreeMap<String, Connection>>>,
     notify: Notify,
+    /// Finds local servers' commands, with the user's full `PATH`.
+    env: Env,
 }
 
 /// Hears a server's notifications.
@@ -74,10 +76,11 @@ impl ClientHandler for Handler {
 }
 
 impl Gateway {
-    pub(crate) fn new(notify: Notify) -> Gateway {
+    pub(crate) fn new(env: Env, notify: Notify) -> Gateway {
         Gateway {
             connections: Arc::new(Mutex::new(BTreeMap::new())),
             notify,
+            env,
         }
     }
 
@@ -240,7 +243,11 @@ impl Gateway {
             name: server.name.clone(),
             gateway: self.clone(),
         };
-        let config = with_secrets(&server.name, &server.config)?;
+        // The keyring can block, waiting for the user to unlock it; keep that off the workers.
+        let config = {
+            let (name, config) = (server.name.clone(), server.config.clone());
+            tokio::task::spawn_blocking(move || with_secrets(&name, &config)).await??
+        };
         let (service, pid) = match &config.url {
             Some(url) => {
                 let mut headers = HashMap::new();
@@ -259,8 +266,12 @@ impl Gateway {
                 (handler.serve(transport).await?, None)
             }
             None => {
-                let mut command =
-                    tokio::process::Command::new(config.command.as_deref().unwrap_or_default());
+                // Found the way a shell finds it, so `npx` (npx.cmd on Windows) works.
+                let program = self.env.find(config.command.as_deref().unwrap_or_default());
+                let mut command = tokio::process::Command::new(program);
+                if let Some(path) = &self.env.path {
+                    command.env("PATH", path);
+                }
                 command.args(&config.args).envs(&config.env);
                 if let Some(cwd) = &config.cwd {
                     command.current_dir(cwd);
@@ -310,6 +321,31 @@ impl Gateway {
                 (self.notify)(Notice::ToolsChanged);
             }
             Err(e) => self.log(name, format!("could not list tools: {e}"), true),
+        }
+    }
+
+    /// Notices local servers that exited and remote ones whose connection ended.
+    pub(crate) fn reap(&self) {
+        let mut ended = Vec::new();
+        {
+            let mut connections = self.connections.lock().unwrap();
+            for (name, connection) in connections.iter_mut() {
+                if connection.service.as_ref().is_some_and(|s| s.is_closed()) {
+                    connection.service = None;
+                    connection.tools.clear();
+                    connection.pid = None;
+                    connection.state = ServerState::Failed {
+                        message: "it stopped; reconnect to start it again".to_owned(),
+                    };
+                    ended.push(name.clone());
+                }
+            }
+        }
+        for name in &ended {
+            self.log(name, "stopped unexpectedly", true);
+        }
+        if !ended.is_empty() {
+            (self.notify)(Notice::ToolsChanged);
         }
     }
 

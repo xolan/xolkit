@@ -52,8 +52,16 @@ pub(crate) struct Daemon {
 }
 
 impl Daemon {
-    fn new(env: Env) -> Result<Arc<Daemon>> {
-        let library = Library::load(&env)?;
+    fn new(env: Env) -> Arc<Daemon> {
+        // A file that doesn't read starts the daemon empty, not at all: sessions keep working,
+        // the app can say what is wrong, and the watcher picks up the fix.
+        let (library, problem) = match Library::load(&env) {
+            Ok(library) => (library, None),
+            Err(e) => (
+                Library::default(),
+                Some(format!("could not read the library: {e:#}")),
+            ),
+        };
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -75,21 +83,27 @@ impl Daemon {
             executing: tokio::sync::Mutex::new(()),
         });
         let weak = Arc::downgrade(&daemon);
-        let gateway = Gateway::new(Arc::new(move |notice| {
-            let Some(daemon) = weak.upgrade() else {
-                return;
-            };
-            match notice {
-                Notice::ToolsChanged => daemon.changed(),
-                Notice::Log {
-                    source,
-                    message,
-                    error,
-                } => daemon.event(&source, message, error),
-            }
-        }));
+        let gateway = Gateway::new(
+            daemon.env.clone(),
+            Arc::new(move |notice| {
+                let Some(daemon) = weak.upgrade() else {
+                    return;
+                };
+                match notice {
+                    Notice::ToolsChanged => daemon.changed(),
+                    Notice::Log {
+                        source,
+                        message,
+                        error,
+                    } => daemon.event(&source, message, error),
+                }
+            }),
+        );
         let _ = daemon.gateway.set(gateway);
-        Ok(daemon)
+        if let Some(problem) = problem {
+            daemon.event("daemon", problem, true);
+        }
+        daemon
     }
 
     pub(crate) fn gateway(&self) -> &Gateway {
@@ -400,6 +414,14 @@ impl Daemon {
     }
 }
 
+/// Keeps the log from growing forever: past 5 MB, it moves to `daemon.log.old` at start.
+fn rotate_log(env: &Env) {
+    let log = env.run_dir().join("daemon.log");
+    if std::fs::metadata(&log).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
+        let _ = std::fs::rename(&log, env.run_dir().join("daemon.log.old"));
+    }
+}
+
 /// Whether the router skill in `provider`'s folder is one xolkit wrote, so it may be removed.
 fn router_is_ours(env: &Env, provider: Provider) -> bool {
     let dir = match provider {
@@ -420,12 +442,31 @@ fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
         mtime(&env.skills_dir()),
         mtime(&env.plugins_dir()),
     ];
-    for dir in [env.skills_dir(), env.plugins_dir()] {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            let mut inner: Vec<_> = entries.flatten().map(|e| e.path()).collect();
-            inner.sort();
-            times.extend(inner.iter().map(|p| mtime(p)));
-            times.extend(inner.iter().map(|p| mtime(&p.join("SKILL.md"))));
+    let folders = |dir: &Path| -> Vec<PathBuf> {
+        let mut inner: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        inner.sort();
+        inner
+    };
+    for skill in folders(&env.skills_dir()) {
+        times.extend([mtime(&skill), mtime(&skill.join("SKILL.md"))]);
+    }
+    // What a plugin is read from: its manifest, servers, commands and skills.
+    for plugin in folders(&env.plugins_dir()) {
+        for part in [
+            ".claude-plugin/plugin.json",
+            ".mcp.json",
+            "commands",
+            "skills",
+        ] {
+            times.push(mtime(&plugin.join(part)));
+        }
+        for skill in folders(&plugin.join("skills")) {
+            times.push(mtime(&skill.join("SKILL.md")));
         }
     }
     times
@@ -433,8 +474,9 @@ fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
 
 /// Runs the daemon until it is told to stop or has been idle long enough.
 pub async fn run(env: Env) -> Result<()> {
-    let listener = ipc::listen(&env)?;
-    let daemon = Daemon::new(env.clone())?;
+    let (listener, instance) = ipc::listen(&env)?;
+    rotate_log(&env);
+    let daemon = Daemon::new(env.clone());
     let _ = std::fs::write(
         env.run_dir().join("daemon.pid"),
         std::process::id().to_string(),
@@ -453,6 +495,11 @@ pub async fn run(env: Env) -> Result<()> {
             let mut last = fingerprint(&env);
             loop {
                 tokio::time::sleep(WATCH_INTERVAL).await;
+                daemon.gateway().reap();
+                // Mid-plan, the files are half changed; the plan reloads when it ends.
+                let Ok(_idle) = daemon.executing.try_lock() else {
+                    continue;
+                };
                 let now = fingerprint(&env);
                 if now != last {
                     last = now;
@@ -485,7 +532,7 @@ pub async fn run(env: Env) -> Result<()> {
     watcher.abort();
     daemon.event("daemon", "stopped", false);
     daemon.gateway().close_all().await;
-    ipc::remove_socket(&env);
+    ipc::remove_socket(&env, &instance);
     let _ = std::fs::remove_file(env.run_dir().join("daemon.pid"));
     Ok(())
 }

@@ -45,7 +45,8 @@ impl Shelf {
             .filter(move |(_, p)| matches(&filter, &[&p.name]))
     }
 
-    /// Changes a profile and saves it.
+    /// Changes a profile and saves it. For the profile in use, plugins installed natively follow:
+    /// turning an agent off turns its native plugins off there too.
     pub(super) fn edit_profile(
         &mut self,
         ix: usize,
@@ -54,8 +55,19 @@ impl Shelf {
         cx: &mut Context<Self>,
     ) {
         let mut settings = self.settings().clone();
+        let before = settings.profiles[ix].clone();
         edit(&mut settings.profiles[ix]);
-        self.save_settings(settings, Vec::new(), None, window, cx);
+        let native = if ix == settings.active_index() {
+            native_steps(
+                &self.library.lock,
+                &self.library.plugins,
+                &before,
+                &settings.profiles[ix],
+            )
+        } else {
+            Vec::new()
+        };
+        self.save_settings(settings, native, None, window, cx);
     }
 
     /// Makes another profile the active one. What xolkit serves changes at once; plugins
@@ -457,17 +469,30 @@ impl Shelf {
             });
         }
         for (name, server) in &shared.servers {
-            lines.push(if library.servers.contains_key(name) {
-                format!("Server {name}: kept as you have it")
-            } else if server.config.secrets.is_empty() {
-                format!("Server {name}: add {}", server.config.summary())
+            if library.servers.contains_key(name) {
+                lines.push(format!("Server {name}: kept as you have it"));
+                continue;
+            }
+            // Everything the server would run with, so nothing hides in its environment.
+            let config = &server.config;
+            lines.push(format!("Server {name}: add {}", config.summary()));
+            let plain = if config.is_remote() {
+                &config.headers
             } else {
-                format!(
-                    "Server {name}: add {}; then save {} under MCP servers",
-                    server.config.summary(),
-                    server.config.secrets.join(", ")
-                )
-            });
+                &config.env
+            };
+            for (key, value) in plain {
+                lines.push(format!("    {key} = {value}"));
+            }
+            if let Some(cwd) = &config.cwd {
+                lines.push(format!("    in the folder {}", cwd.display()));
+            }
+            if !config.secrets.is_empty() {
+                lines.push(format!(
+                    "    then save {} under MCP servers",
+                    config.secrets.join(", ")
+                ));
+            }
         }
         let name = self.settings().free_name(&shared.name);
         let title = format!("Import “{name}”?");

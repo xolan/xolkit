@@ -199,9 +199,19 @@ pub fn router_skill(catalogue: &Catalogue) -> String {
     if digest.is_empty() {
         digest.push_str("nothing yet");
     }
-    let description = format!("{intro}{digest}.").replace(['"', '\n'], " ");
+    #[derive(serde::Serialize)]
+    struct Front {
+        name: &'static str,
+        description: String,
+    }
+    // Serialized, so quotes, backslashes and colons in descriptions can't break the YAML.
+    let front = serde_yaml_ng::to_string(&Front {
+        name: "xolkit",
+        description: format!("{intro}{digest}.").replace('\n', " "),
+    })
+    .unwrap_or_default();
     format!(
-        "---\nname: xolkit\ndescription: \"{description}\"\n---\n\n\
+        "---\n{front}---\n\n\
          # xolkit\n\n\
          This skill is written by xolkit; changes to it are overwritten.\n\n\
          xolkit serves your skills through its MCP server, `xolkit`. To use one:\n\n\

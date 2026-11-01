@@ -25,18 +25,35 @@ fn name(env: &Env) -> io::Result<Name<'static>> {
         .to_fs_name::<GenericFilePath>()
 }
 
+/// Named pipes live in one namespace for every user, so the daemon picks a random name and
+/// keeps it in `~/.xolkit/run/pipe`, which only the user can read: no one else can guess it,
+/// or set up a pipe of that name first.
 #[cfg(windows)]
 fn name(env: &Env) -> io::Result<Name<'static>> {
     use interprocess::local_socket::{GenericNamespaced, ToNsName};
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    env.xolkit_dir.hash(&mut hasher);
-    let user = std::env::var("USERNAME").unwrap_or_default();
-    format!("xolkit-{user}-{:016x}", hasher.finish()).to_ns_name::<GenericNamespaced>()
+    let pipe = std::fs::read_to_string(env.run_dir().join("pipe"))?;
+    pipe.trim().to_owned().to_ns_name::<GenericNamespaced>()
 }
 
-/// Listens on the socket. Fails when another daemon already does.
-pub(crate) fn listen(env: &Env) -> Result<Listener> {
+#[cfg(windows)]
+fn new_pipe_name() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    // Each RandomState is seeded from the system's random source.
+    let part = || {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        hasher.finish()
+    };
+    format!("xolkit-{:016x}{:016x}", part(), part())
+}
+
+/// Held for as long as the daemon runs: only one daemon a user's xolkit folder.
+pub(crate) struct Instance {
+    _lock: std::fs::File,
+}
+
+/// Takes the daemon's lock and listens on the socket. Fails when another daemon runs.
+pub(crate) fn listen(env: &Env) -> Result<(Listener, Instance)> {
     let run = env.run_dir();
     std::fs::create_dir_all(&run)?;
     #[cfg(unix)]
@@ -44,14 +61,23 @@ pub(crate) fn listen(env: &Env) -> Result<Listener> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700))?;
     }
-    if Stream::connect(name(env)?).is_ok() {
-        anyhow::bail!("another xolkit daemon is running");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(run.join("daemon.lock"))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!("another xolkit daemon is running"),
+        Err(std::fs::TryLockError::Error(e)) => return Err(e).context("could not lock the daemon"),
     }
+    #[cfg(windows)]
+    std::fs::write(run.join("pipe"), new_pipe_name())?;
     let options = ListenerOptions::new().name(name(env)?);
     #[cfg(unix)]
     let options = {
         use interprocess::os::unix::local_socket::ListenerOptionsExt;
-        // A socket left by a daemon that crashed is replaced; one in use was ruled out above.
+        // A socket left by a daemon that crashed is replaced; the lock rules out a live one.
         options.try_overwrite(true).mode(0o600)
     };
     #[cfg(windows)]
@@ -63,16 +89,19 @@ pub(crate) fn listen(env: &Env) -> Result<Listener> {
             .expect("the SDDL has no nul");
         options.security_descriptor(SecurityDescriptor::deserialize(&sddl)?)
     };
-    options
+    let listener = options
         .create_tokio()
-        .context("could not listen on the daemon's socket")
+        .context("could not listen on the daemon's socket")?;
+    Ok((listener, Instance { _lock: lock }))
 }
 
-/// Removes the socket file once the daemon is done with it.
-pub(crate) fn remove_socket(env: &Env) {
-    if cfg!(unix) {
-        let _ = std::fs::remove_file(env.run_dir().join("daemon.sock"));
-    }
+/// Removes the socket file once the daemon is done with it, while it still holds the lock.
+pub(crate) fn remove_socket(env: &Env, _instance: &Instance) {
+    let _ =
+        std::fs::remove_file(
+            env.run_dir()
+                .join(if cfg!(unix) { "daemon.sock" } else { "pipe" }),
+        );
 }
 
 pub(crate) async fn connect_async(env: &Env) -> io::Result<AsyncStream> {

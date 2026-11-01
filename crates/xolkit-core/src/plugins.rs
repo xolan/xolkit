@@ -93,7 +93,7 @@ pub(crate) fn scan_plugins(root: &Path) -> Vec<Plugin> {
     };
     let mut plugins: Vec<Plugin> = entries
         .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| e.path().is_dir())
         .filter_map(|e| Plugin::read(&e.path()))
         .collect();
     plugins.sort_by(|a, b| a.id.cmp(&b.id));

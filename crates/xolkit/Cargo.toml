@@ -13,6 +13,9 @@ serde_yaml_ng = "0.10"
 xolkit-core = { path = "../xolkit-core" }
 xolkit-daemon = { path = "../xolkit-daemon" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
 [build-dependencies]
 embed-resource = "3"
 

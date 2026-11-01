@@ -72,10 +72,24 @@ pub fn save_in_background(settings: Settings, cx: &App) {
     .detach();
 }
 
+/// The folders and the `PATH` the user's login shell sets, worked out once: an app started from
+/// a desktop launcher has a short `PATH`, without `gh` in `~/.local/bin`, say.
+fn full_env(env: &Env) -> Env {
+    static FULL: std::sync::OnceLock<Env> = std::sync::OnceLock::new();
+    FULL.get_or_init(|| match Env::detect() {
+        Ok(mut full) => {
+            full.xolkit_dir = env.xolkit_dir.clone();
+            full
+        }
+        Err(_) => env.clone(),
+    })
+    .clone()
+}
+
 /// The GitHub token to send for `access`, if any. Runs `gh`, so call it off the UI thread.
 pub fn github_token(access: GitHubAccess, env: &Env) -> Result<Option<String>> {
     match access {
-        GitHubAccess::Gh => gh_token(env).map(Some),
+        GitHubAccess::Gh => gh_token(&full_env(env)).map(Some),
         GitHubAccess::Token => get_secret(GITHUB_TOKEN)?
             .map(Some)
             .ok_or_else(|| anyhow::anyhow!("no token is saved")),

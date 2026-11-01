@@ -157,8 +157,7 @@ impl Env {
         // Provider tools are console programs; each would flash a console window over the app.
         #[cfg(windows)]
         std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
-        let output = command
-            .output()
+        let output = output_within(command, RUN_TIMEOUT)
             .with_context(|| format!("could not run `{program}`"))?;
         if !output.status.success() {
             bail!(
@@ -172,7 +171,7 @@ impl Env {
 
     /// The file to start for `program`. On Windows, `Command` only looks for `<program>.exe`,
     /// but npm installs `claude.cmd` and `codex.cmd`, so look on `PATH` the way a shell does.
-    fn find(&self, program: &str) -> PathBuf {
+    pub fn find(&self, program: &str) -> PathBuf {
         if cfg!(windows)
             && let Some(found) = self.tool_path(program)
         {
@@ -204,6 +203,63 @@ impl Env {
         }
         self.tool_path(provider.cli())
     }
+}
+
+/// How long an agent's tool may run before it counts as hung and is stopped.
+const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Runs `command` to the end and collects its output, killing it after `timeout`.
+fn output_within(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Read both pipes on their own threads, so a full pipe never stalls the child.
+    let read = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = read(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = read(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "it took over {} minutes, so it was stopped",
+                timeout.as_secs() / 60
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
 }
 
 /// The first `<dir>\<program><ext>` on `path`, trying the extensions in `PATHEXT` that

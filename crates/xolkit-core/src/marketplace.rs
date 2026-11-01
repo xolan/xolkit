@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use crate::discover::{
     MAX_PLUGIN, check_source, download_folder, github, head_commit, tree_hash, valid_name,
+    valid_plugin_id,
 };
 use crate::lock::{Lock, Pin, PluginPin};
 use crate::{Action, Agent, Env, Kind, Plugin, Profile, Provider, Settings};
@@ -210,6 +211,7 @@ pub fn fetch_plugin(env: &Env, offer: &Offer, token: Option<&str>) -> Result<Fet
 
 /// Downloads plugin `id` as `pin` has it, as a shared profile pins it.
 pub fn fetch_plugin_at(env: &Env, id: &str, pin: PluginPin) -> Result<FetchedPlugin> {
+    ensure!(valid_plugin_id(id), "unsafe plugin id: {id}");
     let (staging, _) = download_folder(
         env,
         &pin.pin.source,
@@ -233,7 +235,10 @@ pub fn fetch_plugin_at(env: &Env, id: &str, pin: PluginPin) -> Result<FetchedPlu
 fn commit_of(repo: &str, rev: &str, token: Option<&str>) -> Result<String> {
     ensure!(
         rev.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)),
+            .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+            && rev
+                .split('/')
+                .all(|p| !p.is_empty() && p != "." && p != ".."),
         "unsafe Git ref: {rev}"
     );
     let commit = github(
@@ -245,7 +250,12 @@ fn commit_of(repo: &str, rev: &str, token: Option<&str>) -> Result<String> {
     .with_context(|| format!("could not find {rev} in github.com/{repo}"))?
     .body_mut()
     .read_to_string()?;
-    Ok(commit.trim().to_owned())
+    let commit = commit.trim().to_owned();
+    ensure!(
+        commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit()),
+        "unexpected commit id from GitHub"
+    );
+    Ok(commit)
 }
 
 /// Moves a fetched plugin into the library, records it, turns it on for `agents` in the active
@@ -258,6 +268,11 @@ pub fn install_plugin(
     agents: &[Agent],
 ) -> Result<Vec<Action>> {
     let plugin = &fetched.plugin;
+    ensure!(
+        valid_plugin_id(&plugin.id),
+        "unsafe plugin id: {}",
+        plugin.id
+    );
     let target = env.plugins_dir().join(&plugin.id);
     ensure!(
         fs::symlink_metadata(&target).is_err(),

@@ -216,6 +216,7 @@ fn download_skill(
 /// Moves a fetched skill into `~/.xolkit/skills` and records where it came from. Fails if the
 /// name is already taken.
 pub fn install_skill(env: &Env, skill: &FetchedSkill) -> Result<Vec<Action>> {
+    ensure!(valid_name(&skill.name), "unsafe skill name: {}", skill.name);
     let target = env.skills_dir().join(&skill.name);
     ensure!(
         fs::symlink_metadata(&target).is_err(),
@@ -354,9 +355,22 @@ pub fn update_skill(env: &Env, name: &str, skill: &FetchedSkill) -> Result<Vec<A
     ])
 }
 
-/// Removes downloads left by an earlier run.
+/// Removes downloads left by an earlier run: those over an hour old, so another running copy of
+/// the app keeps the ones it is showing.
 pub fn clean_staging(env: &Env) {
-    let _ = fs::remove_dir_all(env.staging_dir());
+    let Ok(entries) = fs::read_dir(env.staging_dir()) else {
+        return;
+    };
+    let hour = std::time::Duration::from_secs(3600);
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > hour));
+        if old {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -507,12 +521,20 @@ fn storable(name: &str) -> bool {
             .any(|device| stem.eq_ignore_ascii_case(device))
 }
 
+/// A name that is safe as one folder name and as a command-line argument: letters, digits, `-`,
+/// `_` and `.`, not starting with `.` or `-`.
 pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
-        && !name.starts_with('.')
+        && !name.starts_with(['.', '-'])
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
+/// `name@marketplace`, both safe names.
+pub(crate) fn valid_plugin_id(id: &str) -> bool {
+    id.split_once('@')
+        .is_some_and(|(name, marketplace)| valid_name(name) && valid_name(marketplace))
 }
 
 /// Refuses anything but `owner/repo`, since it goes into GitHub URLs.
