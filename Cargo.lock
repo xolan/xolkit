@@ -8608,7 +8608,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xolkit"
-version = "2.1.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -8624,7 +8624,7 @@ dependencies = [
 
 [[package]]
 name = "xolkit-core"
-version = "2.1.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8647,7 +8647,7 @@ dependencies = [
 
 [[package]]
 name = "xolkit-daemon"
-version = "2.1.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "http",

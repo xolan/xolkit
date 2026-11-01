@@ -50,10 +50,6 @@ description = "Draw the architecture diagram in assets/design (needs resvg)"
 run = "python3 -I scripts/diagram.py"
 run_windows = "python -I scripts/diagram.py"
 
-[tasks.inventory]
-description = "Print the installed skills and plugins (read-only)"
-run = "cargo run -q -p xolkit-core --example inventory"
-
 [tasks.package]
 description = "Build a release archive for a target into dist/: a tarball, or a zip for Windows"
 usage = 'arg "<target>" help="Rust target triple, e.g. x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc"'

@@ -684,4 +684,23 @@ mod tests {
         );
         assert!(native_steps(&lock, &[plugin], &on, &on).is_empty());
     }
+
+    /// Reads Anthropic's official marketplace and downloads one of its plugins.
+    #[test]
+    #[ignore = "uses the network"]
+    fn reads_a_real_marketplace() {
+        let (offers, errors) = fetch_offers(&["anthropics/claude-plugins-official".into()], None);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(offers.len() > 5, "{} offers", offers.len());
+        let offer = offers
+            .iter()
+            .find(|o| matches!(&o.source, PluginSource::GitHub { repo, .. } if repo == "anthropics/claude-plugins-official"))
+            .expect("a plugin in the marketplace's own repository");
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        let fetched = fetch_plugin(&env, offer, None).unwrap();
+        assert_eq!(fetched.plugin.id, offer.id);
+        assert_eq!(fetched.pin.pin.commit.len(), 40);
+        fetched.discard();
+    }
 }

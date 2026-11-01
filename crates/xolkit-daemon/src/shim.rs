@@ -182,7 +182,9 @@ mod tests {
         assert!(!session.heard_from_daemon(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#));
         assert!(session.heard_from_daemon(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#));
         assert!(
-            session.heard_from_daemon(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#)
+            session.heard_from_daemon(
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#
+            )
         );
     }
 }

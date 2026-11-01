@@ -1,9 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=xolkit
-Comment=Manage agent skills and plugins
-Exec=xolkit
+Comment=One library of skills, plugins and MCP servers for your coding agents
+Exec=xolkit %u
 Icon=xolkit
 Categories=Development;
 Terminal=false
 StartupWMClass=xolkit
+# Opens xolkit://import/… links to shared profiles.
+MimeType=x-scheme-handler/xolkit;
