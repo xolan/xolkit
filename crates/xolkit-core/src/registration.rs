@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{read_json, read_toml};
 use crate::lock::Lock;
 use crate::marketplace::MARKETPLACE;
+use crate::ops::Gone;
 use crate::{Action, Env, Provider, Settings, XOLKIT};
 
 /// How xolkit is registered with an agent.
@@ -76,6 +77,7 @@ fn remove_entry(provider: Provider) -> Action {
     Action::Undo {
         provider,
         args: args.iter().map(|a| (*a).to_owned()).collect(),
+        gone: Gone::McpEntry,
     }
 }
 
@@ -103,7 +105,8 @@ pub fn router_is_ours(env: &Env, provider: Provider) -> bool {
 pub fn write_router(env: &Env, provider: Provider, skill: Option<&str>) -> anyhow::Result<()> {
     let dir = router_dir(env, provider);
     let path = dir.join("SKILL.md");
-    if dir.exists() && !router_is_ours(env, provider) {
+    // A folder without SKILL.md (emptied by a removal cut short) is free to use.
+    if path.exists() && !router_is_ours(env, provider) {
         anyhow::ensure!(
             skill.is_none(),
             "{} holds a skill of your own; rename it to use the router skill",
@@ -147,12 +150,13 @@ pub fn unregister(
         });
     }
     let router = router_dir(env, provider);
-    if router_is_ours(env, provider) {
+    if router_is_ours(env, provider) || (router.exists() && !router.join("SKILL.md").exists()) {
         actions.push(Action::Remove { path: router });
     }
-    let run = |args: &[&str]| Action::Undo {
+    let run = |args: &[&str], gone: Gone| Action::Undo {
         provider,
         args: args.iter().map(|a| (*a).to_owned()).collect(),
+        gone,
     };
     let mut any_native = false;
     for (id, pin) in &lock.plugins {
@@ -162,9 +166,10 @@ pub fn unregister(
         any_native = true;
         let name = id.split_once('@').map_or(id.as_str(), |(name, _)| name);
         let native = format!("{name}@{MARKETPLACE}");
+        let gone = Gone::Plugin { id: native.clone() };
         actions.push(match provider {
-            Provider::Claude => run(&["plugin", "uninstall", &native, "--scope", "user"]),
-            Provider::Codex => run(&["plugin", "remove", &native]),
+            Provider::Claude => run(&["plugin", "uninstall", &native, "--scope", "user"], gone),
+            Provider::Codex => run(&["plugin", "remove", &native], gone),
         });
         actions.push(Action::SetNative {
             id: id.clone(),
@@ -173,7 +178,10 @@ pub fn unregister(
         });
     }
     if any_native {
-        actions.push(run(&["plugin", "marketplace", "remove", MARKETPLACE]));
+        actions.push(run(
+            &["plugin", "marketplace", "remove", MARKETPLACE],
+            Gone::Marketplace,
+        ));
     }
     actions
 }
@@ -225,7 +233,7 @@ mod tests {
         let env = Env::at(home.path());
         let exe = Path::new("/usr/bin/xolkit");
         let line = |a: &Action| match a {
-            Action::Run { provider, args } | Action::Undo { provider, args } => {
+            Action::Run { provider, args } | Action::Undo { provider, args, .. } => {
                 format!("{} {}", provider.cli(), args.join(" "))
             }
             other => format!("{other:?}"),

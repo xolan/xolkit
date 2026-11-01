@@ -218,16 +218,25 @@ struct Drain {
     done: std::sync::mpsc::Receiver<()>,
 }
 
+/// Most output kept from one pipe; past it, the rest is read and dropped.
+const MAX_OUTPUT: usize = 4 * 1024 * 1024;
+
 impl Drain {
     fn new(pipe: Option<impl std::io::Read + Send + 'static>) -> Drain {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (sender, done) = std::sync::mpsc::channel();
-        let filling = buffer.clone();
+        // Once the buffer is taken, the thread holds the only other handle; a helper that keeps
+        // writing then has its output dropped, not kept.
+        let filling = std::sync::Arc::downgrade(&buffer);
         std::thread::spawn(move || {
             if let Some(mut pipe) = pipe {
                 let mut chunk = [0; 8192];
                 while let Ok(n @ 1..) = pipe.read(&mut chunk) {
-                    filling.lock().unwrap().extend_from_slice(&chunk[..n]);
+                    if let Some(buffer) = filling.upgrade() {
+                        let mut buffer = buffer.lock().unwrap();
+                        let room = MAX_OUTPUT.saturating_sub(buffer.len());
+                        buffer.extend_from_slice(&chunk[..n.min(room)]);
+                    }
                 }
             }
             let _ = sender.send(());

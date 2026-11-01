@@ -13,6 +13,7 @@ use crate::discover::{
     valid_plugin_id,
 };
 use crate::lock::{Lock, Pin, PluginPin};
+use crate::ops::Gone;
 use crate::{Action, Agent, Env, Kind, Plugin, Profile, Provider, Settings};
 
 /// The name of xolkit's local marketplace in the agents.
@@ -443,14 +444,19 @@ pub fn native_toggle(plugin: &Plugin, provider: Provider, enabled: bool) -> Acti
 /// the agent when it was the last.
 fn native_uninstall(env: &Env, lock: &Lock, plugin: &Plugin, provider: Provider) -> Vec<Action> {
     let id = native_id(plugin);
-    let run = |args: &[&str]| Action::Undo {
+    let run = |args: &[&str], gone: Gone| Action::Undo {
         provider,
         args: args.iter().map(|a| (*a).to_owned()).collect(),
+        gone,
     };
+    let gone = || Gone::Plugin { id: id.clone() };
     let mut actions = match provider {
-        Provider::Claude => vec![run(&["plugin", "uninstall", &id, "--scope", "user"])],
+        Provider::Claude => vec![run(
+            &["plugin", "uninstall", &id, "--scope", "user"],
+            gone(),
+        )],
         Provider::Codex => vec![
-            run(&["plugin", "remove", &id]),
+            run(&["plugin", "remove", &id], gone()),
             Action::ForgetCodexHooks { id: id.clone() },
         ],
     };
@@ -468,7 +474,10 @@ fn native_uninstall(env: &Env, lock: &Lock, plugin: &Plugin, provider: Provider)
         .values()
         .any(|pin| pin.native.contains(&provider))
     {
-        actions.push(run(&["plugin", "marketplace", "remove", MARKETPLACE]));
+        actions.push(run(
+            &["plugin", "marketplace", "remove", MARKETPLACE],
+            Gone::Marketplace,
+        ));
     }
     if after.native(&plugin.id).is_empty() {
         let marketplace = env.marketplace_dir();
@@ -583,7 +592,7 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::Run { provider, args } | Action::Undo { provider, args } => {
+                Action::Run { provider, args } | Action::Undo { provider, args, .. } => {
                     Some(format!("{} {}", provider.cli(), args.join(" ")))
                 }
                 _ => None,

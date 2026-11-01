@@ -25,8 +25,8 @@ use crate::ipc;
 use crate::protocol::{Event, Hello, Request, Response, SessionStatus, Status, now};
 use crate::session::{SEPARATOR, Session};
 
-/// Most plugin files the watcher looks at, all plugins together.
-const MAX_WATCHED: usize = 5000;
+/// Most files of one plugin the watcher looks at.
+const MAX_WATCHED: usize = 2000;
 /// Largest `daemon.log` before it starts over.
 const MAX_LOG: u64 = 5 * 1024 * 1024;
 /// Events kept for the Connections page.
@@ -229,11 +229,22 @@ impl Daemon {
         }
         let library = self.library();
         for name in &library.ignored_servers {
-            self.event(
-                "daemon",
-                format!("left out the server {name}: use letters, digits, - and _, without __ or a _ at either end"),
-                true,
-            );
+            // Once per name, like tools left out.
+            if self
+                .left_out
+                .lock()
+                .unwrap()
+                .insert(format!("server {name}"))
+            {
+                self.event(
+                    "daemon",
+                    format!(
+                        "left out the server {name}: use letters, digits, - and _, without __ \
+                         or a _ at either end"
+                    ),
+                    true,
+                );
+            }
         }
         let mut wanted = Vec::new();
         for agent in Agent::ALL {
@@ -501,21 +512,26 @@ fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
     for skill in folders(&env.skills_dir()) {
         times.extend([mtime(&skill), mtime(&skill.join("SKILL.md"))]);
     }
-    // Every file of every plugin, as its manifest may point anywhere inside it. The cap is for
-    // all plugins together, and dependency and Git folders are skipped.
-    let mut stack = folders(&env.plugins_dir());
-    let mut seen = 0;
-    while let Some(entry) = stack.pop() {
-        seen += 1;
-        if seen > MAX_WATCHED {
-            break;
-        }
-        times.push(mtime(&entry));
-        let skip = entry
-            .file_name()
-            .is_some_and(|n| n == "node_modules" || n == ".git");
-        if entry.is_dir() && !skip {
-            stack.extend(folders(&entry));
+    // Every file of every plugin, as its manifest may point anywhere inside it. Each plugin gets
+    // its own share of the cap, so one big plugin can't leave the others unwatched, and
+    // dependency, build and Git folders are skipped.
+    for plugin in folders(&env.plugins_dir()) {
+        let mut stack = vec![plugin];
+        let mut seen = 0;
+        while let Some(entry) = stack.pop() {
+            seen += 1;
+            if seen > MAX_WATCHED {
+                break;
+            }
+            times.push(mtime(&entry));
+            let skip = entry.file_name().is_some_and(|n| {
+                [".git", "node_modules", ".venv", "target", "dist"]
+                    .iter()
+                    .any(|s| n == *s)
+            });
+            if entry.is_dir() && !skip {
+                stack.extend(folders(&entry));
+            }
         }
     }
     times

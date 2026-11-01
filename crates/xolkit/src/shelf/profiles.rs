@@ -26,20 +26,17 @@ use crate::settings;
 
 /// Most steps the switch dialog lists.
 const MAX_STEPS: usize = 14;
-/// Most skill and plugin lines the import dialog lists.
-const MAX_PREVIEW: usize = 16;
-/// Most detail lines the import dialog lists under one server.
-const MAX_DETAILS: usize = 4;
-/// Longest quoted value the import dialog shows.
-const MAX_VALUE: usize = 120;
+/// Longest value the import dialog shows; a longer one is cut and marked, never hidden.
+const MAX_VALUE: usize = 2000;
 
-/// `text` quoted, with control characters escaped, and shortened to `MAX_VALUE` characters.
+/// `text` quoted, with control characters escaped, and cut at `MAX_VALUE` characters with a note.
 fn quoted(text: &str) -> String {
-    let mut short: String = text.chars().take(MAX_VALUE).collect();
-    if text.chars().count() > MAX_VALUE {
-        short.push('…');
+    let length = text.chars().count();
+    if length <= MAX_VALUE {
+        return format!("{text:?}");
     }
-    format!("{short:?}")
+    let short: String = text.chars().take(MAX_VALUE).collect();
+    format!("{short:?}… (cut: {length} characters in all)")
 }
 
 /// A profile on its way in: from a code, or from a file with its local skills unpacked.
@@ -455,9 +452,9 @@ impl Shelf {
     fn preview_import(&mut self, incoming: Incoming, window: &mut Window, cx: &mut Context<Self>) {
         let shared = &incoming.shared;
         let library = &self.library;
-        // Every server, first: they run commands, so none may be cut off. Each one's details, and
-        // the skills and plugins after, are capped. Everything typed by the sharer is quoted and
-        // shortened, so no value can pass for another line or push the rest out of view.
+        // Everything that would run or install, in full: servers first, as they run commands,
+        // then plugins, which can bring hooks and servers of their own, then skills. The list
+        // scrolls. Every value the sharer typed is quoted, so none can pass for another line.
         let mut lines: Vec<String> = Vec::new();
         for (name, server) in &shared.servers {
             if library.servers.contains_key(name) {
@@ -471,33 +468,36 @@ impl Shelf {
             } else {
                 &config.env
             };
-            let mut details: Vec<String> = plain
-                .iter()
-                .map(|(key, value)| format!("    {} = {}", quoted(key), quoted(value)))
-                .collect();
+            for (key, value) in plain {
+                lines.push(format!("    {} = {}", quoted(key), quoted(value)));
+            }
             if let Some(cwd) = &config.cwd {
-                details.push(format!(
+                lines.push(format!(
                     "    in the folder {}",
                     quoted(&cwd.display().to_string())
                 ));
             }
             if !config.secrets.is_empty() {
                 let keys: Vec<String> = config.secrets.iter().map(|k| quoted(k)).collect();
-                details.push(format!(
+                lines.push(format!(
                     "    then save {} under MCP servers",
                     keys.join(", ")
                 ));
             }
-            if details.len() > MAX_DETAILS {
-                let more = details.len() - MAX_DETAILS;
-                details.truncate(MAX_DETAILS);
-                details.push(format!("    …and {more} more"));
-            }
-            lines.extend(details);
         }
-        let mut rest: Vec<String> = Vec::new();
+        for (id, item) in &shared.plugins {
+            lines.push(if library.plugin(id).is_some() {
+                format!("Plugin {id}: installed already")
+            } else {
+                format!(
+                    "Plugin {id}: download {} at {}",
+                    quoted(&item.source),
+                    item.commit
+                )
+            });
+        }
         for (name, item) in &shared.skills {
-            rest.push(if library.skill(name).is_some() {
+            lines.push(if library.skill(name).is_some() {
                 format!("Skill {name}: installed already")
             } else if item.is_local() {
                 match incoming.staged {
@@ -519,23 +519,6 @@ impl Shelf {
                 )
             });
         }
-        for (id, item) in &shared.plugins {
-            rest.push(if library.plugin(id).is_some() {
-                format!("Plugin {id}: installed already")
-            } else {
-                format!(
-                    "Plugin {id}: download {} at {}",
-                    quoted(&item.source),
-                    item.commit
-                )
-            });
-        }
-        if rest.len() > MAX_PREVIEW {
-            let more = rest.len() - MAX_PREVIEW;
-            rest.truncate(MAX_PREVIEW);
-            rest.push(format!("…and {more} more"));
-        }
-        lines.extend(rest);
 
         let name = self.settings().free_name(&shared.name);
         let title = format!("Import “{name}”?");

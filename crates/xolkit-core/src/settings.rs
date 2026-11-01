@@ -169,6 +169,10 @@ impl Settings {
         let name = name.trim();
         ensure!(!name.is_empty(), "Give the profile a name.");
         ensure!(
+            !name.chars().any(char::is_control),
+            "Keep the name to one line."
+        );
+        ensure!(
             name.chars().count() <= MAX_NAME,
             "Keep the name to {MAX_NAME} characters."
         );
@@ -189,7 +193,15 @@ impl Settings {
 
     /// A name like `name` that no profile has yet: `name`, else `name 2`, `name 3`, …
     pub fn free_name(&self, name: &str) -> String {
-        let base: String = name.trim().chars().take(MAX_NAME - 3).collect();
+        // Names come from shared profiles too; no control characters, so none can fake a line.
+        let base: String = name
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .trim()
+            .chars()
+            .take(MAX_NAME - 3)
+            .collect();
         let base = if base.is_empty() {
             "Imported".to_owned()
         } else {

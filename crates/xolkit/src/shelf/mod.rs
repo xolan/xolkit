@@ -426,10 +426,12 @@ impl Shelf {
         cx: &mut Context<Self>,
     ) {
         self.library.settings = settings.clone();
-        let mut steps = vec![Step::SaveSettings {
+        // Changes in the agents first: if one fails, the settings aren't saved either, so they
+        // never claim a state the agents don't have, and trying again redoes the rest.
+        let mut steps = extra;
+        steps.push(Step::SaveSettings {
             settings: Box::new(settings),
-        }];
-        steps.extend(extra);
+        });
         self.run(steps, done, window, cx);
     }
 

@@ -69,12 +69,42 @@ pub enum Action {
         provider: Provider,
         args: Vec<String>,
     },
-    /// Runs an agent's tool to take something out, and goes on if it fails: it may already be
-    /// gone from the agent, and that mustn't block removing it from xolkit.
+    /// Runs an agent's tool to take something out. A failure counts as done when the agent no
+    /// longer has `gone`: it was removed there already, which mustn't block removing it here.
     Undo {
         provider: Provider,
         args: Vec<String>,
+        gone: Gone,
     },
+}
+
+/// What an [`Action::Undo`] takes out of an agent, to check whether it is gone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Gone {
+    /// xolkit's MCP server entry.
+    McpEntry,
+    /// A plugin, by the id the agent knows it by.
+    Plugin { id: String },
+    /// xolkit's marketplace. Left behind it does no harm, so its removal never fails a plan.
+    Marketplace,
+}
+
+impl Gone {
+    fn is_gone(&self, env: &Env, provider: Provider) -> bool {
+        match self {
+            Gone::McpEntry => {
+                crate::registration(env, provider, Path::new("")) == crate::Registration::Missing
+            }
+            Gone::Plugin { id } => env
+                .run(
+                    provider.cli(),
+                    &["plugin".into(), "list".into(), "--json".into()],
+                )
+                .is_ok_and(|list| !list.contains(&format!("\"{id}\""))),
+            Gone::Marketplace => true,
+        }
+    }
 }
 
 impl Action {
@@ -136,7 +166,7 @@ impl Action {
             Action::Run { provider, args } => {
                 format!("Run `{} {}`", provider.cli(), args.join(" "))
             }
-            Action::Undo { provider, args } => format!(
+            Action::Undo { provider, args, .. } => format!(
                 "Run `{} {}`, if it's still there",
                 provider.cli(),
                 args.join(" ")
@@ -214,10 +244,15 @@ fn run(env: &Env, action: &Action) -> Result<()> {
             Ok(())
         }),
         Action::Run { provider, args } => env.run(provider.cli(), args).map(drop),
-        Action::Undo { provider, args } => {
-            let _ = env.run(provider.cli(), args);
-            Ok(())
-        }
+        Action::Undo {
+            provider,
+            args,
+            gone,
+        } => match env.run(provider.cli(), args) {
+            Ok(_) => Ok(()),
+            Err(_) if gone.is_gone(env, *provider) => Ok(()),
+            Err(error) => Err(error),
+        },
     }
 }
 

@@ -40,6 +40,40 @@ fn prompt_name(name: &str) -> String {
         .collect()
 }
 
+/// The prompts of a catalogue, each under a name of its own: skills first, then commands. Two
+/// names that read alike once made prompt-safe (`p:review` and `p-review`) get `-2` and on, so
+/// the listing and the lookup always agree.
+fn prompts(catalogue: &Catalogue) -> Vec<(String, Item<'_>)> {
+    let mut taken = std::collections::HashSet::new();
+    let items = catalogue
+        .skills
+        .iter()
+        .map(|s| (s.name.as_str(), Item::Skill(s)))
+        .chain(
+            catalogue
+                .commands
+                .iter()
+                .map(|c| (c.name.as_str(), Item::Command(c))),
+        );
+    items
+        .map(|(name, item)| {
+            let base = prompt_name(name);
+            let name = (1..)
+                .map(|n| {
+                    if n == 1 {
+                        base.clone()
+                    } else {
+                        format!("{base}-{n}")
+                    }
+                })
+                .find(|candidate| !taken.contains(candidate))
+                .unwrap_or(base);
+            taken.insert(name.clone());
+            (name, item)
+        })
+        .collect()
+}
+
 /// Whether agents accept `name` for a tool of xolkit's: Claude Code names it
 /// `mcp__xolkit__<name>`, and tool names are limited to 64 letters, digits, `_` and `-`.
 fn usable_tool_name(name: &str) -> bool {
@@ -110,17 +144,22 @@ impl Session {
         if found.is_empty() {
             return text(format!("No skill matches “{query}”."));
         }
+        let names = prompts(&catalogue);
         let lines: Vec<String> = found
             .iter()
             .take(15)
             .map(|item| match item {
                 Item::Skill(s) => format!("- {} (skill): {}", s.name, s.description),
-                Item::Command(c) => format!(
-                    "- {} (prompt, run it as /mcp__xolkit__{}): {}",
-                    c.name,
-                    prompt_name(&c.name),
-                    c.description
-                ),
+                Item::Command(c) => {
+                    let prompt = names
+                        .iter()
+                        .find(|(_, i)| matches!(i, Item::Command(other) if other.name == c.name))
+                        .map_or("", |(name, _)| name.as_str());
+                    format!(
+                        "- {} (prompt, run it as /mcp__xolkit__{prompt}): {}",
+                        c.name, c.description
+                    )
+                }
             })
             .collect();
         text(format!(
@@ -306,32 +345,29 @@ impl ServerHandler for Session {
     ) -> Result<ListPromptsResult, McpError> {
         self.note_client(&context);
         let catalogue = self.catalogue();
-        let mut prompts: Vec<Prompt> = catalogue
-            .skills
-            .iter()
-            .map(|s| {
-                Prompt::new(
-                    prompt_name(&s.name),
+        let prompts: Vec<Prompt> = prompts(&catalogue)
+            .into_iter()
+            .map(|(name, item)| match item {
+                Item::Skill(s) => Prompt::new(
+                    name,
                     Some(format!("Use the {} skill. {}", s.name, s.description)),
                     Some(vec![
                         PromptArgument::new("task")
                             .with_description("What to use the skill for")
                             .with_required(false),
                     ]),
-                )
+                ),
+                Item::Command(c) => Prompt::new(
+                    name,
+                    Some(c.description.clone()),
+                    Some(vec![
+                        PromptArgument::new("arguments")
+                            .with_description("Replaces $ARGUMENTS in the prompt")
+                            .with_required(false),
+                    ]),
+                ),
             })
             .collect();
-        prompts.extend(catalogue.commands.iter().map(|c| {
-            Prompt::new(
-                prompt_name(&c.name),
-                Some(c.description.clone()),
-                Some(vec![
-                    PromptArgument::new("arguments")
-                        .with_description("Replaces $ARGUMENTS in the prompt")
-                        .with_required(false),
-                ]),
-            )
-        }));
         Ok(ListPromptsResult::with_all_items(prompts))
     }
 
@@ -350,35 +386,30 @@ impl ServerHandler for Session {
                 .unwrap_or_default()
                 .to_owned()
         };
-        let text = if let Some(skill) = catalogue
-            .skills
-            .iter()
-            .find(|s| prompt_name(&s.name) == request.name)
-        {
-            let task = arg("task");
-            let mut text = format!(
-                "Use the skill below{}. Its files are in {}.\n\n{}",
-                if task.is_empty() {
-                    String::new()
-                } else {
-                    format!(" for this task: {task}")
-                },
-                skill.dir.display(),
-                skill.body()
-            );
-            text.truncate(text.trim_end().len());
-            text
-        } else if let Some(command) = catalogue
-            .commands
-            .iter()
-            .find(|c| prompt_name(&c.name) == request.name)
-        {
-            command.render(&arg("arguments"))
-        } else {
+        let named = prompts(&catalogue);
+        let Some((_, item)) = named.iter().find(|(name, _)| *name == request.name) else {
             return Err(McpError::invalid_params(
                 format!("no prompt named {}", request.name),
                 None,
             ));
+        };
+        let text = match item {
+            Item::Skill(skill) => {
+                let task = arg("task");
+                let mut text = format!(
+                    "Use the skill below{}. Its files are in {}.\n\n{}",
+                    if task.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" for this task: {task}")
+                    },
+                    skill.dir.display(),
+                    skill.body()
+                );
+                text.truncate(text.trim_end().len());
+                text
+            }
+            Item::Command(command) => command.render(&arg("arguments")),
         };
         self.daemon
             .session_call(self.id, &format!("prompt {}", request.name));
@@ -395,6 +426,22 @@ mod tests {
         assert!(usable_tool_name("github__create_issue"));
         assert!(!usable_tool_name(&format!("server__{}", "x".repeat(50))));
         assert!(!usable_tool_name("server__has.dot"));
+    }
+
+    #[test]
+    fn prompt_names_never_collide() {
+        let skill = |name: &str| xolkit_core::Skill {
+            name: name.into(),
+            title: String::new(),
+            description: String::new(),
+            dir: Default::default(),
+        };
+        let catalogue = Catalogue {
+            skills: vec![skill("p-review"), skill("p:review")],
+            ..Catalogue::default()
+        };
+        let names: Vec<String> = prompts(&catalogue).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["p-review", "p-review-2"]);
     }
 
     #[test]
