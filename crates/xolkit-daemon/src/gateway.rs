@@ -12,7 +12,7 @@ use rmcp::service::{NotificationContext, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientHandler, RoleClient, ServiceExt};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use xolkit_core::{Env, Server, ServerConfig, get_secret, secret_key};
 
 use crate::protocol::{ServerState, ServerStatus};
@@ -290,9 +290,30 @@ impl Gateway {
                     let gateway = self.clone();
                     let name = server.name.clone();
                     tokio::spawn(async move {
-                        let mut lines = BufReader::new(stderr).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            gateway.log(&name, line, false);
+                        // Lines past 4 KB are cut, so a server that never ends a line can't
+                        // grow one without end.
+                        let mut reader = BufReader::new(stderr);
+                        let mut line = Vec::new();
+                        loop {
+                            line.clear();
+                            match (&mut reader).take(4096).read_until(b'\n', &mut line).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                            if !line.ends_with(b"\n") {
+                                // Skip the rest of a long line.
+                                let mut rest = Vec::new();
+                                while let Ok(1..) =
+                                    (&mut reader).take(4096).read_until(b'\n', &mut rest).await
+                                {
+                                    if rest.ends_with(b"\n") {
+                                        break;
+                                    }
+                                    rest.clear();
+                                }
+                            }
+                            let text = String::from_utf8_lossy(&line);
+                            gateway.log(&name, text.trim_end().to_owned(), false);
                         }
                     });
                 }

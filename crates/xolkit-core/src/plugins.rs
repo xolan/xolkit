@@ -128,8 +128,12 @@ fn read_parts(dir: &Path, manifest: &Value) -> Parts {
         skills: scan_skills(&dir.join("skills")),
         ..Parts::default()
     };
+    // A manifest path is a skill folder itself, or a folder of them.
     for extra in manifest_paths(dir, &manifest["skills"]) {
-        parts.skills.extend(scan_skills(&extra));
+        match Skill::read(&extra) {
+            Some(skill) => parts.skills.push(skill),
+            None => parts.skills.extend(scan_skills(&extra)),
+        }
     }
 
     let mut command_dirs = vec![dir.join("commands")];
@@ -189,6 +193,13 @@ fn read_commands(dir: &Path) -> Vec<Command> {
 }
 
 fn collect_commands(dir: &Path, prefix: &str, commands: &mut Vec<Command>) {
+    // A manifest path may name one command file.
+    if dir.is_file() {
+        if let Some(stem) = dir.file_stem().and_then(|s| s.to_str()) {
+            commands.push(read_command(dir, stem.to_owned()));
+        }
+        return;
+    }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -205,22 +216,28 @@ fn collect_commands(dir: &Path, prefix: &str, commands: &mut Vec<Command>) {
         if path.is_dir() {
             collect_commands(&path, &name, commands);
         } else if path.extension().is_some_and(|e| e == "md") {
-            let text = fs::read_to_string(&path).unwrap_or_default();
-            let description = frontmatter(&text).description.unwrap_or_else(|| {
-                strip_frontmatter(&text)
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or_default()
-                    .trim_start_matches('#')
-                    .trim()
-                    .to_owned()
-            });
-            commands.push(Command {
-                name,
-                description,
-                path,
-            });
+            commands.push(read_command(&path, name));
         }
+    }
+}
+
+/// The command in the Markdown file `path`: its description from the frontmatter, else its
+/// first line.
+fn read_command(path: &Path, name: String) -> Command {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let description = frontmatter(&text).description.unwrap_or_else(|| {
+        strip_frontmatter(&text)
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_default()
+            .trim_start_matches('#')
+            .trim()
+            .to_owned()
+    });
+    Command {
+        name,
+        description,
+        path: path.to_path_buf(),
     }
 }
 
@@ -288,6 +305,24 @@ mod tests {
             Some(format!("{}/bin/tool", dir.display()).as_str())
         );
         assert!(!plugin.needs_native());
+    }
+
+    #[test]
+    fn manifest_paths_name_skills_and_commands_directly() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("p@m");
+        crate::skills::write_skill(&dir.join("extra/task"), "task");
+        fs::write(dir.join("extra/review.md"), "# Review it\n").unwrap();
+        fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
+        fs::write(
+            dir.join(".claude-plugin/plugin.json"),
+            r#"{"skills": ["./extra/task"], "commands": ["./extra/review.md"]}"#,
+        )
+        .unwrap();
+        let plugin = Plugin::read(&dir).unwrap();
+        assert_eq!(plugin.parts.skills[0].name, "task");
+        assert_eq!(plugin.parts.commands[0].name, "review");
+        assert_eq!(plugin.parts.commands[0].description, "Review it");
     }
 
     #[test]

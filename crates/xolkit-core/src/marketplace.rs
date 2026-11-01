@@ -444,10 +444,29 @@ pub(crate) fn native_state(env: &Env, provider: Provider, id: &str) -> Result<Op
         Provider::Codex => (list["installed"].as_array(), "pluginId"),
     };
     let entries = entries.context("unexpected plugin list from the agent")?;
-    let entry = entries
-        .iter()
-        .find(|e| e[key] == id && (provider == Provider::Codex || e["scope"] == "user"));
-    Ok(entry.map(|e| e["enabled"].as_bool().unwrap_or(true)))
+    // Every entry must say what it is, so a malformed one can't hide the plugin.
+    let mut found = None;
+    for entry in entries {
+        let listed = entry[key]
+            .as_str()
+            .context("the agent's plugin list has an entry without an id")?;
+        let user = match provider {
+            Provider::Claude => {
+                entry["scope"]
+                    .as_str()
+                    .context("the agent's plugin list has an entry without a scope")?
+                    == "user"
+            }
+            Provider::Codex => true,
+        };
+        if listed == id && user {
+            let on = entry["enabled"]
+                .as_bool()
+                .context("the agent's plugin list doesn't say whether the plugin is on")?;
+            found = Some(on);
+        }
+    }
+    Ok(found)
 }
 
 /// Steps that uninstall a native plugin from `provider`, and take xolkit's marketplace out of

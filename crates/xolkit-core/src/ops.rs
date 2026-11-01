@@ -100,19 +100,23 @@ impl Gone {
     /// Whether the agent no longer has it. Only a clear answer counts: a config or listing that
     /// can't be read means "maybe not".
     fn is_gone(&self, env: &Env, provider: Provider) -> bool {
-        // Without the agent's tool nothing can be taken out through it, and an agent that is
-        // gone doesn't run what's left.
-        if !env.has_tool(provider.cli()) {
-            return true;
-        }
         match self {
+            // The config can be read without the agent's tool.
             Gone::McpEntry => crate::registration::has_entry(env, provider).is_ok_and(|has| !has),
+            // An agent that is gone (no folder, no tool) runs nothing that's left. A tool merely
+            // missing from PATH is no proof, so then the listing must say so.
+            Gone::Plugin { .. } if agent_absent(env, provider) => true,
             Gone::Plugin { id } => {
                 crate::marketplace::native_state(env, provider, id).is_ok_and(|s| s.is_none())
             }
             Gone::Marketplace => true,
         }
     }
+}
+
+/// Whether the agent is gone from this computer: neither its folder nor its tool is there.
+fn agent_absent(env: &Env, provider: Provider) -> bool {
+    env.locate(provider).is_none()
 }
 
 impl Action {
@@ -260,13 +264,17 @@ fn run(env: &Env, action: &Action) -> Result<()> {
             let args = ["plugin", verb, id, "--scope", "user"].map(String::from);
             match env.run(Provider::Claude.cli(), &args) {
                 Ok(_) => Ok(()),
-                Err(_)
-                    if crate::marketplace::native_state(env, Provider::Claude, id)
-                        .is_ok_and(|state| state.is_none_or(|on| on == *enabled)) =>
-                {
-                    Ok(())
-                }
-                Err(error) => Err(error),
+                // Claude Code is gone; nothing of it runs to switch.
+                Err(_) if agent_absent(env, Provider::Claude) => Ok(()),
+                Err(error) => match crate::marketplace::native_state(env, Provider::Claude, id) {
+                    // Already as wanted; or off and not installed at all.
+                    Ok(Some(on)) if on == *enabled => Ok(()),
+                    Ok(None) if !*enabled => Ok(()),
+                    Ok(None) => Err(anyhow::anyhow!(
+                        "Claude Code no longer has the plugin {id}; install it natively again"
+                    )),
+                    _ => Err(error),
+                },
             }
         }
         Action::Undo {

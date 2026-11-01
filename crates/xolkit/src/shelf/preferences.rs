@@ -130,13 +130,7 @@ impl Shelf {
         let steps = if on {
             register(&self.env, provider, &exe)
         } else {
-            unregister(
-                &self.env,
-                provider,
-                &exe,
-                &self.library.lock,
-                self.settings(),
-            )
+            unregister(&self.env, provider, &self.library.lock, self.settings())
         };
         if steps.is_empty() {
             return;
