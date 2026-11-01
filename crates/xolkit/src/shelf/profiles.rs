@@ -26,6 +26,8 @@ use crate::settings;
 
 /// Most steps the switch dialog lists.
 const MAX_STEPS: usize = 14;
+/// Most lines the import dialog lists.
+const MAX_PREVIEW: usize = 24;
 
 /// A profile on its way in: from a code, or from a file with its local skills unpacked.
 #[derive(Clone)]
@@ -440,7 +442,35 @@ impl Shelf {
     fn preview_import(&mut self, incoming: Incoming, window: &mut Window, cx: &mut Context<Self>) {
         let shared = &incoming.shared;
         let library = &self.library;
+        // Servers first: they run commands, so they must not scroll out of view. Values are
+        // quoted, so a newline in one can't pass for another line.
         let mut lines: Vec<String> = Vec::new();
+        for (name, server) in &shared.servers {
+            if library.servers.contains_key(name) {
+                lines.push(format!("Server {name}: kept as you have it"));
+                continue;
+            }
+            // Everything the server would run with, so nothing hides in its environment.
+            let config = &server.config;
+            lines.push(format!("Server {name}: add {:?}", config.summary()));
+            let plain = if config.is_remote() {
+                &config.headers
+            } else {
+                &config.env
+            };
+            for (key, value) in plain {
+                lines.push(format!("    {key} = {value:?}"));
+            }
+            if let Some(cwd) = &config.cwd {
+                lines.push(format!("    in the folder {:?}", cwd.display().to_string()));
+            }
+            if !config.secrets.is_empty() {
+                lines.push(format!(
+                    "    then save {} under MCP servers",
+                    config.secrets.join(", ")
+                ));
+            }
+        }
         for (name, item) in &shared.skills {
             let line = if library.skill(name).is_some() {
                 format!("Skill {name}: installed already")
@@ -468,32 +498,12 @@ impl Shelf {
                 format!("Plugin {id}: download {} at {}", item.source, item.commit)
             });
         }
-        for (name, server) in &shared.servers {
-            if library.servers.contains_key(name) {
-                lines.push(format!("Server {name}: kept as you have it"));
-                continue;
-            }
-            // Everything the server would run with, so nothing hides in its environment.
-            let config = &server.config;
-            lines.push(format!("Server {name}: add {}", config.summary()));
-            let plain = if config.is_remote() {
-                &config.headers
-            } else {
-                &config.env
-            };
-            for (key, value) in plain {
-                lines.push(format!("    {key} = {value}"));
-            }
-            if let Some(cwd) = &config.cwd {
-                lines.push(format!("    in the folder {}", cwd.display()));
-            }
-            if !config.secrets.is_empty() {
-                lines.push(format!(
-                    "    then save {} under MCP servers",
-                    config.secrets.join(", ")
-                ));
-            }
+        if lines.len() > MAX_PREVIEW {
+            let more = lines.len() - MAX_PREVIEW;
+            lines.truncate(MAX_PREVIEW);
+            lines.push(format!("…and {more} more"));
         }
+
         let name = self.settings().free_name(&shared.name);
         let title = format!("Import “{name}”?");
         let shelf = cx.entity();

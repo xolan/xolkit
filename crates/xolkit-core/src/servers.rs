@@ -107,6 +107,9 @@ pub fn valid_server_name(name: &str) -> bool {
         && name.len() <= 32
         && name != XOLKIT
         && !name.contains("__")
+        // Tool names are `<server>__<tool>`; a `_` at either end would blur the split.
+        && !name.starts_with('_')
+        && !name.ends_with('_')
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')

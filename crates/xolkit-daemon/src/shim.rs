@@ -125,6 +125,10 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
         }
         if send.write_all(opening.as_bytes()).await.is_err() {
             failures += 1;
+            if failures > RECONNECTS {
+                anyhow::bail!("xolkit keeps closing the session");
+            }
+            tokio::time::sleep(Duration::from_millis(500 * u64::from(failures))).await;
             continue;
         }
         let connected = std::time::Instant::now();

@@ -220,13 +220,15 @@ fn output_within(
         .spawn()?;
     // Read both pipes on their own threads, so a full pipe never stalls the child.
     let read = |pipe: Option<Box<dyn Read + Send>>| {
+        let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut out = Vec::new();
             if let Some(mut pipe) = pipe {
                 let _ = pipe.read_to_end(&mut out);
             }
-            out
-        })
+            let _ = sender.send(out);
+        });
+        receiver
     };
     let stdout = read(
         child
@@ -255,10 +257,15 @@ fn output_within(
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
+    // A helper the tool left running can hold the pipes open; don't wait for it past a moment.
+    let collect = |pipe: std::sync::mpsc::Receiver<Vec<u8>>| {
+        pipe.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_default()
+    };
     Ok(std::process::Output {
         status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout: collect(stdout),
+        stderr: collect(stderr),
     })
 }
 
@@ -296,13 +303,22 @@ fn merge_paths(first: Option<OsString>, extra: Option<OsString>) -> Option<OsStr
 fn login_shell_path() -> Option<OsString> {
     use std::time::{Duration, Instant};
     let shell = std::env::var_os("SHELL")?;
-    let mut child = Command::new(shell)
+    let mut command = Command::new(shell);
+    command
         .args(["-l", "-i", "-c", "env"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    // An interactive shell in a background process group of a terminal stops itself, and the
+    // whole group with it, when it touches the terminal; its own session has no terminal.
+    // SAFETY: setsid is async-signal-safe, which is all pre_exec requires.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().ok()?;
     // shortcut: `env` output over the pipe buffer (64 KiB) stalls until the timeout; read it on a thread if that happens.
     let deadline = Instant::now() + Duration::from_secs(5);
     while child.try_wait().ok()?.is_none() {

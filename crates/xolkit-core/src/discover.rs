@@ -529,6 +529,7 @@ pub(crate) fn valid_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        && storable(name)
 }
 
 /// `name@marketplace`, both safe names.
@@ -537,10 +538,18 @@ pub(crate) fn valid_plugin_id(id: &str) -> bool {
         .is_some_and(|(name, marketplace)| valid_name(name) && valid_name(marketplace))
 }
 
-/// Refuses anything but `owner/repo`, since it goes into GitHub URLs.
+/// Refuses anything but `owner/repo`, since it goes into GitHub URLs. Repositories such as
+/// `owner/.github` start with a dot, so this is looser than [`valid_name`].
 pub(crate) fn check_source(source: &str) -> Result<()> {
+    let part = |p: &str| {
+        !p.is_empty()
+            && p != "."
+            && p != ".."
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    };
     ensure!(
-        source.split('/').count() == 2 && source.split('/').all(valid_name),
+        source.split('/').count() == 2 && source.split('/').all(part),
         "not a GitHub repository: {source}"
     );
     Ok(())

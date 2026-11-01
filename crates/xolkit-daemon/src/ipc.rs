@@ -129,14 +129,16 @@ pub(crate) async fn connect_or_start(env: &Env, exe: &Path) -> Result<AsyncStrea
 
 /// Connects to the daemon without an async runtime, for the app, starting it when needed.
 pub(crate) fn connect_or_start_blocking(env: &Env, exe: &Path) -> Result<Stream> {
-    if let Ok(stream) = Stream::connect(name(env)?) {
+    // No name yet (on Windows, no `run/pipe`) means no daemon, like a failed connect.
+    let connect = || name(env).and_then(Stream::connect);
+    if let Ok(stream) = connect() {
         return Ok(stream);
     }
     start(exe)?;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
         std::thread::sleep(Duration::from_millis(100));
-        match Stream::connect(name(env)?) {
+        match connect() {
             Ok(stream) => return Ok(stream),
             Err(e) if Instant::now() > deadline => {
                 return Err(e).context("the xolkit daemon didn't start");
@@ -154,8 +156,17 @@ fn start(exe: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // A session of its own: no controlling terminal, so nothing it starts (such as the login
+    // shell that tells it the user's PATH) gets stopped for reading from a terminal it doesn't
+    // own, and closing the terminal doesn't end it.
     #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    // SAFETY: setsid is async-signal-safe, which is all pre_exec requires.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+            libc::setsid();
+            Ok(())
+        });
+    }
     #[cfg(windows)]
     {
         const DETACHED_PROCESS: u32 = 0x0000_0008;

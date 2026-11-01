@@ -103,7 +103,8 @@ impl Shared {
         };
         for skill in &library.skills {
             let on = agents_on(profile.skills.get(&skill.name));
-            if on.is_empty() {
+            // A folder made by hand may have a name others can't install under.
+            if on.is_empty() || !valid_name(&skill.name) {
                 continue;
             }
             let item = match library.lock.skills.get(&skill.name) {
@@ -267,10 +268,10 @@ pub fn read_export(env: &Env, path: &Path) -> Result<(Shared, PathBuf)> {
         "the file is larger than {} MB",
         MAX_FILE >> 20
     );
-    let dest = env.staging_dir().join(unique());
-    fs::create_dir_all(&dest)?;
     // `extract` drops the archive's first folder, as GitHub wraps everything in one.
     let wrapped = wrap_in_folder(path)?;
+    let dest = env.staging_dir().join(unique());
+    fs::create_dir_all(&dest)?;
     let result = extract(&wrapped[..], "", &dest, MAX_FILE).and_then(|_| {
         let json = fs::read(dest.join("profile.json")).context("the file has no profile")?;
         let shared: Shared = serde_json::from_slice(&json).context("the profile is damaged")?;

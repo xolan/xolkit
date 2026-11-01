@@ -44,7 +44,7 @@ struct Connection {
     pid: Option<u32>,
     calls: u64,
     latency_ms: Option<u64>,
-    /// Bumped on every (re)connect, so a late result of an older attempt is dropped.
+    /// The current connection attempt; a result of any other is dropped.
     generation: u64,
 }
 
@@ -114,9 +114,7 @@ impl Gateway {
                     Some(c) => stopped.extend(c.service.clone()),
                     None => {}
                 }
-                let generation = connections
-                    .get(&server.name)
-                    .map_or(0, |c| c.generation + 1);
+                let generation = next_attempt();
                 connections.insert(
                     server.name.clone(),
                     Connection {
@@ -147,7 +145,7 @@ impl Gateway {
         let (server, generation, old) = {
             let mut connections = self.connections.lock().unwrap();
             let connection = connections.get_mut(name).context("no such server")?;
-            connection.generation += 1;
+            connection.generation = next_attempt();
             connection.state = ServerState::Starting;
             connection.tools.clear();
             connection.pid = None;
@@ -169,7 +167,7 @@ impl Gateway {
         let old = {
             let mut connections = self.connections.lock().unwrap();
             let connection = connections.get_mut(name).context("no such server")?;
-            connection.generation += 1;
+            connection.generation = next_attempt();
             connection.state = ServerState::Stopped;
             connection.tools.clear();
             connection.pid = None;
@@ -407,6 +405,13 @@ impl Gateway {
             })
             .collect()
     }
+}
+
+/// A number no connection attempt has had, so a late result of an old attempt (even of a server
+/// removed and added again) is never taken for the current one.
+fn next_attempt() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 async fn close(service: Arc<RunningService<RoleClient, Handler>>) {

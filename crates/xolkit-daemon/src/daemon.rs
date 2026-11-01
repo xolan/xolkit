@@ -23,8 +23,12 @@ use xolkit_core::{
 use crate::gateway::{Gateway, Notice};
 use crate::ipc;
 use crate::protocol::{Event, Hello, Request, Response, SessionStatus, Status, now};
-use crate::session::Session;
+use crate::session::{SEPARATOR, Session};
 
+/// Most files of one plugin the watcher looks at.
+const MAX_WATCHED: usize = 2000;
+/// Largest `daemon.log` before it starts over.
+const MAX_LOG: u64 = 5 * 1024 * 1024;
 /// Events kept for the Connections page.
 const MAX_EVENTS: usize = 500;
 /// How often the daemon looks for changes made to `~/.xolkit` by hand.
@@ -49,6 +53,11 @@ pub(crate) struct Daemon {
     log: Mutex<Option<std::fs::File>>,
     /// Serializes changes, so two plans never run at once.
     executing: tokio::sync::Mutex<()>,
+    /// Whether the library last failed to read: until it reads again, the daemon serves what it
+    /// has and leaves the router skills and server connections alone.
+    broken: std::sync::atomic::AtomicBool,
+    /// Tools left out for their names, already logged once.
+    left_out: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Daemon {
@@ -62,11 +71,7 @@ impl Daemon {
                 Some(format!("could not read the library: {e:#}")),
             ),
         };
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(env.run_dir().join("daemon.log"))
-            .ok();
+        let log = rotate_log(&env);
         let daemon = Arc::new(Daemon {
             env,
             library: RwLock::new(Arc::new(library)),
@@ -81,6 +86,8 @@ impl Daemon {
             shutdown: tokio::sync::Notify::new(),
             log: Mutex::new(log),
             executing: tokio::sync::Mutex::new(()),
+            broken: std::sync::atomic::AtomicBool::new(problem.is_some()),
+            left_out: Mutex::new(std::collections::HashSet::new()),
         });
         let weak = Arc::downgrade(&daemon);
         let gateway = Gateway::new(
@@ -133,18 +140,41 @@ impl Daemon {
             message: message.into(),
             error,
         };
-        if let Some(log) = self.log.lock().unwrap().as_mut() {
-            let mark = if error { "error" } else { "info" };
-            let _ = writeln!(
-                log,
-                "{} {mark} [{}] {}",
-                event.time, event.source, event.message
-            );
+        {
+            let mut log = self.log.lock().unwrap();
+            // Past the size cap, start a new log, keeping the last one as daemon.log.old.
+            if log
+                .as_ref()
+                .and_then(|f| f.metadata().ok())
+                .is_some_and(|m| m.len() > MAX_LOG)
+            {
+                *log = rotate_log(&self.env);
+            }
+            if let Some(log) = log.as_mut() {
+                let mark = if error { "error" } else { "info" };
+                let _ = writeln!(
+                    log,
+                    "{} {mark} [{}] {}",
+                    event.time, event.source, event.message
+                );
+            }
         }
         let mut events = self.events.lock().unwrap();
         events.push_back(event);
         while events.len() > MAX_EVENTS {
             events.pop_front();
+        }
+    }
+
+    /// Logs that a server's tool was left out, once per tool.
+    pub(crate) fn left_out(&self, server: &str, tool: &str) {
+        let key = format!("{server}{SEPARATOR}{tool}");
+        if self.left_out.lock().unwrap().insert(key) {
+            self.event(
+                server,
+                format!("left out the tool {tool}: its name is too long or unusual"),
+                true,
+            );
         }
     }
 
@@ -176,18 +206,27 @@ impl Daemon {
     fn reload(&self) {
         match Library::load(&self.env) {
             Ok(library) => {
-                let same = **self.library.read().unwrap() == library;
+                let was_broken = self.broken.swap(false, Ordering::SeqCst);
+                let same = !was_broken && **self.library.read().unwrap() == library;
                 *self.library.write().unwrap() = Arc::new(library);
                 if !same {
                     self.apply();
                 }
             }
-            Err(e) => self.event("daemon", format!("could not read the library: {e:#}"), true),
+            Err(e) => {
+                // Once per breakage, not every time the watcher looks.
+                if !self.broken.swap(true, Ordering::SeqCst) {
+                    self.event("daemon", format!("could not read the library: {e:#}"), true);
+                }
+            }
         }
     }
 
     /// Connects to the servers some agent gets, writes the router skills, and tells sessions.
     fn apply(&self) {
+        if self.broken.load(Ordering::SeqCst) {
+            return;
+        }
         let library = self.library();
         let mut wanted = Vec::new();
         for agent in Agent::ALL {
@@ -414,12 +453,18 @@ impl Daemon {
     }
 }
 
-/// Keeps the log from growing forever: past 5 MB, it moves to `daemon.log.old` at start.
-fn rotate_log(env: &Env) {
+/// Opens the log, first moving one past `MAX_LOG` to `daemon.log.old`, so it never grows
+/// without end.
+fn rotate_log(env: &Env) -> Option<std::fs::File> {
     let log = env.run_dir().join("daemon.log");
-    if std::fs::metadata(&log).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
+    if std::fs::metadata(&log).is_ok_and(|m| m.len() > MAX_LOG) {
         let _ = std::fs::rename(&log, env.run_dir().join("daemon.log.old"));
     }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .ok()
 }
 
 /// Whether the router skill in `provider`'s folder is one xolkit wrote, so it may be removed.
@@ -455,18 +500,22 @@ fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
     for skill in folders(&env.skills_dir()) {
         times.extend([mtime(&skill), mtime(&skill.join("SKILL.md"))]);
     }
-    // What a plugin is read from: its manifest, servers, commands and skills.
+    // Every file of every plugin, as its manifest may point anywhere inside it. Plugins are
+    // small; the cap keeps a huge one from making each look slow.
     for plugin in folders(&env.plugins_dir()) {
-        for part in [
-            ".claude-plugin/plugin.json",
-            ".mcp.json",
-            "commands",
-            "skills",
-        ] {
-            times.push(mtime(&plugin.join(part)));
-        }
-        for skill in folders(&plugin.join("skills")) {
-            times.push(mtime(&skill.join("SKILL.md")));
+        let mut stack = vec![plugin];
+        let mut seen = 0;
+        while let Some(dir) = stack.pop() {
+            for entry in folders(&dir) {
+                seen += 1;
+                if seen > MAX_WATCHED {
+                    break;
+                }
+                times.push(mtime(&entry));
+                if entry.is_dir() {
+                    stack.push(entry);
+                }
+            }
         }
     }
     times
@@ -475,7 +524,6 @@ fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
 /// Runs the daemon until it is told to stop or has been idle long enough.
 pub async fn run(env: Env) -> Result<()> {
     let (listener, instance) = ipc::listen(&env)?;
-    rotate_log(&env);
     let daemon = Daemon::new(env.clone());
     let _ = std::fs::write(
         env.run_dir().join("daemon.pid"),

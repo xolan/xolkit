@@ -237,14 +237,7 @@ impl ServerHandler for Session {
                 let name = format!("{}{SEPARATOR}{}", server.name, tool.name);
                 // Agents refuse a whole request over one bad tool name, so leave such tools out.
                 if !usable_tool_name(&name) {
-                    self.daemon.event(
-                        &server.name,
-                        format!(
-                            "left out the tool {}: its name is too long or unusual",
-                            tool.name
-                        ),
-                        true,
-                    );
+                    self.daemon.left_out(&server.name, &tool.name);
                     continue;
                 }
                 let mut tool = tool.clone();
