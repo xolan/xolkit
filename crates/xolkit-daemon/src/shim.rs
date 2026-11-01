@@ -32,7 +32,7 @@ struct Session {
 
 impl Session {
     /// Notes a line from the agent.
-    fn from_agent(&mut self, line: &str) {
+    fn heard_from_agent(&mut self, line: &str) {
         let Ok(message) = serde_json::from_str::<Value>(line) else {
             return;
         };
@@ -49,7 +49,7 @@ impl Session {
     }
 
     /// Notes a line from the daemon; `false` when the agent shouldn't see it.
-    fn from_daemon(&mut self, line: &str) -> bool {
+    fn heard_from_daemon(&mut self, line: &str) -> bool {
         let Ok(message) = serde_json::from_str::<Value>(line) else {
             return true;
         };
@@ -133,7 +133,7 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
             tokio::select! {
                 line = agent_lines.next_line() => match line {
                     Ok(Some(line)) => {
-                        session.from_agent(&line);
+                        session.heard_from_agent(&line);
                         if send.write_all(format!("{line}\n").as_bytes()).await.is_err() {
                             break;
                         }
@@ -143,7 +143,7 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
                 },
                 line = daemon_lines.next_line() => match line {
                     Ok(Some(line)) => {
-                        if session.from_daemon(&line) {
+                        if session.heard_from_daemon(&line) {
                             stdout.write_all(format!("{line}\n").as_bytes()).await?;
                             stdout.flush().await?;
                         }
@@ -167,20 +167,22 @@ mod tests {
     fn replays_the_opening_and_answers_what_was_lost() {
         let mut session = Session::default();
         let init = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#;
-        session.from_agent(init);
-        assert!(session.from_daemon(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#));
-        session.from_agent(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-        session.from_agent(r#"{"jsonrpc":"2.0","id":"a","method":"tools/call"}"#);
-        session.from_agent(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
-        assert!(session.from_daemon(r#"{"jsonrpc":"2.0","id":2,"result":{}}"#));
+        session.heard_from_agent(init);
+        assert!(session.heard_from_daemon(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#));
+        session.heard_from_agent(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        session.heard_from_agent(r#"{"jsonrpc":"2.0","id":"a","method":"tools/call"}"#);
+        session.heard_from_agent(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+        assert!(session.heard_from_daemon(r#"{"jsonrpc":"2.0","id":2,"result":{}}"#));
 
         let lost = session.abandon();
         assert_eq!(lost.len(), 1);
         assert!(lost[0].contains(r#""id":"a""#), "{}", lost[0]);
         assert_eq!(session.replay().len(), 2);
         // The new daemon's answer to the replayed opening isn't passed on; later ones are.
-        assert!(!session.from_daemon(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#));
-        assert!(session.from_daemon(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#));
-        assert!(session.from_daemon(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#));
+        assert!(!session.heard_from_daemon(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#));
+        assert!(session.heard_from_daemon(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#));
+        assert!(
+            session.heard_from_daemon(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#)
+        );
     }
 }

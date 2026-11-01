@@ -133,7 +133,9 @@ mod tests {
         write_skill(&env.skills_dir().join("s"), "s");
         write_plugin(&env.plugins_dir(), "p@m", false);
         let mut settings = Settings::default();
-        settings.active_mut().set(Kind::Skill, "s", Agent::Claude, true);
+        settings
+            .active_mut()
+            .set(Kind::Skill, "s", Agent::Claude, true);
         execute(
             &env,
             &[

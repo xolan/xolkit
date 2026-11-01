@@ -53,6 +53,15 @@ fn error_result(text: impl Into<String>) -> CallToolResponse {
 }
 
 impl Session {
+    /// Records the client's name and version once a request carries them: the current protocol
+    /// sends them with every request, older ones once at the start.
+    fn note_client(&self, context: &RequestContext<RoleServer>) {
+        if let Some(info) = context.client_info() {
+            self.daemon
+                .session_client(self.id, format!("{} {}", info.name, info.version));
+        }
+    }
+
     fn catalogue(&self) -> Catalogue {
         self.daemon.catalogue(self.agent)
     }
@@ -174,7 +183,10 @@ impl ServerHandler for Session {
         });
     }
 
-    fn accepted_subscription_filter(&self, requested: &SubscriptionFilter) -> Option<SubscriptionFilter> {
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
         let mut accepted = SubscriptionFilter::default();
         accepted.tools_list_changed = requested.tools_list_changed;
         accepted.prompts_list_changed = requested.prompts_list_changed;
@@ -207,8 +219,9 @@ impl ServerHandler for Session {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        self.note_client(&context);
         let mut tools = Session::own_tools();
         for server in self.catalogue().servers {
             for tool in self.daemon.gateway().tools(&server.name) {
@@ -223,8 +236,9 @@ impl ServerHandler for Session {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        self.note_client(&context);
         let arg = |key: &str| {
             request
                 .arguments
@@ -241,7 +255,10 @@ impl ServerHandler for Session {
             "load_skill" => self.load_skill(&arg("name")),
             _ => {
                 let Some((server, tool)) = name.split_once(SEPARATOR) else {
-                    return Err(McpError::invalid_params(format!("no tool named {name}"), None));
+                    return Err(McpError::invalid_params(
+                        format!("no tool named {name}"),
+                        None,
+                    ));
                 };
                 if !self.catalogue().servers.iter().any(|s| s.name == server) {
                     return Err(McpError::invalid_params(
@@ -257,7 +274,8 @@ impl ServerHandler for Session {
                 {
                     Ok(result) => result.into(),
                     Err(e) => {
-                        self.daemon.session_error(self.id, &format!("{name}: {e:#}"));
+                        self.daemon
+                            .session_error(self.id, &format!("{name}: {e:#}"));
                         error_result(format!("{e:#}"))
                     }
                 }
@@ -269,8 +287,9 @@ impl ServerHandler for Session {
     async fn list_prompts(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
+        self.note_client(&context);
         let catalogue = self.catalogue();
         let mut prompts: Vec<Prompt> = catalogue
             .skills
@@ -346,7 +365,8 @@ impl ServerHandler for Session {
                 None,
             ));
         };
-        self.daemon.session_call(self.id, &format!("prompt {}", request.name));
+        self.daemon
+            .session_call(self.id, &format!("prompt {}", request.name));
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(Role::User, text)]).into())
     }
 }

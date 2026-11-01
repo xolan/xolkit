@@ -19,7 +19,8 @@ impl ServerHandler for Echo {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let schema = serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}});
+        let schema =
+            serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}});
         Ok(ListToolsResult::with_all_items(vec![Tool::new(
             "echo",
             "Says the text back",

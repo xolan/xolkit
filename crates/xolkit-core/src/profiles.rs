@@ -95,7 +95,13 @@ impl Profile {
     pub fn set_agent(&mut self, agent: Agent, on: bool) {
         self.agents = Agent::ALL
             .into_iter()
-            .filter(|&a| if a == agent { on } else { self.agents.contains(&a) })
+            .filter(|&a| {
+                if a == agent {
+                    on
+                } else {
+                    self.agents.contains(&a)
+                }
+            })
             .collect();
     }
 }

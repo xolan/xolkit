@@ -28,6 +28,14 @@ pub struct Env {
 
 impl Env {
     pub fn detect() -> Result<Env> {
+        let mut env = Env::detect_dirs()?;
+        env.path = merge_paths(std::env::var_os("PATH"), login_shell_path());
+        Ok(env)
+    }
+
+    /// The folders only, without asking the login shell for its `PATH`, which can take a few
+    /// seconds: enough to read the library and reach the daemon, not to run an agent's tool.
+    pub fn detect_dirs() -> Result<Env> {
         let home = std::env::home_dir().context("no home directory")?;
         let dir_or = |var: &str, default: &str| {
             std::env::var_os(var)
@@ -39,7 +47,7 @@ impl Env {
             xolkit_dir: dir_or("XOLKIT_HOME", ".xolkit"),
             claude_dir: dir_or("CLAUDE_CONFIG_DIR", ".claude"),
             codex_dir: dir_or("CODEX_HOME", ".codex"),
-            path: merge_paths(std::env::var_os("PATH"), login_shell_path()),
+            path: None,
             home,
         })
     }

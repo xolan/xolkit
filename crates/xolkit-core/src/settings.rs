@@ -179,7 +179,10 @@ impl Settings {
         if let Some(ix) = taken
             && Some(ix) != renaming
         {
-            bail!("There is a profile named “{}” already.", self.profiles[ix].name);
+            bail!(
+                "There is a profile named “{}” already.",
+                self.profiles[ix].name
+            );
         }
         Ok(name.to_owned())
     }
@@ -187,9 +190,19 @@ impl Settings {
     /// A name like `name` that no profile has yet: `name`, else `name 2`, `name 3`, …
     pub fn free_name(&self, name: &str) -> String {
         let base: String = name.trim().chars().take(MAX_NAME - 3).collect();
-        let base = if base.is_empty() { "Imported".to_owned() } else { base };
+        let base = if base.is_empty() {
+            "Imported".to_owned()
+        } else {
+            base
+        };
         (1..)
-            .map(|n| if n == 1 { base.clone() } else { format!("{base} {n}") })
+            .map(|n| {
+                if n == 1 {
+                    base.clone()
+                } else {
+                    format!("{base} {n}")
+                }
+            })
             .find(|candidate| self.check_name(candidate, None).is_ok())
             .unwrap_or(base)
     }
@@ -250,7 +263,11 @@ mod tests {
 
     #[test]
     fn a_missing_or_broken_file_gets_the_default_profile() {
-        for json in [json!({}), json!(null), json!({"profiles": "nope", "idleMinutes": "x"})] {
+        for json in [
+            json!({}),
+            json!(null),
+            json!({"profiles": "nope", "idleMinutes": "x"}),
+        ] {
             let settings = Settings::from_json(json);
             assert_eq!(settings.profiles.len(), 1);
             assert_eq!(settings.active().name, DEFAULT_PROFILE);
@@ -286,7 +303,9 @@ mod tests {
     #[test]
     fn adds_renames_and_removes_profiles() {
         let mut settings = Settings::default();
-        settings.active_mut().set(Kind::Skill, "s", Agent::Claude, true);
+        settings
+            .active_mut()
+            .set(Kind::Skill, "s", Agent::Claude, true);
         let ix = settings.add(" Work ").unwrap();
         assert_eq!(settings.profiles[ix].name, "Work");
         assert!(settings.profiles[ix].switched_on(Kind::Skill, "s", Agent::Claude));

@@ -2,7 +2,7 @@
 //! `*.yaml` files in `~/.config/xolkit/themes/` (`%APPDATA%\xolkit\themes\` on Windows).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
@@ -35,6 +35,7 @@ const BASE16: &[&str] = &[
 
 /// Registers every theme and applies the saved one, or the one matching the system appearance.
 pub fn init(window: &Window, cx: &mut App) {
+    let themes = settings::store(cx).env.themes_dir();
     let registry = ThemeRegistry::global_mut(cx);
     registry
         .load_themes_from_str(OWN)
@@ -45,13 +46,13 @@ pub fn init(window: &Window, cx: &mut App) {
             .load_themes_from_str(&set)
             .expect("Base16 theme is valid");
     }
-    for (path, result) in user_base16() {
+    for (path, result) in user_base16(&themes) {
         if let Err(e) = result.and_then(|set| registry.load_themes_from_str(&set)) {
             eprintln!("xolkit: skipping theme {}: {e:#}", path.display());
         }
     }
 
-    let saved = settings::get("theme");
+    let saved = settings::load(cx).get("theme").map(str::to_owned);
     let system = match window.appearance() {
         WindowAppearance::Dark | WindowAppearance::VibrantDark => DARK,
         WindowAppearance::Light | WindowAppearance::VibrantLight => LIGHT,
@@ -75,10 +76,10 @@ pub fn names(cx: &App) -> Vec<(SharedString, ThemeMode)> {
 
 /// Applies a theme and remembers it for the next start.
 pub fn select(name: &str, cx: &mut App) {
-    if apply(name, cx)
-        && let Err(e) = settings::set("theme", name)
-    {
-        eprintln!("xolkit: could not save the theme: {e:#}");
+    if apply(name, cx) {
+        let mut saved = settings::load(cx);
+        saved.set("theme", name);
+        settings::save_in_background(saved, cx);
     }
 }
 
@@ -90,8 +91,8 @@ fn apply(name: &str, cx: &mut App) -> bool {
     true
 }
 
-fn user_base16() -> Vec<(PathBuf, Result<String>)> {
-    let Ok(entries) = fs::read_dir(settings::config_dir().join("themes")) else {
+fn user_base16(dir: &Path) -> Vec<(PathBuf, Result<String>)> {
+    let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
     entries

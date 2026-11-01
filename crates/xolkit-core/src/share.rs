@@ -16,9 +16,7 @@ use crate::discover::{extract, fetch_skill_at, unique, valid_name};
 use crate::lock::{Pin, PluginPin};
 use crate::marketplace::{FetchedPlugin, fetch_plugin_at};
 use crate::servers::valid_server_name;
-use crate::{
-    Action, Agent, Env, FetchedSkill, Kind, Library, Profile, ServerConfig, Settings,
-};
+use crate::{Action, Agent, Env, FetchedSkill, Kind, Library, Profile, ServerConfig, Settings};
 
 const PREFIX: &str = "xolkit1:";
 const LINK_PREFIX: &str = "xolkit://import/";
@@ -228,7 +226,8 @@ pub fn decode_code(code: &str) -> Result<Shared> {
 
 /// Writes a `.xolkit` file: the profile, with the files of its local-only skills.
 pub fn export_file(library: &Library, shared: &Shared, path: &Path) -> Result<()> {
-    let file = fs::File::create(path).with_context(|| format!("could not create {}", path.display()))?;
+    let file =
+        fs::File::create(path).with_context(|| format!("could not create {}", path.display()))?;
     let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
         file,
         flate2::Compression::default(),
@@ -255,7 +254,11 @@ pub fn export_file(library: &Library, shared: &Shared, path: &Path) -> Result<()
 /// with the profile.
 pub fn read_export(env: &Env, path: &Path) -> Result<(Shared, PathBuf)> {
     let size = fs::metadata(path)?.len();
-    ensure!(size <= MAX_FILE, "the file is larger than {} MB", MAX_FILE >> 20);
+    ensure!(
+        size <= MAX_FILE,
+        "the file is larger than {} MB",
+        MAX_FILE >> 20
+    );
     let dest = env.staging_dir().join(unique());
     fs::create_dir_all(&dest)?;
     // `extract` drops the archive's first folder, as GitHub wraps everything in one.
@@ -319,7 +322,12 @@ impl Downloads {
 }
 
 /// Downloads what the profile has that the library lacks, at the commits it pins.
-pub fn fetch_import(env: &Env, library: &Library, shared: &Shared, token: Option<&str>) -> Result<Downloads> {
+pub fn fetch_import(
+    env: &Env,
+    library: &Library,
+    shared: &Shared,
+    token: Option<&str>,
+) -> Result<Downloads> {
     let mut downloads = Downloads::default();
     let result = (|| {
         for (name, item) in &shared.skills {
@@ -375,7 +383,10 @@ fn full_commit(source: &str, commit: &str, token: Option<&str>) -> Result<String
     .body_mut()
     .read_to_string()?;
     let full = full.trim().to_owned();
-    ensure!(full.len() == 40 && full.starts_with(commit), "GitHub returned another commit");
+    ensure!(
+        full.len() == 40 && full.starts_with(commit),
+        "GitHub returned another commit"
+    );
     Ok(full)
 }
 
@@ -407,7 +418,11 @@ pub fn import_steps(
     }
     for plugin in &downloads.plugins {
         let target = env.plugins_dir().join(&plugin.plugin.id);
-        ensure!(!target.exists(), "{} is installed already", plugin.plugin.id);
+        ensure!(
+            !target.exists(),
+            "{} is installed already",
+            plugin.plugin.id
+        );
         actions.push(Action::Rename {
             from: plugin.plugin.dir.clone(),
             to: target,
@@ -533,9 +548,14 @@ mod tests {
         // The remote skill would be downloaded; here only the local one is installed.
         let mut without_remote = read.clone();
         without_remote.skills.remove("remote");
-        let actions =
-            import_steps(&other_env, &empty, &without_remote, &Downloads::default(), Some(&staged))
-                .unwrap();
+        let actions = import_steps(
+            &other_env,
+            &empty,
+            &without_remote,
+            &Downloads::default(),
+            Some(&staged),
+        )
+        .unwrap();
         execute(&other_env, &actions).unwrap();
         let imported = Library::load(&other_env).unwrap();
         assert!(imported.skill("mine").is_some());

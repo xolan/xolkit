@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use interprocess::local_socket::tokio::{Listener, Stream as AsyncStream};
-use interprocess::local_socket::traits::tokio::Stream as _;
 use interprocess::local_socket::traits::Stream as _;
+use interprocess::local_socket::traits::tokio::Stream as _;
 use interprocess::local_socket::{ListenerOptions, Name, Stream};
 use xolkit_core::Env;
 
@@ -20,7 +20,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 fn name(env: &Env) -> io::Result<Name<'static>> {
     use interprocess::local_socket::{GenericFilePath, ToFsName};
-    env.run_dir().join("daemon.sock").to_fs_name::<GenericFilePath>()
+    env.run_dir()
+        .join("daemon.sock")
+        .to_fs_name::<GenericFilePath>()
 }
 
 #[cfg(windows)]

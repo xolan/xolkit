@@ -133,7 +133,14 @@ pub fn fetch_skill_at(
         pin.commit
     );
     let folder_hash = tree_hash(&pin.source, &pin.commit, &pin.folder, token)?;
-    download_skill(env, &pin.source, &pin.commit, &pin.folder, folder_hash, name)
+    download_skill(
+        env,
+        &pin.source,
+        &pin.commit,
+        &pin.folder,
+        folder_hash,
+        name,
+    )
 }
 
 /// Extracts `folder` of `source` at `commit` into a new staging directory, returning it and the

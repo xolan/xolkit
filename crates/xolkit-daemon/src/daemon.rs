@@ -121,7 +121,11 @@ impl Daemon {
         };
         if let Some(log) = self.log.lock().unwrap().as_mut() {
             let mark = if error { "error" } else { "info" };
-            let _ = writeln!(log, "{} {mark} [{}] {}", event.time, event.source, event.message);
+            let _ = writeln!(
+                log,
+                "{} {mark} [{}] {}",
+                event.time, event.source, event.message
+            );
         }
         let mut events = self.events.lock().unwrap();
         events.push_back(event);
@@ -131,7 +135,9 @@ impl Daemon {
     }
 
     pub(crate) fn session_client(&self, id: u64, client: String) {
-        if let Some((status, _)) = self.sessions.lock().unwrap().get_mut(&id) {
+        if let Some((status, _)) = self.sessions.lock().unwrap().get_mut(&id)
+            && status.client.as_ref() != Some(&client)
+        {
             status.client = Some(client);
         }
     }
@@ -172,7 +178,10 @@ impl Daemon {
         let mut wanted = Vec::new();
         for agent in Agent::ALL {
             for server in catalogue(&library, agent).servers {
-                if !wanted.iter().any(|s: &xolkit_core::Server| s.name == server.name) {
+                if !wanted
+                    .iter()
+                    .any(|s: &xolkit_core::Server| s.name == server.name)
+                {
                     wanted.push(server);
                 }
             }
@@ -185,7 +194,11 @@ impl Daemon {
                 continue;
             }
             if let Err(e) = write_router(&self.env, provider, skill.as_deref()) {
-                self.event("daemon", format!("router skill for {}: {e:#}", provider.name()), true);
+                self.event(
+                    "daemon",
+                    format!("router skill for {}: {e:#}", provider.name()),
+                    true,
+                );
             }
         }
         self.changed();
@@ -252,7 +265,11 @@ impl Daemon {
                         if let Some(abort) = abort {
                             abort.abort();
                         }
-                        self.event(&format!("session {session}"), "disconnected by the app", false);
+                        self.event(
+                            &format!("session {session}"),
+                            "disconnected by the app",
+                            false,
+                        );
                         Ok(())
                     }
                     None => Err(anyhow::anyhow!("no such session")),
@@ -280,7 +297,9 @@ impl Daemon {
         reader.read_line(&mut line).await?;
         let hello: Hello = serde_json::from_str(&line).context("a connection said no hello")?;
         match hello {
-            Hello::Session { agent, pid, cwd } => self.serve_session(reader, send, agent, pid, cwd).await,
+            Hello::Session { agent, pid, cwd } => {
+                self.serve_session(reader, send, agent, pid, cwd).await
+            }
             Hello::Control => {
                 self.controls.fetch_add(1, Ordering::SeqCst);
                 let result = self.serve_control(reader, send).await;
@@ -314,7 +333,9 @@ impl Daemon {
         };
         self.sessions.lock().unwrap().insert(id, (status, None));
         let source = format!("session {id}");
-        let place = cwd.map(|c| format!(" in {}", self.env.tilde(&c))).unwrap_or_default();
+        let place = cwd
+            .map(|c| format!(" in {}", self.env.tilde(&c)))
+            .unwrap_or_default();
         self.event(&source, format!("{} connected{place}", agent.name()), false);
         let session = Session {
             daemon: self.clone(),
@@ -414,8 +435,15 @@ fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
 pub async fn run(env: Env) -> Result<()> {
     let listener = ipc::listen(&env)?;
     let daemon = Daemon::new(env.clone())?;
-    let _ = std::fs::write(env.run_dir().join("daemon.pid"), std::process::id().to_string());
-    daemon.event("daemon", format!("started, version {}", env!("CARGO_PKG_VERSION")), false);
+    let _ = std::fs::write(
+        env.run_dir().join("daemon.pid"),
+        std::process::id().to_string(),
+    );
+    daemon.event(
+        "daemon",
+        format!("started, version {}", env!("CARGO_PKG_VERSION")),
+        false,
+    );
     daemon.apply();
 
     let watcher = {
@@ -460,17 +488,4 @@ pub async fn run(env: Env) -> Result<()> {
     ipc::remove_socket(&env);
     let _ = std::fs::remove_file(env.run_dir().join("daemon.pid"));
     Ok(())
-}
-
-impl Daemon {
-    /// Saves the profile switch of a test: what the app does with an `Execute`.
-    #[cfg(test)]
-    pub(crate) fn set_on(&self, kind: xolkit_core::Kind, name: &str, agent: Agent) {
-        let mut library = (*self.library()).clone();
-        let profile = library.settings.active_mut();
-        profile.set_agent(agent, true);
-        profile.set(kind, name, agent, true);
-        library.settings.save(&self.env.settings_file()).unwrap();
-        self.reload();
-    }
 }

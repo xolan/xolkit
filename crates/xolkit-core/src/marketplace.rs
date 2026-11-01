@@ -119,26 +119,28 @@ fn plugin_source(repo: &str, root: &str, source: &Value) -> PluginSource {
             rev: None,
         },
         _ => match source["source"].as_str() {
-            Some("github") if source["repo"].as_str().is_some_and(|r| check_source(r).is_ok()) => {
+            Some("github")
+                if source["repo"]
+                    .as_str()
+                    .is_some_and(|r| check_source(r).is_ok()) =>
+            {
                 PluginSource::GitHub {
                     repo: source["repo"].as_str().unwrap_or_default().to_owned(),
                     folder: join_folder("", source["path"].as_str().unwrap_or_default()),
                     rev: rev("sha").or_else(|| rev("ref")),
                 }
             }
-            Some("url" | "git-subdir") => {
-                match source["url"].as_str().and_then(github_repo) {
-                    Some(repo) => PluginSource::GitHub {
-                        repo,
-                        folder: join_folder("", source["path"].as_str().unwrap_or_default()),
-                        rev: rev("sha").or_else(|| rev("ref")),
-                    },
-                    None => PluginSource::Unsupported(format!(
-                        "a Git repository outside GitHub ({})",
-                        source["url"].as_str().unwrap_or("no URL")
-                    )),
-                }
-            }
+            Some("url" | "git-subdir") => match source["url"].as_str().and_then(github_repo) {
+                Some(repo) => PluginSource::GitHub {
+                    repo,
+                    folder: join_folder("", source["path"].as_str().unwrap_or_default()),
+                    rev: rev("sha").or_else(|| rev("ref")),
+                },
+                None => PluginSource::Unsupported(format!(
+                    "a Git repository outside GitHub ({})",
+                    source["url"].as_str().unwrap_or("no URL")
+                )),
+            },
             Some(other) => PluginSource::Unsupported(format!("a {other} source")),
             None => PluginSource::Unsupported("an unknown source".to_owned()),
         },
@@ -345,7 +347,9 @@ pub fn native_install(
     provider: Provider,
 ) -> Result<Vec<Action>> {
     let clash = lock.plugins.iter().any(|(id, pin)| {
-        id != &plugin.id && !pin.native.is_empty() && id.split_once('@').map(|s| s.0) == Some(&plugin.name)
+        id != &plugin.id
+            && !pin.native.is_empty()
+            && id.split_once('@').map(|s| s.0) == Some(&plugin.name)
     });
     ensure!(
         !clash,
@@ -356,7 +360,10 @@ pub fn native_install(
     let copy = marketplace.join("plugins").join(&plugin.name);
     let mut names = native_names(lock);
     names.insert(plugin.name.clone());
-    let added = lock.plugins.values().any(|pin| pin.native.contains(&provider));
+    let added = lock
+        .plugins
+        .values()
+        .any(|pin| pin.native.contains(&provider));
     let mut actions = Vec::new();
     if lock.native(&plugin.id).is_empty() {
         actions.push(Action::Remove { path: copy.clone() });
@@ -441,7 +448,11 @@ fn native_uninstall(env: &Env, lock: &Lock, plugin: &Plugin, provider: Provider)
     if let Some(pin) = after.plugins.get_mut(&plugin.id) {
         pin.native.remove(&provider);
     }
-    if !after.plugins.values().any(|pin| pin.native.contains(&provider)) {
+    if !after
+        .plugins
+        .values()
+        .any(|pin| pin.native.contains(&provider))
+    {
         actions.push(run(&["plugin", "marketplace", "remove", MARKETPLACE]));
     }
     if after.native(&plugin.id).is_empty() {
@@ -458,7 +469,12 @@ fn native_uninstall(env: &Env, lock: &Lock, plugin: &Plugin, provider: Provider)
 }
 
 /// Deletes a plugin: from every agent that has it natively, the library and every profile.
-pub fn uninstall_plugin(env: &Env, settings: &Settings, lock: &Lock, plugin: &Plugin) -> Vec<Action> {
+pub fn uninstall_plugin(
+    env: &Env,
+    settings: &Settings,
+    lock: &Lock,
+    plugin: &Plugin,
+) -> Vec<Action> {
     let mut actions = Vec::new();
     let mut lock = lock.clone();
     for provider in lock.native(&plugin.id) {
@@ -552,7 +568,9 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::Run { provider, args } => Some(format!("{} {}", provider.cli(), args.join(" "))),
+                Action::Run { provider, args } => {
+                    Some(format!("{} {}", provider.cli(), args.join(" ")))
+                }
                 _ => None,
             })
             .collect()
@@ -580,11 +598,17 @@ mod tests {
             .cloned()
             .collect();
         crate::execute(&env, &local).unwrap();
-        let listing =
-            fs::read_to_string(env.marketplace_dir().join(".claude-plugin/marketplace.json"))
-                .unwrap();
+        let listing = fs::read_to_string(
+            env.marketplace_dir()
+                .join(".claude-plugin/marketplace.json"),
+        )
+        .unwrap();
         assert!(listing.contains("\"./plugins/p\""), "{listing}");
-        assert!(env.marketplace_dir().join("plugins/p/hooks/hooks.json").is_file());
+        assert!(
+            env.marketplace_dir()
+                .join("plugins/p/hooks/hooks.json")
+                .is_file()
+        );
         let lock = Lock::read(&env.lock_file()).unwrap();
         assert!(lock.native("p@m").contains(&Provider::Claude));
 

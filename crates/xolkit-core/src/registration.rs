@@ -32,9 +32,11 @@ fn command_line(exe: &Path, provider: Provider) -> Vec<String> {
 /// How xolkit is registered with `provider`, read from the agent's config file.
 pub fn registration(env: &Env, provider: Provider, exe: &Path) -> Registration {
     let command = match provider {
-        Provider::Claude => read_json(&env.claude_json())
-            .ok()
-            .and_then(|json| json["mcpServers"][XOLKIT]["command"].as_str().map(str::to_owned)),
+        Provider::Claude => read_json(&env.claude_json()).ok().and_then(|json| {
+            json["mcpServers"][XOLKIT]["command"]
+                .as_str()
+                .map(str::to_owned)
+        }),
         Provider::Codex => read_toml(&env.codex_config()).ok().and_then(|doc| {
             doc.get("mcp_servers")?
                 .get(XOLKIT)?
@@ -157,7 +159,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let env = Env::at(home.path());
         let exe = home.path().join("bin/xolkit");
-        assert_eq!(registration(&env, Provider::Claude, &exe), Registration::Missing);
+        assert_eq!(
+            registration(&env, Provider::Claude, &exe),
+            Registration::Missing
+        );
         fs::write(
             env.claude_json(),
             format!(
@@ -166,7 +171,10 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(registration(&env, Provider::Claude, &exe), Registration::Current);
+        assert_eq!(
+            registration(&env, Provider::Claude, &exe),
+            Registration::Current
+        );
         fs::create_dir_all(&env.codex_dir).unwrap();
         fs::write(
             env.codex_config(),
@@ -188,14 +196,24 @@ mod tests {
             Action::Run { provider, args } => format!("{} {}", provider.cli(), args.join(" ")),
             other => format!("{other:?}"),
         };
-        let claude: Vec<_> = register(&env, Provider::Claude, exe).iter().map(line).collect();
+        let claude: Vec<_> = register(&env, Provider::Claude, exe)
+            .iter()
+            .map(line)
+            .collect();
         assert_eq!(
             claude,
             ["claude mcp add --scope user xolkit -- /usr/bin/xolkit mcp --agent claude"]
         );
         fs::create_dir_all(&env.codex_dir).unwrap();
-        fs::write(env.codex_config(), "[mcp_servers.xolkit]\ncommand = \"/old\"\n").unwrap();
-        let codex: Vec<_> = register(&env, Provider::Codex, exe).iter().map(line).collect();
+        fs::write(
+            env.codex_config(),
+            "[mcp_servers.xolkit]\ncommand = \"/old\"\n",
+        )
+        .unwrap();
+        let codex: Vec<_> = register(&env, Provider::Codex, exe)
+            .iter()
+            .map(line)
+            .collect();
         assert_eq!(
             codex,
             [
@@ -211,7 +229,11 @@ mod tests {
         let env = Env::at(home.path());
         let exe = Path::new("/usr/bin/xolkit");
         fs::create_dir_all(router_dir(&env, Provider::Claude)).unwrap();
-        fs::write(env.claude_json(), r#"{"mcpServers": {"xolkit": {"command": "x"}}}"#).unwrap();
+        fs::write(
+            env.claude_json(),
+            r#"{"mcpServers": {"xolkit": {"command": "x"}}}"#,
+        )
+        .unwrap();
         let mut lock = Lock::default();
         lock.plugins.insert(
             "hooks@m".into(),

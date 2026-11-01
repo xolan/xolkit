@@ -39,12 +39,14 @@ impl Shelf {
                 "Go to",
                 vec![
                     page("Profiles", Icon::new(Lucide::Layers), Page::Profiles),
-                    page("Installed skills", IconName::BookOpen.into(), Page::Skills),
                     page(
-                        "Installed plugins",
-                        Icon::new(Lucide::Puzzle),
-                        Page::Plugins,
+                        "Connections",
+                        Icon::new(Lucide::Activity),
+                        Page::Connections,
                     ),
+                    page("Skills", IconName::BookOpen.into(), Page::Skills),
+                    page("Plugins", Icon::new(Lucide::Puzzle), Page::Plugins),
+                    page("MCP servers", Icon::new(Lucide::Server), Page::Servers),
                     page("Discover skills", IconName::Search.into(), Page::FindSkills),
                     page(
                         "Discover plugins",
@@ -67,15 +69,15 @@ impl Shelf {
             ),
             (
                 "Profile",
-                self.profiles
-                    .list
+                self.settings()
+                    .profiles
                     .iter()
                     .enumerate()
                     .map(|(ix, profile)| {
                         let item = CommandItem::new()
                             .label(profile.name.clone())
                             .icon(Icon::new(Lucide::Layers))
-                            .checked(ix == self.profiles.active)
+                            .checked(ix == self.settings().active_index())
                             .keywords(["profile", "switch"]);
                         (item, Run::Profile(ix))
                     })

@@ -27,14 +27,25 @@ pub enum Hello {
 pub enum Request {
     Status,
     /// Runs the actions in order, then reloads the library.
-    Execute { actions: Vec<Action> },
+    Execute {
+        actions: Vec<Action>,
+    },
     /// Saves a secret in the OS keyring, or deletes it.
-    SetSecret { key: String, value: Option<String> },
+    SetSecret {
+        key: String,
+        value: Option<String>,
+    },
     /// Reconnects to an MCP server, or connects to one that failed or was stopped.
-    RestartServer { name: String },
-    StopServer { name: String },
+    RestartServer {
+        name: String,
+    },
+    StopServer {
+        name: String,
+    },
     /// Ends an agent session; the agent may start a new one.
-    Disconnect { session: u64 },
+    Disconnect {
+        session: u64,
+    },
     /// Stops the daemon. Shims start a new one when they next need it.
     Shutdown,
 }
@@ -99,8 +110,12 @@ pub enum ServerState {
     Starting,
     Running,
     /// Waiting for a secret to be saved, named.
-    NeedsSecret { key: String },
-    Failed { message: String },
+    NeedsSecret {
+        key: String,
+    },
+    Failed {
+        message: String,
+    },
     Stopped,
 }
 
@@ -133,7 +148,10 @@ mod tests {
             cwd: None,
         };
         let line = serde_json::to_string(&hello).unwrap();
-        assert_eq!(line, r#"{"kind":"session","agent":"codex","pid":7,"cwd":null}"#);
+        assert_eq!(
+            line,
+            r#"{"kind":"session","agent":"codex","pid":7,"cwd":null}"#
+        );
         assert_eq!(serde_json::from_str::<Hello>(&line).unwrap(), hello);
         let request = serde_json::to_string(&Request::Disconnect { session: 3 }).unwrap();
         assert_eq!(request, r#"{"request":"disconnect","session":3}"#);

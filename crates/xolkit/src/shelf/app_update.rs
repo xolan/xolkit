@@ -14,6 +14,7 @@ use gpui_kit::*;
 use xolkit_core::{Release, check_for_update, install_update, installed_by_package_manager};
 
 use super::{Page, Shelf, icon_row};
+use crate::settings;
 
 pub(super) enum AppUpdate {
     Checking,
@@ -47,13 +48,7 @@ impl Shelf {
         let AppUpdate::Available(release) = &self.app_update else {
             return;
         };
-        let Some(exe) = self.exe.clone() else {
-            window.push_notification(
-                Notification::error("xolkit could not find its own program file"),
-                cx,
-            );
-            return;
-        };
+        let exe = self.exe(cx);
         let release = release.clone();
         self.app_update = AppUpdate::Installing(release.clone());
         self.app_update_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -76,12 +71,12 @@ impl Shelf {
         cx.notify();
     }
 
-    /// Starts the program file, now the new version, and quits this one.
+    /// Stops the daemon, so the next session starts the new version, then starts the program
+    /// file, now the new version, and quits this one. Open agent sessions reconnect on their own.
     fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(exe) = &self.exe else {
-            return;
-        };
-        match std::process::Command::new(exe).spawn() {
+        let exe = self.exe(cx);
+        let _ = settings::call(&settings::client(cx), xolkit_daemon::Request::Shutdown);
+        match std::process::Command::new(&exe).spawn() {
             Ok(_) => cx.quit(),
             Err(e) => window.push_notification(
                 Notification::error(format!("could not start xolkit again: {e}")),
@@ -96,7 +91,7 @@ impl Shelf {
             .primary()
             .icon(IconName::RefreshCw)
             .label("Restart")
-            // Quitting midway would leave skills and plugins half changed.
+            // Quitting midway would leave a change half sent.
             .disabled(self.busy)
             .on_click(cx.listener(|this, _, window, cx| this.restart(window, cx)))
     }
@@ -142,10 +137,7 @@ impl Shelf {
                 .label("Release notes")
                 .on_click(move |_, _, cx| cx.open_url(&url))
         };
-        let packaged = self
-            .exe
-            .as_deref()
-            .is_some_and(installed_by_package_manager);
+        let packaged = installed_by_package_manager(&self.exe(cx));
         let (status, actions): (Div, Vec<Button>) = match &self.app_update {
             AppUpdate::Checking => (
                 icon_row(Spinner::new().small(), "Checking for updates…").text_color(muted),

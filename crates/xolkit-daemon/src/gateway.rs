@@ -111,7 +111,9 @@ impl Gateway {
                     Some(c) => stopped.extend(c.service.clone()),
                     None => {}
                 }
-                let generation = connections.get(&server.name).map_or(0, |c| c.generation + 1);
+                let generation = connections
+                    .get(&server.name)
+                    .map_or(0, |c| c.generation + 1);
                 connections.insert(
                     server.name.clone(),
                     Connection {
@@ -269,7 +271,10 @@ impl Gateway {
                     .stderr(Stdio::piped())
                     .spawn()
                     .with_context(|| {
-                        format!("could not start `{}`", config.command.as_deref().unwrap_or(""))
+                        format!(
+                            "could not start `{}`",
+                            config.command.as_deref().unwrap_or("")
+                        )
                     })?;
                 let pid = transport.id();
                 if let Some(stderr) = stderr {
@@ -390,7 +395,8 @@ impl std::error::Error for MissingSecret {}
 fn with_secrets(name: &str, config: &ServerConfig) -> Result<ServerConfig> {
     let mut config = config.clone();
     for key in config.secrets.clone() {
-        let value = get_secret(&secret_key(name, &key))?.ok_or_else(|| MissingSecret(key.clone()))?;
+        let value =
+            get_secret(&secret_key(name, &key))?.ok_or_else(|| MissingSecret(key.clone()))?;
         if config.is_remote() {
             config.headers.insert(key, value);
         } else {

@@ -65,8 +65,8 @@ impl Plugin {
     pub fn read_as(dir: &Path, id: &str) -> Option<Plugin> {
         let id = id.to_owned();
         let (name, marketplace) = id.split_once('@')?;
-        let manifest = read_json(&dir.join(".claude-plugin").join("plugin.json"))
-            .unwrap_or(Value::Null);
+        let manifest =
+            read_json(&dir.join(".claude-plugin").join("plugin.json")).unwrap_or(Value::Null);
         Some(Plugin {
             name: name.to_owned(),
             marketplace: marketplace.to_owned(),
@@ -152,9 +152,8 @@ fn read_parts(dir: &Path, manifest: &Value) -> Parts {
         }
     }
 
-    let non_empty = |path: PathBuf| {
-        fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
-    };
+    let non_empty =
+        |path: PathBuf| fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some());
     if non_empty(dir.join("agents")) || !manifest["agents"].is_null() {
         parts.native.push("subagents");
     }

@@ -148,13 +148,21 @@ impl Catalogue {
             let description = description.to_lowercase();
             words
                 .iter()
-                .map(|w| 3 * usize::from(name.contains(w.as_str())) + usize::from(description.contains(w.as_str())))
+                .map(|w| {
+                    3 * usize::from(name.contains(w.as_str()))
+                        + usize::from(description.contains(w.as_str()))
+                })
                 .sum()
         };
         let mut found: Vec<(usize, Item<'_>)> = self
             .skills
             .iter()
-            .map(|s| (score(&s.name, &format!("{} {}", s.title, s.description)), Item::Skill(s)))
+            .map(|s| {
+                (
+                    score(&s.name, &format!("{} {}", s.title, s.description)),
+                    Item::Skill(s),
+                )
+            })
             .chain(
                 self.commands
                     .iter()
@@ -162,7 +170,7 @@ impl Catalogue {
             )
             .filter(|(score, _)| *score > 0 || words.is_empty())
             .collect();
-        found.sort_by(|a, b| b.0.cmp(&a.0));
+        found.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         found.into_iter().map(|(_, item)| item).collect()
     }
 }
@@ -273,7 +281,11 @@ mod tests {
             ..Catalogue::default()
         };
         let text = many.instructions();
-        assert!(text.len() <= INSTRUCTIONS_BUDGET * 2 + 100, "{}", text.len());
+        assert!(
+            text.len() <= INSTRUCTIONS_BUDGET * 2 + 100,
+            "{}",
+            text.len()
+        );
         assert!(text.contains("Also: "));
         assert!(text.contains("more `find_skill` can find"));
         assert!(Catalogue::default().instructions().contains("No skills"));
@@ -303,7 +315,10 @@ mod tests {
         let front = crate::skills::frontmatter(&text);
         assert_eq!(front.name.as_deref(), Some("xolkit"));
         let description = front.description.unwrap();
-        assert!(description.contains("deploy (Does deploy)"), "{description}");
+        assert!(
+            description.contains("deploy (Does deploy)"),
+            "{description}"
+        );
         let many = Catalogue {
             skills: (0..200)
                 .map(|i| Skill {
@@ -318,6 +333,10 @@ mod tests {
         let description = crate::skills::frontmatter(&router_skill(&many))
             .description
             .unwrap();
-        assert!(description.len() <= DESCRIPTION_LIMIT, "{}", description.len());
+        assert!(
+            description.len() <= DESCRIPTION_LIMIT,
+            "{}",
+            description.len()
+        );
     }
 }

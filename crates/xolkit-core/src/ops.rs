@@ -18,14 +18,31 @@ use crate::{Env, Provider, ServerConfig, Settings};
 #[serde(tag = "action", rename_all = "camelCase")]
 pub enum Action {
     /// Deletes a file or folder, or unlinks a link. Never follows links.
-    Remove { path: PathBuf },
+    Remove {
+        path: PathBuf,
+    },
     /// Copies a folder that holds no links.
-    Copy { from: PathBuf, to: PathBuf },
-    Rename { from: PathBuf, to: PathBuf },
-    WriteFile { path: PathBuf, contents: String },
+    Copy {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    WriteFile {
+        path: PathBuf,
+        contents: String,
+    },
     /// Records where a skill came from, or forgets it.
-    PinSkill { name: String, pin: Option<Pin> },
-    PinPlugin { id: String, pin: Option<PluginPin> },
+    PinSkill {
+        name: String,
+        pin: Option<Pin>,
+    },
+    PinPlugin {
+        id: String,
+        pin: Option<PluginPin>,
+    },
     /// Records whether an agent has a plugin installed natively.
     SetNative {
         id: String,
@@ -37,11 +54,21 @@ pub enum Action {
         name: String,
         config: Option<ServerConfig>,
     },
-    SaveSettings { settings: Box<Settings> },
-    SetCodexPlugin { id: String, enabled: bool },
-    ForgetCodexHooks { id: String },
+    SaveSettings {
+        settings: Box<Settings>,
+    },
+    SetCodexPlugin {
+        id: String,
+        enabled: bool,
+    },
+    ForgetCodexHooks {
+        id: String,
+    },
     /// Runs an agent's command-line tool.
-    Run { provider: Provider, args: Vec<String> },
+    Run {
+        provider: Provider,
+        args: Vec<String>,
+    },
 }
 
 impl Action {
@@ -61,10 +88,17 @@ impl Action {
             Action::Rename { from, .. } => format!("Move {} aside", show(from)),
             Action::WriteFile { path, .. } => format!("Write {}", show(path)),
             Action::PinSkill { name, pin: Some(_) }
-            | Action::PinPlugin { id: name, pin: Some(_) } => {
+            | Action::PinPlugin {
+                id: name,
+                pin: Some(_),
+            } => {
                 format!("Record {name} in {}", show(&env.lock_file()))
             }
-            Action::PinSkill { name, pin: None } | Action::PinPlugin { id: name, pin: None } => {
+            Action::PinSkill { name, pin: None }
+            | Action::PinPlugin {
+                id: name,
+                pin: None,
+            } => {
                 format!("Remove {name} from {}", show(&env.lock_file()))
             }
             Action::SetNative {
@@ -252,9 +286,7 @@ mod tests {
             .active_mut()
             .set(Kind::Skill, "s", Agent::Claude, true);
         let actions = vec![
-            Action::Remove {
-                path: "/x".into(),
-            },
+            Action::Remove { path: "/x".into() },
             Action::SaveSettings {
                 settings: Box::new(settings),
             },

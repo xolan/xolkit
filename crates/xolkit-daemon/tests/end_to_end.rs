@@ -73,7 +73,10 @@ async fn serves_an_agent_session() {
         let env = env.clone();
         std::thread::spawn(move || xolkit_daemon::run_daemon(env))
     };
-    wait_for("the daemon", async || xolkit_daemon::connect(&env).await.is_ok()).await;
+    wait_for("the daemon", async || {
+        xolkit_daemon::connect(&env).await.is_ok()
+    })
+    .await;
 
     // An agent session, the way the shim opens one.
     let mut stream = xolkit_daemon::connect(&env).await.unwrap();
@@ -91,13 +94,21 @@ async fn serves_an_agent_session() {
 
     let info = session.peer_info().unwrap();
     let instructions = info.instructions.clone().unwrap_or_default();
-    assert!(instructions.contains("- deploy: Ships deploy to production."), "{instructions}");
+    assert!(
+        instructions.contains("- deploy: Ships deploy to production."),
+        "{instructions}"
+    );
     assert!(!instructions.contains("later"), "{instructions}");
 
     let loaded = session
-        .call_tool(CallToolRequestParams::new("load_skill").with_arguments(
-            serde_json::json!({"name": "deploy"}).as_object().cloned().unwrap(),
-        ))
+        .call_tool(
+            CallToolRequestParams::new("load_skill").with_arguments(
+                serde_json::json!({"name": "deploy"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
         .await
         .unwrap();
     let text = serde_json::to_string(&loaded.content).unwrap();
@@ -105,12 +116,19 @@ async fn serves_an_agent_session() {
     assert!(text.contains("scripts/go.sh"), "{text}");
 
     let prompts = session.list_all_prompts().await.unwrap();
-    assert_eq!(prompts.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["deploy"]);
+    assert_eq!(
+        prompts.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        ["deploy"]
+    );
     let prompt = session
         .get_prompt(GetPromptRequestParams::new("deploy"))
         .await
         .unwrap();
-    assert!(serde_json::to_string(&prompt.messages).unwrap().contains("Run scripts/go.sh."));
+    assert!(
+        serde_json::to_string(&prompt.messages)
+            .unwrap()
+            .contains("Run scripts/go.sh.")
+    );
 
     // The echo server's tool, passed on once the daemon has connected to it.
     let tools = loop {
@@ -122,12 +140,21 @@ async fn serves_an_agent_session() {
     };
     assert!(tools.iter().any(|t| t.name == "find_skill"));
     let echoed = session
-        .call_tool(CallToolRequestParams::new("echo__echo").with_arguments(
-            serde_json::json!({"text": "hi"}).as_object().cloned().unwrap(),
-        ))
+        .call_tool(
+            CallToolRequestParams::new("echo__echo").with_arguments(
+                serde_json::json!({"text": "hi"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
         .await
         .unwrap();
-    assert!(serde_json::to_string(&echoed.content).unwrap().contains("echo: hi"));
+    assert!(
+        serde_json::to_string(&echoed.content)
+            .unwrap()
+            .contains("echo: hi")
+    );
 
     // The app sees the session and the server.
     let mut app = Client::new(env.clone(), Path::new("/no/xolkit"));
@@ -161,12 +188,21 @@ async fn serves_an_agent_session() {
     })
     .await;
     let found = session
-        .call_tool(CallToolRequestParams::new("find_skill").with_arguments(
-            serde_json::json!({"query": "later"}).as_object().cloned().unwrap(),
-        ))
+        .call_tool(
+            CallToolRequestParams::new("find_skill").with_arguments(
+                serde_json::json!({"query": "later"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
         .await
         .unwrap();
-    assert!(serde_json::to_string(&found.content).unwrap().contains("later (skill)"));
+    assert!(
+        serde_json::to_string(&found.content)
+            .unwrap()
+            .contains("later (skill)")
+    );
 
     session.cancel().await.unwrap();
     tokio::task::spawn_blocking(move || {
