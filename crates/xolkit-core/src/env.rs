@@ -24,12 +24,17 @@ pub struct Env {
     /// `PATH` for provider tools: this process's `PATH`, then on Unix any extra entries from the
     /// user's login shell, because an app started from a desktop launcher gets a short `PATH`.
     pub path: Option<OsString>,
+    /// Whether `path` is the user's whole `PATH`: the login shell answered (always so on
+    /// Windows). Only then does a tool missing from it mean the tool isn't installed.
+    pub path_complete: bool,
 }
 
 impl Env {
     pub fn detect() -> Result<Env> {
         let mut env = Env::detect_dirs()?;
-        env.path = merge_paths(std::env::var_os("PATH"), login_shell_path());
+        let login = login_shell_path();
+        env.path_complete = cfg!(windows) || login.is_some();
+        env.path = merge_paths(std::env::var_os("PATH"), login);
         Ok(env)
     }
 
@@ -48,6 +53,7 @@ impl Env {
             claude_dir: dir_or("CLAUDE_CONFIG_DIR", ".claude"),
             codex_dir: dir_or("CODEX_HOME", ".codex"),
             path: None,
+            path_complete: false,
             home,
         })
     }
@@ -60,6 +66,7 @@ impl Env {
             claude_dir: home.join(".claude"),
             codex_dir: home.join(".codex"),
             path: None,
+            path_complete: false,
         }
     }
 

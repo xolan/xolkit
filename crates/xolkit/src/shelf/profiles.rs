@@ -18,7 +18,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use xolkit_core::{
     Agent, Downloads, Kind, Profile, Shared, decode_code, encode_code, export_file, fetch_import,
-    import_steps, native_steps, read_export,
+    import_steps, native_changes, native_steps, read_export,
 };
 
 use super::{Page, Selection, Shelf, cell, count, divider, list_body, matches, section};
@@ -67,13 +67,11 @@ impl Shelf {
         cx: &mut Context<Self>,
     ) {
         let mut settings = self.settings().clone();
-        let before = settings.profiles[ix].clone();
         edit(&mut settings.profiles[ix]);
         let native = if ix == settings.active_index() {
             native_steps(
                 &self.library.lock,
                 &self.library.plugins,
-                &before,
                 &settings.profiles[ix],
             )
         } else {
@@ -97,20 +95,24 @@ impl Shelf {
         let from = settings.active().clone();
         settings.profile = settings.profiles[ix].name.clone();
         let to = settings.active().clone();
-        let native = native_steps(&self.library.lock, &self.library.plugins, &from, &to);
+        let (lock, plugins) = (&self.library.lock, &self.library.plugins);
+        let changes = native_changes(lock, plugins, &from, &to);
+        // Every native plugin is set as the profile has it, so one a failed switch left behind
+        // is set right too; only the changes are worth asking about.
+        let native = native_steps(lock, plugins, &to);
         let done: SharedString = format!("Switched to {}", to.name).into();
-        if native.is_empty() {
-            self.save_settings(settings, Vec::new(), Some(done), window, cx);
+        if changes.is_empty() {
+            self.save_settings(settings, native, Some(done), window, cx);
             return;
         }
         // The dialog doesn't scroll, so a long list ends in a count.
-        let mut lines: Vec<String> = native
+        let mut lines: Vec<String> = changes
             .iter()
             .take(MAX_STEPS)
             .map(|step| step.describe(&self.env))
             .collect();
-        if native.len() > MAX_STEPS {
-            lines.push(format!("…and {} more", native.len() - MAX_STEPS));
+        if changes.len() > MAX_STEPS {
+            lines.push(format!("…and {} more", changes.len() - MAX_STEPS));
         }
         let title = format!("Switch to “{}”?", to.name);
         let shelf = cx.entity();

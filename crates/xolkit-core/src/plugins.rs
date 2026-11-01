@@ -195,7 +195,9 @@ fn read_commands(dir: &Path) -> Vec<Command> {
 fn collect_commands(dir: &Path, prefix: &str, commands: &mut Vec<Command>) {
     // A manifest path may name one command file.
     if dir.is_file() {
-        if let Some(stem) = dir.file_stem().and_then(|s| s.to_str()) {
+        if dir.extension().is_some_and(|e| e == "md")
+            && let Some(stem) = dir.file_stem().and_then(|s| s.to_str())
+        {
             commands.push(read_command(dir, stem.to_owned()));
         }
         return;

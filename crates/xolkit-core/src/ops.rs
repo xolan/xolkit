@@ -75,6 +75,11 @@ pub enum Action {
         id: String,
         enabled: bool,
     },
+    /// Takes xolkit's router skill out of an agent's skills folder: its own files only, checked
+    /// when it runs, and the folder if nothing else is left in it.
+    RemoveRouter {
+        provider: Provider,
+    },
     /// Runs an agent's tool to take something out. A failure counts as done when the agent no
     /// longer has `gone`: it was removed there already, which mustn't block removing it here.
     Undo {
@@ -101,11 +106,9 @@ impl Gone {
     /// can't be read means "maybe not".
     fn is_gone(&self, env: &Env, provider: Provider) -> bool {
         match self {
-            // The config can be read without the agent's tool.
+            // An uninstalled agent runs nothing that's left of it.
+            _ if agent_absent(env, provider) => true,
             Gone::McpEntry => crate::registration::has_entry(env, provider).is_ok_and(|has| !has),
-            // An agent that is gone (no folder, no tool) runs nothing that's left. A tool merely
-            // missing from PATH is no proof, so then the listing must say so.
-            Gone::Plugin { .. } if agent_absent(env, provider) => true,
             Gone::Plugin { id } => {
                 crate::marketplace::native_state(env, provider, id).is_ok_and(|s| s.is_none())
             }
@@ -114,9 +117,11 @@ impl Gone {
     }
 }
 
-/// Whether the agent is gone from this computer: neither its folder nor its tool is there.
+/// Whether the agent is uninstalled: nothing of it is left, or its tool is missing from the
+/// user's whole `PATH` (uninstalling leaves the folder behind). A tool missing from a `PATH`
+/// that may be partial proves nothing.
 fn agent_absent(env: &Env, provider: Provider) -> bool {
-    env.locate(provider).is_none()
+    env.locate(provider).is_none() || (env.path_complete && !env.has_tool(provider.cli()))
 }
 
 impl Action {
@@ -166,6 +171,9 @@ impl Action {
                 format!("Remove server {name} from {}", show(&env.servers_file()))
             }
             Action::SaveSettings { .. } => format!("Save {}", show(&env.settings_file())),
+            Action::RemoveRouter { provider } => {
+                format!("Remove the router skill from {}", provider.name())
+            }
             Action::SetClaudePlugin { id, enabled } => {
                 format!("Turn {} plugin {id} in Claude Code", on_off(enabled))
             }
@@ -259,6 +267,7 @@ fn run(env: &Env, action: &Action) -> Result<()> {
             Ok(())
         }),
         Action::Run { provider, args } => env.run(provider.cli(), args).map(drop),
+        Action::RemoveRouter { provider } => crate::write_router(env, *provider, None),
         Action::SetClaudePlugin { id, enabled } => {
             let verb = if *enabled { "enable" } else { "disable" };
             let args = ["plugin", verb, id, "--scope", "user"].map(String::from);

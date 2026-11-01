@@ -553,9 +553,14 @@ pub fn uninstall_plugin(
     actions
 }
 
-/// Steps that turn native plugins on and off when the active profile changes from `from` to
-/// `to`. Served plugins need none: the daemon serves the new profile at once.
-pub fn native_steps(lock: &Lock, plugins: &[Plugin], from: &Profile, to: &Profile) -> Vec<Action> {
+/// The native plugin toggles a switch from `from` to `to` changes, to show before it runs.
+/// Served plugins need none: the daemon serves the new profile at once.
+pub fn native_changes(
+    lock: &Lock,
+    plugins: &[Plugin],
+    from: &Profile,
+    to: &Profile,
+) -> Vec<Action> {
     let mut steps = Vec::new();
     for plugin in plugins {
         for provider in lock.native(&plugin.id) {
@@ -564,6 +569,19 @@ pub fn native_steps(lock: &Lock, plugins: &[Plugin], from: &Profile, to: &Profil
             if want != from.is_on(Kind::Plugin, &plugin.id, agent) {
                 steps.push(native_toggle(plugin, provider, want));
             }
+        }
+    }
+    steps
+}
+
+/// Steps that set every native plugin as `to` has it, changed or not: the toggles are
+/// idempotent, so a switch that failed halfway is set right by the next.
+pub fn native_steps(lock: &Lock, plugins: &[Plugin], to: &Profile) -> Vec<Action> {
+    let mut steps = Vec::new();
+    for plugin in plugins {
+        for provider in lock.native(&plugin.id) {
+            let want = to.is_on(Kind::Plugin, &plugin.id, Agent::from(provider));
+            steps.push(native_toggle(plugin, provider, want));
         }
     }
     steps
@@ -729,13 +747,15 @@ mod tests {
         on.set(Kind::Plugin, "p@m", Agent::Claude, true);
         let off = Profile::new("off", vec![Agent::Claude, Agent::Codex]);
         assert_eq!(
-            native_steps(&lock, std::slice::from_ref(&plugin), &on, &off),
+            native_changes(&lock, std::slice::from_ref(&plugin), &on, &off),
             [Action::SetCodexPlugin {
                 id: "p@xolkit".into(),
                 enabled: false
             }]
         );
-        assert!(native_steps(&lock, &[plugin], &on, &on).is_empty());
+        assert!(native_changes(&lock, std::slice::from_ref(&plugin), &on, &on).is_empty());
+        // Setting a profile sets every native plugin, so a half-done switch is set right.
+        assert_eq!(native_steps(&lock, &[plugin], &on).len(), 1);
     }
 
     /// Reads Anthropic's official marketplace and downloads one of its plugins.

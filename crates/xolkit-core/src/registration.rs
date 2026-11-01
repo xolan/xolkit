@@ -180,19 +180,7 @@ pub fn unregister(env: &Env, provider: Provider, lock: &Lock, settings: &Setting
     }
     let router = router_dir(env, provider);
     if router.exists() && router_free(env, provider) {
-        // xolkit's own files, then the folder if nothing else is in it.
-        let only_ours = std::fs::read_dir(&router).is_ok_and(|entries| {
-            entries
-                .flatten()
-                .all(|e| ROUTER_FILES.iter().any(|f| e.file_name() == *f))
-        });
-        if only_ours {
-            actions.push(Action::Remove { path: router });
-        } else {
-            actions.push(Action::Remove {
-                path: router.join("SKILL.md"),
-            });
-        }
+        actions.push(Action::RemoveRouter { provider });
     }
     let run = |args: &[&str], gone: Gone| Action::Undo {
         provider,
@@ -361,8 +349,8 @@ mod tests {
         assert!(saved.router.is_empty());
         assert_eq!(
             actions[2],
-            Action::Remove {
-                path: router_dir(&env, Provider::Claude)
+            Action::RemoveRouter {
+                provider: Provider::Claude
             }
         );
         assert!(unregister(&env, Provider::Codex, &lock, &settings).is_empty());

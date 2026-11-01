@@ -30,7 +30,7 @@ pub use library::{Library, uninstall_skill};
 pub use lock::{Lock, Pin, PluginPin};
 pub use marketplace::{
     FetchedPlugin, Offer, PluginSource, fetch_offers, fetch_plugin, fetch_plugin_at,
-    install_plugin, native_install, native_steps, native_toggle, uninstall_plugin,
+    install_plugin, native_changes, native_install, native_steps, native_toggle, uninstall_plugin,
     valid_marketplace,
 };
 pub use ops::{Action, execute};
