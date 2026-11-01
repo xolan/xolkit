@@ -11,10 +11,12 @@ use crate::Provider;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Where providers keep their files, and how to run their command-line tools.
+/// Where xolkit and the providers keep their files, and how to run the providers' tools.
 #[derive(Clone, Debug)]
 pub struct Env {
     pub home: PathBuf,
+    /// `~/.xolkit`, or `$XOLKIT_HOME`: everything xolkit keeps.
+    pub xolkit_dir: PathBuf,
     /// `~/.claude`, or `$CLAUDE_CONFIG_DIR`.
     pub claude_dir: PathBuf,
     /// `~/.codex`, or `$CODEX_HOME`.
@@ -34,6 +36,7 @@ impl Env {
                 .unwrap_or_else(|| home.join(default))
         };
         Ok(Env {
+            xolkit_dir: dir_or("XOLKIT_HOME", ".xolkit"),
             claude_dir: dir_or("CLAUDE_CONFIG_DIR", ".claude"),
             codex_dir: dir_or("CODEX_HOME", ".codex"),
             path: merge_paths(std::env::var_os("PATH"), login_shell_path()),
@@ -45,26 +48,70 @@ impl Env {
     pub fn at(home: &Path) -> Env {
         Env {
             home: home.to_path_buf(),
+            xolkit_dir: home.join(".xolkit"),
             claude_dir: home.join(".claude"),
             codex_dir: home.join(".codex"),
             path: None,
         }
     }
 
-    pub fn agents_skills(&self) -> PathBuf {
-        self.home.join(".agents").join("skills")
+    /// Installed skills, one folder each.
+    pub fn skills_dir(&self) -> PathBuf {
+        self.xolkit_dir.join("skills")
     }
 
-    pub fn skill_lock(&self) -> PathBuf {
-        self.home.join(".agents").join(".skill-lock.json")
+    /// Installed plugins, one folder each, named by plugin id.
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.xolkit_dir.join("plugins")
+    }
+
+    /// The local marketplace the agents install native plugins from.
+    pub fn marketplace_dir(&self) -> PathBuf {
+        self.xolkit_dir.join("marketplace")
+    }
+
+    pub fn settings_file(&self) -> PathBuf {
+        self.xolkit_dir.join("settings.json")
+    }
+
+    /// Where skills and plugins came from, and the commits they are pinned to.
+    pub fn lock_file(&self) -> PathBuf {
+        self.xolkit_dir.join("lock.json")
+    }
+
+    /// The MCP servers xolkit connects to.
+    pub fn servers_file(&self) -> PathBuf {
+        self.xolkit_dir.join("servers.toml")
+    }
+
+    /// The daemon's socket, pid file and log.
+    pub fn run_dir(&self) -> PathBuf {
+        self.xolkit_dir.join("run")
+    }
+
+    /// Downloads wait here until they are installed: inside `~/.xolkit`, so installing is a
+    /// rename, but outside `skills/`, so no agent sees a skill that is only being previewed.
+    pub fn staging_dir(&self) -> PathBuf {
+        self.xolkit_dir.join("staging")
+    }
+
+    /// Extra Base16 themes.
+    pub fn themes_dir(&self) -> PathBuf {
+        self.xolkit_dir.join("themes")
+    }
+
+    /// Claude Code's own config, where `claude mcp add --scope user` writes: `~/.claude.json`,
+    /// or `.claude.json` inside `$CLAUDE_CONFIG_DIR` when that moves Claude's directory.
+    pub fn claude_json(&self) -> PathBuf {
+        if self.claude_dir == self.home.join(".claude") {
+            self.home.join(".claude.json")
+        } else {
+            self.claude_dir.join(".claude.json")
+        }
     }
 
     pub fn claude_skills(&self) -> PathBuf {
         self.claude_dir.join("skills")
-    }
-
-    pub fn claude_settings(&self) -> PathBuf {
-        self.claude_dir.join("settings.json")
     }
 
     pub fn codex_skills(&self) -> PathBuf {
@@ -222,19 +269,16 @@ mod tests {
     fn paths_use_the_platform_separator() {
         let home = if cfg!(windows) { r"C:\h" } else { "/h" };
         let env = Env::at(Path::new(home));
-        let shown = env.tilde(&env.agents_skills().join("s"));
+        let shown = env.tilde(&env.skills_dir().join("s"));
         if cfg!(windows) {
-            assert_eq!(shown, r"~\.agents\skills\s");
-            assert_eq!(
-                env.skill_lock(),
-                Path::new(r"C:\h\.agents\.skill-lock.json")
-            );
+            assert_eq!(shown, r"~\.xolkit\skills\s");
+            assert_eq!(env.lock_file(), Path::new(r"C:\h\.xolkit\lock.json"));
             assert_eq!(
                 env.codex_plugin_cache().to_str(),
                 Some(r"C:\h\.codex\plugins\cache")
             );
         } else {
-            assert_eq!(shown, "~/.agents/skills/s");
+            assert_eq!(shown, "~/.xolkit/skills/s");
         }
         assert_eq!(env.tilde(Path::new("../x")), "../x");
     }

@@ -7,18 +7,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
-use serde_json::{Value, json};
 
-use crate::config::read_json;
-use crate::ops::claude_link_target;
+use crate::lock::{Lock, Pin};
 use crate::skills::frontmatter;
-use crate::{Action, Env, Provider};
+use crate::{Action, Env};
 
 const USER_AGENT: &str = concat!("xolkit/", env!("CARGO_PKG_VERSION"));
 /// Largest repository archive to download.
 const MAX_ARCHIVE: u64 = 200 * 1024 * 1024;
 /// Largest skill folder to extract.
 const MAX_SKILL: u64 = 20 * 1024 * 1024;
+/// Largest plugin folder to extract.
+pub(crate) const MAX_PLUGIN: u64 = 100 * 1024 * 1024;
 
 /// A skills.sh search result.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -67,13 +67,10 @@ pub fn search_skills(query: &str) -> Result<Vec<SkillHit>> {
 pub struct FetchedSkill {
     /// Directory name it installs as.
     pub name: String,
-    pub source: String,
     /// The staging directory holding the skill's files.
     pub dir: PathBuf,
-    /// Path of its SKILL.md in the repository.
-    pub skill_path: String,
-    /// Git tree hash of the skill folder, as `npx skills` records it.
-    pub folder_hash: String,
+    /// Where it came from, at the commit downloaded.
+    pub pin: Pin,
     pub skill_md: String,
     /// Every file, relative to the skill folder.
     pub files: Vec<String>,
@@ -120,20 +117,36 @@ pub fn fetch_skill(
             .map(|e| e.sha.clone())
             .context("skill folder missing from the GitHub tree")?
     };
-    download(env, source, &commit, &folder, folder_hash, skill_id)
+    download_skill(env, source, &commit, &folder, folder_hash, skill_id)
 }
 
-/// Extracts `folder` of `source` at `commit` into a staging directory. The skill is named by its
-/// frontmatter, else `fallback_name`.
-fn download(
+/// Downloads the skill in `folder` of `source` at `commit`, as a shared profile pins it.
+pub fn fetch_skill_at(
+    env: &Env,
+    pin: &Pin,
+    name: &str,
+    token: Option<&str>,
+) -> Result<FetchedSkill> {
+    ensure!(
+        pin.commit.len() >= 7 && pin.commit.chars().all(|c| c.is_ascii_hexdigit()),
+        "not a commit: {}",
+        pin.commit
+    );
+    let folder_hash = tree_hash(&pin.source, &pin.commit, &pin.folder, token)?;
+    download_skill(env, &pin.source, &pin.commit, &pin.folder, folder_hash, name)
+}
+
+/// Extracts `folder` of `source` at `commit` into a new staging directory, returning it and the
+/// files in it. Nothing is left behind when it fails.
+pub(crate) fn download_folder(
     env: &Env,
     source: &str,
     commit: &str,
     folder: &str,
-    folder_hash: String,
-    fallback_name: &str,
-) -> Result<FetchedSkill> {
-    let dir = staging_root(env).join(unique());
+    max: u64,
+) -> Result<(PathBuf, Vec<String>)> {
+    check_source(source)?;
+    let dir = env.staging_dir().join(unique());
     fs::create_dir_all(&dir)?;
     let archive = github(
         None,
@@ -145,91 +158,110 @@ fn download(
     .into_with_config()
     .limit(MAX_ARCHIVE)
     .reader();
-    let files = match extract(archive, folder, &dir) {
-        Ok(files) => files,
+    match extract(archive, folder, &dir, max) {
+        Ok(files) => Ok((dir, files)),
         Err(e) => {
             let _ = fs::remove_dir_all(&dir);
-            return Err(e);
+            Err(e)
         }
-    };
+    }
+}
 
+/// Downloads a skill folder into a staging directory. The skill is named by its frontmatter,
+/// else `fallback_name`.
+fn download_skill(
+    env: &Env,
+    source: &str,
+    commit: &str,
+    folder: &str,
+    folder_hash: String,
+    fallback_name: &str,
+) -> Result<FetchedSkill> {
+    let (dir, files) = download_folder(env, source, commit, folder, MAX_SKILL)?;
+    if !files.iter().any(|f| f == "SKILL.md") {
+        let _ = fs::remove_dir_all(&dir);
+        bail!("the download has no SKILL.md");
+    }
     let skill_md = fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
     let name = frontmatter(&skill_md)
         .name
         .filter(|n| valid_name(n))
         .unwrap_or_else(|| fallback_name.to_owned());
-    ensure!(valid_name(&name), "unsafe skill name: {name}");
-    let skill_path = if folder.is_empty() {
-        "SKILL.md".to_owned()
-    } else {
-        format!("{folder}/SKILL.md")
-    };
+    if !valid_name(&name) {
+        let _ = fs::remove_dir_all(&dir);
+        bail!("unsafe skill name: {name}");
+    }
     Ok(FetchedSkill {
         name,
-        source: source.to_owned(),
         dir,
-        skill_path,
-        folder_hash,
+        pin: Pin {
+            source: source.to_owned(),
+            folder: folder.to_owned(),
+            commit: commit.to_owned(),
+            tree: folder_hash,
+            ..Pin::default()
+        },
         skill_md,
         files,
     })
 }
 
-/// Moves a fetched skill into `~/.agents/skills`, records it in the lock file, and exposes it to
-/// the chosen `providers` out of the `offered` ones. Fails if the name is already taken.
-pub fn install_skill(
-    env: &Env,
-    skill: &FetchedSkill,
-    providers: &[Provider],
-    offered: &[Provider],
-) -> Result<Vec<Action>> {
-    let target = env.agents_skills().join(&skill.name);
-    let link = env.claude_skills().join(&skill.name);
+/// Moves a fetched skill into `~/.xolkit/skills` and records where it came from. Fails if the
+/// name is already taken.
+pub fn install_skill(env: &Env, skill: &FetchedSkill) -> Result<Vec<Action>> {
+    let target = env.skills_dir().join(&skill.name);
     ensure!(
         fs::symlink_metadata(&target).is_err(),
         "{} already exists",
         env.tilde(&target)
     );
-    let link_claude = providers.contains(&Provider::Claude);
-    ensure!(
-        !link_claude || fs::symlink_metadata(&link).is_err(),
-        "{} already exists",
-        env.tilde(&link)
-    );
-    let now = humantime::format_rfc3339_millis(SystemTime::now()).to_string();
-    let mut actions = vec![
+    let now = now();
+    Ok(vec![
         Action::Rename {
             from: skill.dir.clone(),
-            to: target.clone(),
+            to: target,
         },
-        Action::AddLock {
+        Action::PinSkill {
             name: skill.name.clone(),
-            entry: json!({
-                "source": skill.source,
-                "sourceType": "github",
-                "sourceUrl": format!("https://github.com/{}.git", skill.source),
-                "skillPath": skill.skill_path,
-                "skillFolderHash": skill.folder_hash,
-                "installedAt": now,
-                "updatedAt": now,
+            pin: Some(Pin {
+                installed_at: now.clone(),
+                updated_at: now,
+                ..skill.pin.clone()
             }),
         },
-    ];
-    if link_claude {
-        actions.push(Action::Link {
-            link,
-            target: claude_link_target(env, &target, &skill.name),
-        });
-    }
-    // Codex reads ~/.agents/skills on its own, so leaving it out means turning it off there. A
-    // provider that wasn't offered is not managed here, and its config is left alone.
-    if offered.contains(&Provider::Codex) && !providers.contains(&Provider::Codex) {
-        actions.push(Action::SetCodexSkill {
-            skill_md: target.join("SKILL.md"),
-            enabled: false,
-        });
-    }
-    Ok(actions)
+    ])
+}
+
+/// Copies a skill folder from disk into `~/.xolkit/skills`, named like the folder. Fails if
+/// the folder has no SKILL.md, holds links, or the name is taken.
+pub fn add_local_skill(env: &Env, dir: &Path) -> Result<(String, Vec<Action>)> {
+    ensure!(
+        dir.join("SKILL.md").is_file(),
+        "{} has no SKILL.md",
+        env.tilde(dir)
+    );
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| valid_name(n))
+        .with_context(|| format!("{} can't be a skill name", dir.display()))?
+        .to_owned();
+    let target = env.skills_dir().join(&name);
+    ensure!(
+        fs::symlink_metadata(&target).is_err(),
+        "a skill named {name} is installed already"
+    );
+    Ok((
+        name,
+        vec![Action::Copy {
+            from: dir.to_path_buf(),
+            to: target,
+        }],
+    ))
+}
+
+fn now() -> String {
+    humantime::format_rfc3339_millis(SystemTime::now()).to_string()
 }
 
 /// A newer version of an installed skill on GitHub.
@@ -244,46 +276,31 @@ pub struct SkillUpdate {
     pub folder_hash: String,
 }
 
-/// Compares the folder hash the lock file recorded at install with the folder on GitHub now.
-/// `None` when they match, or the skill was not installed from GitHub.
+/// Compares the folder hash recorded at install with the folder on GitHub now. `None` when they
+/// match, or the skill was not installed from GitHub.
 pub fn check_skill_update(
     env: &Env,
     name: &str,
     token: Option<&str>,
 ) -> Result<Option<SkillUpdate>> {
-    let Some((source, folder, installed)) = locked_skill(&read_json(&env.skill_lock())?, name)
-    else {
+    let lock = Lock::read(&env.lock_file())?;
+    let Some(pin) = lock.skills.get(name).filter(|p| !p.tree.is_empty()) else {
         return Ok(None);
     };
-    let folder_hash = tree_hash(&source, "HEAD", &folder, token)?;
-    Ok((folder_hash != installed).then(|| SkillUpdate {
+    let folder_hash = tree_hash(&pin.source, "HEAD", &pin.folder, token)?;
+    Ok((folder_hash != pin.tree).then(|| SkillUpdate {
         name: name.to_owned(),
-        source,
-        folder,
+        source: pin.source.clone(),
+        folder: pin.folder.clone(),
         folder_hash,
     }))
-}
-
-/// `(source, folder, skillFolderHash)` of a skill the lock file says came from GitHub.
-fn locked_skill(lock: &Value, name: &str) -> Option<(String, String, String)> {
-    let entry = &lock["skills"][name];
-    if entry["sourceType"] != "github" {
-        return None;
-    }
-    let source = entry["source"].as_str()?;
-    let path = entry["skillPath"].as_str()?;
-    let folder = path.strip_suffix("SKILL.md")?.trim_end_matches('/');
-    let hash = entry["skillFolderHash"]
-        .as_str()
-        .filter(|h| !h.is_empty())?;
-    Some((source.to_owned(), folder.to_owned(), hash.to_owned()))
 }
 
 /// Downloads the newer version of an installed skill into a staging directory.
 pub fn fetch_update(env: &Env, update: &SkillUpdate, token: Option<&str>) -> Result<FetchedSkill> {
     let commit = head_commit(&update.source, token)?;
     let folder_hash = tree_hash(&update.source, &commit, &update.folder, token)?;
-    download(
+    download_skill(
         env,
         &update.source,
         &commit,
@@ -293,61 +310,46 @@ pub fn fetch_update(env: &Env, update: &SkillUpdate, token: Option<&str>) -> Res
     )
 }
 
-/// Swaps the shared copy of skill `name` for a downloaded newer version and records the new
-/// folder hash in the lock file. The old copy is moved aside first and deleted last, so a failed
-/// step never leaves a half-deleted skill.
+/// Swaps installed skill `name` for a downloaded newer version and records the new commit. The
+/// old copy is moved aside first and deleted last, so a failed step never leaves a half-deleted
+/// skill.
 pub fn update_skill(env: &Env, name: &str, skill: &FetchedSkill) -> Result<Vec<Action>> {
-    let target = env.agents_skills().join(name);
+    let target = env.skills_dir().join(name);
     ensure!(
         fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir()),
         "{} is not a folder xolkit can replace",
         env.tilde(&target)
     );
-    let mut entry = read_json(&env.skill_lock())?["skills"][name].clone();
-    ensure!(entry.is_object(), "{name} is not in the skill lock");
-    entry["skillPath"] = skill.skill_path.clone().into();
-    entry["skillFolderHash"] = skill.folder_hash.clone().into();
-    entry["updatedAt"] = humantime::format_rfc3339_millis(SystemTime::now())
-        .to_string()
-        .into();
-    let old = staging_root(env).join(format!("{}-old", unique()));
-    let mut actions = vec![
+    let installed_at = Lock::read(&env.lock_file())?
+        .skills
+        .get(name)
+        .map(|p| p.installed_at.clone())
+        .unwrap_or_default();
+    let old = env.staging_dir().join(format!("{}-old", unique()));
+    Ok(vec![
         Action::Rename {
             from: target.clone(),
             to: old.clone(),
         },
         Action::Rename {
             from: skill.dir.clone(),
-            to: target.clone(),
+            to: target,
         },
-        Action::AddLock {
+        Action::PinSkill {
             name: name.to_owned(),
-            entry,
+            pin: Some(Pin {
+                installed_at,
+                updated_at: now(),
+                ..skill.pin.clone()
+            }),
         },
-    ];
-    // A copy in ~/.claude/skills, made where `npx skills` could not link, would keep the old
-    // version.
-    let claude_copy = env.claude_skills().join(name);
-    if fs::symlink_metadata(&claude_copy).is_ok_and(|m| m.is_dir()) {
-        actions.push(Action::Remove(claude_copy.clone()));
-        actions.push(Action::Copy {
-            from: target,
-            to: claude_copy,
-        });
-    }
-    actions.push(Action::Remove(old));
-    Ok(actions)
-}
-
-/// Downloads wait here: next to `~/.agents/skills`, so installing is a rename, but outside it,
-/// so Codex never loads a skill that is only being previewed.
-pub(crate) fn staging_root(env: &Env) -> PathBuf {
-    env.home.join(".agents").join(".xolkit-staging")
+        Action::Remove { path: old },
+    ])
 }
 
 /// Removes downloads left by an earlier run.
 pub fn clean_staging(env: &Env) {
-    let _ = fs::remove_dir_all(staging_root(env));
+    let _ = fs::remove_dir_all(env.staging_dir());
 }
 
 #[derive(Deserialize)]
@@ -415,7 +417,12 @@ fn find_skill_folder(
 
 /// Extracts the files under `folder` from a GitHub tarball into `dest`. Refuses links and any
 /// path that would leave `dest`.
-fn extract(archive: impl Read, folder: &str, dest: &Path) -> Result<Vec<String>> {
+pub(crate) fn extract(
+    archive: impl Read,
+    folder: &str,
+    dest: &Path,
+    max: u64,
+) -> Result<Vec<String>> {
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
     let folder: Vec<String> = folder
         .split('/')
@@ -444,7 +451,7 @@ fn extract(archive: impl Read, folder: &str, dest: &Path) -> Result<Vec<String>>
         }
         ensure!(
             rel.iter().all(|part| storable(part)),
-            "the skill has a file name Windows can't store: {}",
+            "the download has a file name Windows can't store: {}",
             rel.join("/")
         );
         let out = rel.iter().fold(dest.to_path_buf(), |p, part| p.join(part));
@@ -452,28 +459,21 @@ fn extract(archive: impl Read, folder: &str, dest: &Path) -> Result<Vec<String>>
             tar::EntryType::Directory => fs::create_dir_all(&out)?,
             tar::EntryType::Regular | tar::EntryType::Continuous => {
                 total += entry.size();
-                ensure!(
-                    total <= MAX_SKILL,
-                    "skill is larger than {} MB",
-                    MAX_SKILL >> 20
-                );
+                ensure!(total <= max, "the download is larger than {} MB", max >> 20);
                 fs::create_dir_all(out.parent().context("no parent")?)?;
                 entry.unpack(&out)?;
                 files.push(rel.join("/"));
             }
             tar::EntryType::Symlink | tar::EntryType::Link => {
                 bail!(
-                    "skill contains a link ({}); refusing to install it",
+                    "the download contains a link ({}); refusing to install it",
                     rel.join("/")
                 )
             }
             _ => {}
         }
     }
-    ensure!(
-        files.iter().any(|f| f == "SKILL.md"),
-        "the download has no SKILL.md"
-    );
+    ensure!(!files.is_empty(), "the download is empty");
     files.sort();
     Ok(files)
 }
@@ -500,7 +500,7 @@ fn storable(name: &str) -> bool {
             .any(|device| stem.eq_ignore_ascii_case(device))
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
         && name
@@ -509,7 +509,7 @@ fn valid_name(name: &str) -> bool {
 }
 
 /// Refuses anything but `owner/repo`, since it goes into GitHub URLs.
-fn check_source(source: &str) -> Result<()> {
+pub(crate) fn check_source(source: &str) -> Result<()> {
     ensure!(
         source.split('/').count() == 2 && source.split('/').all(valid_name),
         "not a GitHub repository: {source}"
@@ -518,7 +518,7 @@ fn check_source(source: &str) -> Result<()> {
 }
 
 /// The commit `HEAD` of a GitHub repository points to.
-fn head_commit(source: &str, token: Option<&str>) -> Result<String> {
+pub(crate) fn head_commit(source: &str, token: Option<&str>) -> Result<String> {
     check_source(source)?;
     let commit = github(
         token,
@@ -539,7 +539,12 @@ fn head_commit(source: &str, token: Option<&str>) -> Result<String> {
 }
 
 /// Git tree hash of `folder` (`""` for the root) at `rev`, one small API call.
-fn tree_hash(source: &str, rev: &str, folder: &str, token: Option<&str>) -> Result<String> {
+pub(crate) fn tree_hash(
+    source: &str,
+    rev: &str,
+    folder: &str,
+    token: Option<&str>,
+) -> Result<String> {
     #[derive(Deserialize)]
     struct Tree {
         sha: String,
@@ -622,27 +627,12 @@ pub fn github_rate_limit(token: Option<&str>) -> Result<(u64, u64)> {
     ))
 }
 
-fn unique() -> String {
+pub(crate) fn unique() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     format!("{}-{nanos}", std::process::id())
-}
-
-/// Adds or replaces a skill's entry in the lock file, creating the file if needed.
-pub(crate) fn add_lock_entry(lock: &mut Value, name: &str, entry: &Value) -> Result<()> {
-    let root = lock
-        .as_object_mut()
-        .context("the skill lock is not a JSON object")?;
-    root.entry("version").or_insert(json!(3));
-    let skills = root
-        .entry("skills")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .context("`skills` in the skill lock is not an object")?;
-    skills.insert(name.to_owned(), entry.clone());
-    Ok(())
 }
 
 #[cfg(test)]
@@ -731,7 +721,7 @@ mod tests {
                 b"other",
             ),
         ]);
-        let files = extract(&archive[..], "skills/a", dest.path()).unwrap();
+        let files = extract(&archive[..], "skills/a", dest.path(), MAX_SKILL).unwrap();
         assert_eq!(files, ["SKILL.md", "scripts/run.sh"]);
         assert!(dest.path().join("scripts/run.sh").is_file());
         assert!(!dest.path().join("README.md").exists());
@@ -744,9 +734,9 @@ mod tests {
             ("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x"),
             ("repo-abc/s/evil", tar::EntryType::Symlink, b""),
         ]);
-        assert!(extract(&link[..], "s", dest.path()).is_err());
+        assert!(extract(&link[..], "s", dest.path(), MAX_SKILL).is_err());
         let traversal = tarball(&[("repo-abc/s/../../evil", tar::EntryType::Regular, b"x")]);
-        assert!(extract(&traversal[..], "s", dest.path()).is_err());
+        assert!(extract(&traversal[..], "s", dest.path(), MAX_SKILL).is_err());
         assert!(!dest.path().parent().unwrap().join("evil").exists());
     }
 
@@ -766,7 +756,7 @@ mod tests {
                 ("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x"),
                 (&format!("repo-abc/s/{name}"), tar::EntryType::Regular, b"x"),
             ]);
-            let result = extract(&archive[..], "s", dest.path());
+            let result = extract(&archive[..], "s", dest.path(), MAX_SKILL);
             assert_eq!(result.is_err(), cfg!(windows), "{name}");
         }
         // `C:evil` would be relative to the current directory on drive C.
@@ -777,160 +767,82 @@ mod tests {
             ("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x"),
             ("repo-abc/other/CON", tar::EntryType::Regular, b"x"),
         ]);
-        assert!(extract(&archive[..], "s", dest.path()).is_ok());
+        assert!(extract(&archive[..], "s", dest.path(), MAX_SKILL).is_ok());
     }
 
-    #[test]
-    fn install_plans_link_and_codex_opt_out() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::at(home.path());
-        let skill = FetchedSkill {
-            name: "s".into(),
-            source: "o/r".into(),
-            dir: staging_root(&env).join("1"),
-            skill_path: "skills/s/SKILL.md".into(),
-            folder_hash: "abc".into(),
-            skill_md: String::new(),
+    fn fetched(env: &Env, name: &str, text: &str) -> FetchedSkill {
+        let dir = env.staging_dir().join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), text).unwrap();
+        FetchedSkill {
+            name: name.into(),
+            dir,
+            pin: Pin {
+                source: "o/r".into(),
+                folder: format!("skills/{name}"),
+                commit: "c0ffee".into(),
+                tree: "new".into(),
+                ..Pin::default()
+            },
+            skill_md: text.into(),
             files: vec!["SKILL.md".into()],
-        };
-        let actions = install_skill(&env, &skill, &[Provider::Claude], &Provider::ALL).unwrap();
-        assert_eq!(actions.len(), 4);
-        let target = if cfg!(windows) {
-            env.agents_skills().join("s")
-        } else {
-            "../../.agents/skills/s".into()
-        };
-        assert_eq!(
-            actions[2],
-            Action::Link {
-                link: env.claude_skills().join("s"),
-                target
-            }
-        );
-        assert_eq!(
-            actions[3],
-            Action::SetCodexSkill {
-                skill_md: env.agents_skills().join("s/SKILL.md"),
-                enabled: false
-            }
-        );
-        // With Codex not managed, its config is not touched.
-        let claude_only = [Provider::Claude];
-        let actions = install_skill(&env, &skill, &claude_only, &claude_only).unwrap();
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::SetCodexSkill { .. }))
-        );
-        fs::create_dir_all(env.agents_skills().join("s")).unwrap();
-        assert!(install_skill(&env, &skill, &Provider::ALL, &Provider::ALL).is_err());
+        }
     }
 
     #[test]
-    fn lock_entry_keeps_other_fields() {
-        let mut lock = json!({"version": 3, "skills": {"a": {}}, "dismissed": {}});
-        add_lock_entry(&mut lock, "b", &json!({"source": "o/r"})).unwrap();
-        assert_eq!(
-            lock,
-            json!({"version": 3, "skills": {"a": {}, "b": {"source": "o/r"}}, "dismissed": {}})
-        );
-        let mut empty = json!({});
-        add_lock_entry(&mut empty, "b", &json!({})).unwrap();
-        assert_eq!(empty, json!({"version": 3, "skills": {"b": {}}}));
-    }
-
-    #[test]
-    fn reads_github_skills_from_the_lock() {
-        let entry = |path: &str| json!({"source": "o/r", "sourceType": "github", "skillPath": path, "skillFolderHash": "h"});
-        let lock = json!({"skills": {
-            "nested": entry("skills/a/SKILL.md"),
-            "root": entry("SKILL.md"),
-            "local": {"source": "/x", "sourceType": "local", "skillPath": "SKILL.md", "skillFolderHash": "h"},
-            "no-hash": {"source": "o/r", "sourceType": "github", "skillPath": "SKILL.md", "skillFolderHash": ""},
-        }});
-        let got = |name| locked_skill(&lock, name);
-        let expect = |folder: &str| Some(("o/r".into(), folder.into(), "h".into()));
-        assert_eq!(got("nested"), expect("skills/a"));
-        assert_eq!(got("root"), expect(""));
-        assert_eq!(got("local"), None);
-        assert_eq!(got("no-hash"), None);
-        assert_eq!(got("missing"), None);
-    }
-
-    #[test]
-    fn update_swaps_the_shared_copy() {
+    fn install_moves_and_pins() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::at(home.path());
-        let target = env.agents_skills().join("s");
+        let skill = fetched(&env, "s", "x");
+        crate::execute(&env, &install_skill(&env, &skill).unwrap()).unwrap();
+        assert!(env.skills_dir().join("s/SKILL.md").is_file());
+        let pin = &Lock::read(&env.lock_file()).unwrap().skills["s"];
+        assert_eq!((pin.commit.as_str(), pin.tree.as_str()), ("c0ffee", "new"));
+        assert!(!pin.installed_at.is_empty());
+        assert!(install_skill(&env, &fetched(&env, "s", "y")).is_err());
+    }
+
+    #[test]
+    fn adds_a_local_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        let dir = home.path().join("mine/tidy");
+        crate::skills::write_skill(&dir, "tidy");
+        let (name, actions) = add_local_skill(&env, &dir).unwrap();
+        assert_eq!(name, "tidy");
+        crate::execute(&env, &actions).unwrap();
+        assert!(env.skills_dir().join("tidy/SKILL.md").is_file());
+        assert!(add_local_skill(&env, &dir).is_err());
+        assert!(add_local_skill(&env, home.path()).is_err());
+    }
+
+    #[test]
+    fn update_swaps_the_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        let target = env.skills_dir().join("s");
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("SKILL.md"), "old").unwrap();
         fs::write(target.join("gone.md"), "x").unwrap();
-        fs::write(
-            env.skill_lock(),
-            r#"{"version":3,"skills":{"s":{"source":"o/r","sourceType":"github","skillPath":"s/SKILL.md","skillFolderHash":"old","installedAt":"then"}}}"#,
-        )
+        Lock::edit(&env.lock_file(), |lock| {
+            lock.skills.insert(
+                "s".into(),
+                Pin {
+                    installed_at: "then".into(),
+                    ..Pin::default()
+                },
+            );
+        })
         .unwrap();
-        fs::create_dir_all(env.claude_skills()).unwrap();
-        crate::testing::link_dir("../../.agents/skills/s", env.claude_skills().join("s"));
-        let dir = staging_root(&env).join("new");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("SKILL.md"), "new").unwrap();
-        let fetched = FetchedSkill {
-            name: "renamed".into(),
-            source: "o/r".into(),
-            dir,
-            skill_path: "s/SKILL.md".into(),
-            folder_hash: "new".into(),
-            skill_md: "new".into(),
-            files: vec!["SKILL.md".into()],
-        };
-
-        let actions = update_skill(&env, "s", &fetched).unwrap();
-        crate::execute(&env, &actions).unwrap();
+        let skill = fetched(&env, "renamed", "new");
+        crate::execute(&env, &update_skill(&env, "s", &skill).unwrap()).unwrap();
         assert_eq!(fs::read_to_string(target.join("SKILL.md")).unwrap(), "new");
         assert!(!target.join("gone.md").exists());
-        assert_eq!(
-            fs::read_to_string(env.claude_skills().join("s/SKILL.md")).unwrap(),
-            "new"
-        );
-        assert_eq!(fs::read_dir(staging_root(&env)).unwrap().count(), 0);
-        let entry = &read_json(&env.skill_lock()).unwrap()["skills"]["s"];
-        assert_eq!(entry["skillFolderHash"], "new");
-        assert_eq!(entry["installedAt"], "then");
-        assert_ne!(entry["updatedAt"], Value::Null);
-    }
-
-    #[test]
-    fn update_refreshes_a_copy_in_claude() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::at(home.path());
-        for dir in [env.agents_skills().join("s"), env.claude_skills().join("s")] {
-            fs::create_dir_all(&dir).unwrap();
-            fs::write(dir.join("SKILL.md"), "old").unwrap();
-        }
-        fs::write(
-            env.skill_lock(),
-            r#"{"skills":{"s":{"skillPath":"SKILL.md"}}}"#,
-        )
-        .unwrap();
-        let dir = staging_root(&env).join("new");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("SKILL.md"), "new").unwrap();
-        let fetched = FetchedSkill {
-            name: "s".into(),
-            source: "o/r".into(),
-            dir,
-            skill_path: "SKILL.md".into(),
-            folder_hash: "new".into(),
-            skill_md: "new".into(),
-            files: vec!["SKILL.md".into()],
-        };
-        crate::execute(&env, &update_skill(&env, "s", &fetched).unwrap()).unwrap();
-        assert_eq!(
-            fs::read_to_string(env.claude_skills().join("s/SKILL.md")).unwrap(),
-            "new"
-        );
-        assert_eq!(fs::read_dir(staging_root(&env)).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(env.staging_dir()).unwrap().count(), 0);
+        let pin = &Lock::read(&env.lock_file()).unwrap().skills["s"];
+        assert_eq!(pin.tree, "new");
+        assert_eq!(pin.installed_at, "then");
+        assert!(!pin.updated_at.is_empty());
     }
 
     #[test]
@@ -939,19 +851,10 @@ mod tests {
         let env = Env::at(home.path());
         let dotfiles = home.path().join("dotfiles/s");
         fs::create_dir_all(&dotfiles).unwrap();
-        fs::create_dir_all(env.agents_skills()).unwrap();
-        crate::testing::link_dir(&dotfiles, env.agents_skills().join("s"));
-        fs::write(env.skill_lock(), r#"{"skills":{"s":{}}}"#).unwrap();
-        let fetched = FetchedSkill {
-            name: "s".into(),
-            source: "o/r".into(),
-            dir: staging_root(&env).join("new"),
-            skill_path: "SKILL.md".into(),
-            folder_hash: "new".into(),
-            skill_md: String::new(),
-            files: Vec::new(),
-        };
-        assert!(update_skill(&env, "s", &fetched).is_err());
+        fs::create_dir_all(env.skills_dir()).unwrap();
+        crate::testing::link_dir(&dotfiles, env.skills_dir().join("s"));
+        let skill = fetched(&env, "s", "new");
+        assert!(update_skill(&env, "s", &skill).is_err());
     }
 
     /// Finds an outdated skill on GitHub and downloads its update into a throwaway home.
@@ -960,11 +863,18 @@ mod tests {
     fn check_and_fetch_update() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::at(home.path());
-        fs::create_dir_all(home.path().join(".agents")).unwrap();
-        fs::write(
-            env.skill_lock(),
-            r#"{"skills":{"find-skills":{"source":"vercel-labs/skills","sourceType":"github","skillPath":"skills/find-skills/SKILL.md","skillFolderHash":"0000"}}}"#,
-        )
+        Lock::edit(&env.lock_file(), |lock| {
+            lock.skills.insert(
+                "find-skills".into(),
+                Pin {
+                    source: "vercel-labs/skills".into(),
+                    folder: "skills/find-skills".into(),
+                    commit: "0000".into(),
+                    tree: "0000".into(),
+                    ..Pin::default()
+                },
+            );
+        })
         .unwrap();
         let update = check_skill_update(&env, "find-skills", None)
             .unwrap()
@@ -972,7 +882,7 @@ mod tests {
         assert_eq!(update.folder, "skills/find-skills");
         assert_eq!(update.folder_hash.len(), 40);
         let fetched = fetch_update(&env, &update, None).unwrap();
-        assert_eq!(fetched.folder_hash, update.folder_hash);
+        assert_eq!(fetched.pin.tree, update.folder_hash);
         assert!(fetched.files.contains(&"SKILL.md".to_owned()));
     }
 
@@ -989,14 +899,13 @@ mod tests {
         let env = Env::at(home.path());
         let fetched = fetch_skill(&env, &hit.source, &hit.skill_id, None).unwrap();
         assert_eq!(fetched.name, "find-skills");
-        assert_eq!(fetched.folder_hash.len(), 40);
+        assert_eq!(fetched.pin.tree.len(), 40);
         assert!(fetched.files.contains(&"SKILL.md".to_owned()));
-        let actions = install_skill(&env, &fetched, &Provider::ALL, &Provider::ALL).unwrap();
-        crate::execute(&env, &actions).unwrap();
-        let skills = crate::scan_skills(&env).unwrap();
-        assert_eq!(skills[0].source.as_deref(), Some("vercel-labs/skills"));
-        assert_eq!(skills[0].enabled(Provider::Claude), Some(true));
-        assert_eq!(skills[0].enabled(Provider::Codex), Some(true));
+        crate::execute(&env, &install_skill(&env, &fetched).unwrap()).unwrap();
+        let skills = crate::skills::scan_skills(&env.skills_dir());
+        assert_eq!(skills[0].name, "find-skills");
+        let again = fetch_skill_at(&env, &fetched.pin, "find-skills", None).unwrap();
+        assert_eq!(again.pin.tree, fetched.pin.tree);
     }
 
     #[test]
