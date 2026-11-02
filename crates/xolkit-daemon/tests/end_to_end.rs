@@ -204,6 +204,55 @@ async fn serves_an_agent_session() {
             .contains("later (skill)")
     );
 
+    // Adding a server through the one-step save connects it.
+    let echo = ServerConfig {
+        command: Some(env!("CARGO_BIN_EXE_echo-server").into()),
+        ..ServerConfig::default()
+    };
+    let mut with_second = Settings::load(&env.settings_file()).unwrap();
+    with_second
+        .active_mut()
+        .set(Kind::Server, "echo2", Agent::Claude, true);
+    let app = tokio::task::spawn_blocking(move || {
+        let mut app = app;
+        app.call(&xolkit_daemon::Request::SaveServer {
+            name: "echo2".into(),
+            secrets: Vec::new(),
+            actions: vec![
+                Action::SaveServer {
+                    name: "echo2".into(),
+                    config: Some(echo),
+                },
+                Action::SaveSettings {
+                    settings: Box::new(with_second),
+                },
+            ],
+        })
+        .unwrap();
+        app
+    })
+    .await
+    .unwrap();
+    let app = std::sync::Arc::new(std::sync::Mutex::new(app));
+    wait_for("the added server", async || {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || {
+            let status = app.lock().unwrap().status().unwrap();
+            status
+                .servers
+                .iter()
+                .any(|s| s.name == "echo2" && s.state == ServerState::Running)
+        })
+        .await
+        .unwrap()
+    })
+    .await;
+    let app = std::sync::Arc::try_unwrap(app)
+        .ok()
+        .unwrap()
+        .into_inner()
+        .unwrap();
+
     session.cancel().await.unwrap();
     tokio::task::spawn_blocking(move || {
         let mut app = app;

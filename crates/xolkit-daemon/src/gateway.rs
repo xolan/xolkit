@@ -187,20 +187,28 @@ impl Gateway {
         Ok(())
     }
 
-    /// Drops the connection to `name`, and any attempt under way, so the next sync connects
-    /// afresh. A server stopped by hand stays stopped.
-    pub(crate) fn detach(&self, name: &str) {
+    /// Disconnects `name` and holds it stopped while its settings and secrets change, cutting
+    /// off any attempt under way. Returns whether it was held: `false` for a server unknown
+    /// here or stopped by hand, which stays as it is. Release it with `restart`.
+    pub(crate) fn hold(&self, name: &str) -> bool {
         let old = {
             let mut connections = self.connections.lock().unwrap();
-            match connections.get(name) {
-                Some(c) if c.state == ServerState::Stopped => None,
-                Some(_) => connections.remove(name).and_then(|c| c.service),
-                None => None,
+            let Some(connection) = connections.get_mut(name) else {
+                return false;
+            };
+            if connection.state == ServerState::Stopped {
+                return false;
             }
+            connection.generation = next_attempt();
+            connection.state = ServerState::Stopped;
+            connection.tools.clear();
+            connection.pid = None;
+            connection.service.take()
         };
         if let Some(old) = old {
             tokio::spawn(close(old));
         }
+        true
     }
 
     /// Whether attempt `generation` is still the one wanted for `name`.
@@ -281,7 +289,10 @@ impl Gateway {
                 (server.name.clone(), server.config.clone(), self.env.clone());
             tokio::task::spawn_blocking(move || {
                 let config = with_secrets(&name, &config)?;
-                let env = launcher_env(&env, config.command.as_deref().unwrap_or_default());
+                let env = match (&config.url, &config.command) {
+                    (None, Some(program)) => launcher_env(&env, program),
+                    _ => env,
+                };
                 anyhow::Ok((config, env))
             })
             .await??

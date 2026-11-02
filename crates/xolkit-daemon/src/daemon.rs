@@ -345,24 +345,7 @@ impl Daemon {
                 name,
                 secrets,
                 actions,
-            } => {
-                let _running = self.executing.lock().await;
-                // No connection may read the new secrets with the old settings, or the reverse.
-                self.gateway().detach(&name);
-                let env = self.env.clone();
-                for action in &actions {
-                    self.event("app", action.describe(&env), false);
-                }
-                let done =
-                    tokio::task::spawn_blocking(move || save_server(&env, &secrets, &actions))
-                        .await
-                        .context("the change stopped unexpectedly")
-                        .and_then(|r| r);
-                self.reload();
-                // Connect, with whichever settings and secrets are saved now.
-                self.apply();
-                done
-            }
+            } => self.save_server(name, secrets, actions).await,
             Request::StopServer { name } => self.gateway().stop(&name),
             Request::Disconnect { session } => {
                 let removed = self.sessions.lock().unwrap().remove(&session);
@@ -393,6 +376,55 @@ impl Daemon {
                 self.event("daemon", &message, true);
                 Response::Error { message }
             }
+        }
+    }
+
+    /// Saves a server's settings and secrets as one change; see `Request::SaveServer`.
+    async fn save_server(
+        self: &Arc<Self>,
+        name: String,
+        secrets: Vec<(String, Option<String>)>,
+        actions: Vec<xolkit_core::Action>,
+    ) -> Result<()> {
+        let _running = self.executing.lock().await;
+        // Nothing changes while the library can't be read: the save couldn't take
+        // effect, and the server's connection is left as it is.
+        Library::load(&self.env).context("the library can't be read; fix it first")?;
+        // No connection may read the new secrets with the old settings, or the reverse.
+        let held = self.gateway().hold(&name);
+        let env = self.env.clone();
+        for action in &actions {
+            self.event("app", action.describe(&env), false);
+        }
+        let saved = {
+            let name = name.clone();
+            tokio::task::spawn_blocking(move || save_server(&env, &name, &secrets, &actions))
+                .await
+                .unwrap_or_else(|e| Err((anyhow::anyhow!("the change stopped: {e}"), false)))
+        };
+        self.reload();
+        self.apply();
+        match saved {
+            Ok(()) => {
+                if held {
+                    let _ = self.gateway().restart(&name);
+                }
+                Library::load(&self.env)
+                    .map(drop)
+                    .context("saved, but the library can't be read")
+            }
+            // Put back as it was: connect again as before.
+            Err((error, true)) => {
+                if held {
+                    let _ = self.gateway().restart(&name);
+                }
+                Err(error)
+            }
+            // Settings and secrets may not match: stay disconnected until saved again.
+            Err((error, false)) => Err(error.context(format!(
+                "{name} stays disconnected: its secrets couldn't be put back as they \
+                 were; save the server again"
+            ))),
         }
     }
 
@@ -506,27 +538,40 @@ impl Daemon {
     }
 }
 
-/// Saves secrets, then runs the actions; if either fails, puts the secrets back as they were.
+/// Saves a server's secrets, then runs the actions (its settings). If anything fails, the
+/// secrets and the server's entry in `servers.toml` are put back as they were; the error says
+/// whether that worked (`true`) or left them unsure (`false`).
 fn save_server(
     env: &Env,
+    name: &str,
     secrets: &[(String, Option<String>)],
     actions: &[xolkit_core::Action],
-) -> Result<()> {
+) -> Result<(), (anyhow::Error, bool)> {
     let mut before = Vec::new();
     for (key, _) in secrets {
-        before.push((key.clone(), xolkit_core::get_secret(key)?));
+        let value = xolkit_core::get_secret(key).map_err(|e| (e, true))?;
+        before.push((key.clone(), value));
     }
+    let old_config = xolkit_core::read_servers(&env.servers_file())
+        .map_err(|e| (e, true))?
+        .remove(name);
     let saved = secrets
         .iter()
         .try_for_each(|(key, value)| set_secret(key, value.as_deref()))
         .and_then(|()| execute(env, actions));
-    if let Err(error) = saved {
-        for (key, value) in &before {
-            let _ = set_secret(key, value.as_deref());
-        }
-        return Err(error);
+    let Err(error) = saved else {
+        return Ok(());
+    };
+    let mut restored = true;
+    for (key, value) in &before {
+        restored &= set_secret(key, value.as_deref()).is_ok();
     }
-    Ok(())
+    let put_back = xolkit_core::Action::SaveServer {
+        name: name.to_owned(),
+        config: old_config,
+    };
+    restored &= execute(env, &[put_back]).is_ok();
+    Err((error, restored))
 }
 
 /// Opens the log, first moving one past `MAX_LOG` to `daemon.log.old`, so it never grows
