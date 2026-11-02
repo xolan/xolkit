@@ -445,23 +445,38 @@ fn find_skill_folder(
 }
 
 /// Unpacks `archive`, a `.tar.gz` stream, with this computer's `tar` into `dest`, a folder not
-/// yet there: of a repository GitHub wraps in one folder, its `folder` (`Some("")` for all of
-/// it); else (`None`) all of the archive. Returns the files, relative to `dest`. Archives come
-/// from repositories and files the user chose to install from, trusted as any software one
-/// installs is, so `tar` unpacks them as it would any; links are refused, as xolkit copies
-/// skills and plugins on, and so are more than `max` bytes of files. Nothing is left behind when
-/// it fails.
+/// yet there: of a repository GitHub wraps in one folder, only its `folder` (`Some("")` for all
+/// of it), so nothing else in the repository is unpacked; else (`None`) all of the archive.
+/// Returns the files, relative to `dest`. Archives come from repositories and files the user
+/// chose to install from, trusted as any software one installs is, so `tar` unpacks them as it
+/// would any; links are refused, as xolkit copies skills and plugins on, and so are more than
+/// `max` bytes of files. Nothing is left behind when it fails.
 pub(crate) fn extract(
     archive: impl Read,
     folder: Option<&str>,
     dest: &Path,
     max: u64,
 ) -> Result<Vec<String>> {
+    let saved = dest.with_extension("tar.gz");
     let unpacked = dest.with_extension("unpacked");
-    let result = unpack(archive, &unpacked).and_then(|()| {
+    let result = (|| {
+        save(archive, &saved)?;
+        fs::create_dir_all(&unpacked)?;
         let root = match folder {
-            Some(folder) => wrapped_in(&unpacked)?.join(folder),
-            None => unpacked.clone(),
+            Some(folder) => {
+                let wrapper = wrapper(&saved)?;
+                let member = if folder.is_empty() {
+                    wrapper.clone()
+                } else {
+                    format!("{wrapper}/{folder}")
+                };
+                untar(&saved, &unpacked, Some(&member))?;
+                unpacked.join(&wrapper).join(folder)
+            }
+            None => {
+                untar(&saved, &unpacked, None)?;
+                unpacked.clone()
+            }
         };
         ensure!(
             root.is_dir(),
@@ -480,7 +495,8 @@ pub(crate) fn extract(
         fs::rename(&root, dest)?;
         files.sort();
         Ok(files)
-    });
+    })();
+    let _ = fs::remove_file(&saved);
     let _ = fs::remove_dir_all(&unpacked);
     if result.is_err() {
         let _ = fs::remove_dir_all(dest);
@@ -488,43 +504,59 @@ pub(crate) fn extract(
     result
 }
 
-/// Unpacks `archive` into `into` with `tar`, which every system xolkit runs on has: GNU tar on
-/// Linux, bsdtar on Windows 10 and 11. A failure says `tar`'s first line of complaint, or that
-/// the download itself failed.
-fn unpack(mut archive: impl Read, into: &Path) -> Result<()> {
-    fs::create_dir_all(into)?;
-    let mut tar = Command::new("tar")
-        .args(["-x", "-z", "-f", "-", "-C"])
-        .arg(into)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("could not run tar, which xolkit unpacks downloads with")?;
-    let copied = io::copy(&mut archive, tar.stdin.as_mut().context("no input to tar")?);
-    drop(tar.stdin.take());
-    let output = tar.wait_with_output()?;
-    // The download failing comes first: tar then fails only for what it got.
-    if let Err(e) = copied
-        && e.kind() != io::ErrorKind::BrokenPipe
-    {
-        return Err(anyhow!(e).context("the download failed"));
+/// Saves `archive` to the file `to`, as `tar` reads it from there twice.
+fn save(mut archive: impl Read, to: &Path) -> Result<()> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
     }
+    let mut file = fs::File::create(to)?;
+    io::copy(&mut archive, &mut file).context("the download failed")?;
+    Ok(())
+}
+
+/// Runs `tar` on the `.tar.gz` file `archive` with `args`, which every system xolkit runs on
+/// has: GNU tar on Linux, bsdtar on Windows 10 and 11. Returns what it printed; a failure says
+/// its first line of complaint.
+fn tar(archive: &Path, args: &[&std::ffi::OsStr]) -> Result<String> {
+    let output = Command::new("tar")
+        .arg("-z")
+        .arg("-f")
+        .arg(archive)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .context("could not run tar, which xolkit unpacks downloads with")?;
     if !output.status.success() {
         let said = String::from_utf8_lossy(&output.stderr);
         let said = said.lines().next().unwrap_or("").trim();
         bail!("could not unpack the download: {said}");
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// The one folder GitHub wraps a repository's archive in, unpacked in `unpacked`.
-fn wrapped_in(unpacked: &Path) -> Result<PathBuf> {
-    let mut folders = fs::read_dir(unpacked)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()));
-    match (folders.next(), folders.next()) {
-        (Some(only), None) => Ok(only.path()),
+/// Unpacks `archive` into `into`: only `member`, a folder and all in it, when given. Times are
+/// set to now (`-m`), not the commit's: staging that looks an hour old is cleaned away.
+fn untar(archive: &Path, into: &Path, member: Option<&str>) -> Result<()> {
+    let mut args = vec![
+        "-x".as_ref(),
+        "-m".as_ref(),
+        "-C".as_ref(),
+        into.as_os_str(),
+    ];
+    args.extend(member.map(std::ffi::OsStr::new));
+    tar(archive, &args).map(drop)
+}
+
+/// The one folder GitHub wraps a repository's archive in, as `tar` lists it.
+fn wrapper(archive: &Path) -> Result<String> {
+    let listed = tar(archive, &["-t".as_ref()])?;
+    let mut tops = listed
+        .lines()
+        .filter_map(|line| line.split('/').next())
+        .filter(|top| !top.is_empty() && *top != "pax_global_header");
+    let first = tops.next().map(str::to_owned);
+    match first {
+        Some(first) if tops.all(|top| top == first) => Ok(first),
         _ => bail!("the download isn't one repository's archive"),
     }
 }
@@ -830,7 +862,8 @@ mod tests {
             let mut header = tar::Header::new_gnu();
             header.set_entry_type(*kind);
             header.set_size(data.len() as u64);
-            header.set_mode(0o644);
+            header.set_mode(if kind.is_dir() { 0o755 } else { 0o644 });
+            header.set_mtime(1_000_000_000);
             if *kind == tar::EntryType::Symlink {
                 header.set_link_name("../../etc/passwd").unwrap();
             }
@@ -872,6 +905,63 @@ mod tests {
         // Nothing else is left beside it.
         let left: Vec<_> = fs::read_dir(dest.parent().unwrap()).unwrap().collect();
         assert_eq!(left.len(), 1);
+    }
+
+    /// Only the wanted folder is unpacked: what else the repository has stays packed and in
+    /// nobody's way. Here that is a file and a folder of the same name, which no disk can hold,
+    /// as Windows can't hold some names, and a link, which Windows makes only for admins and in
+    /// Developer Mode.
+    #[test]
+    fn unpacks_only_the_wanted_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = home.path().join("skill");
+        let archive = tarball(&[
+            ("repo-abc/x", tar::EntryType::Regular, b"1"),
+            ("repo-abc/x/y", tar::EntryType::Regular, b"2"),
+            ("repo-abc/CLAUDE.md", tar::EntryType::Symlink, b""),
+            ("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x"),
+        ]);
+        let files = extract(&archive[..], Some("s"), &dest, MAX_SKILL).unwrap();
+        assert_eq!(files, ["SKILL.md"]);
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
+    }
+
+    /// What is unpacked is new, whatever times the archive gives, so cleaning away old staging
+    /// doesn't take a download made a moment ago from an old commit.
+    #[test]
+    fn keeps_a_fresh_download_from_an_old_commit() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        let dest = env.staging_dir().join(unique());
+        // Times of 2001, as the helper writes, for the folder too.
+        let archive = tarball(&[
+            ("repo-abc/s/", tar::EntryType::Directory, b""),
+            ("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x"),
+        ]);
+        extract(&archive[..], Some("s"), &dest, MAX_SKILL).unwrap();
+        clean_staging(&env);
+        assert!(dest.join("SKILL.md").is_file());
+    }
+
+    /// An archive whose listing is more than a pipe holds (about 115 KB of names here) still
+    /// unpacks: what tar prints is read as it goes, so it never waits on xolkit.
+    #[test]
+    fn unpacks_an_archive_with_a_long_listing() {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for n in 0..1200 {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            let name = format!("repo-abc/s/{n:04}-{}", "w".repeat(80));
+            builder.append_data(&mut header, &name, &b"x"[..]).unwrap();
+        }
+        let archive = builder.into_inner().unwrap().finish().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let files = extract(&archive[..], Some("s"), &home.path().join("s"), MAX_SKILL).unwrap();
+        assert_eq!(files.len(), 1200);
     }
 
     #[test]
