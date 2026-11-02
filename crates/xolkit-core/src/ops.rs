@@ -119,9 +119,9 @@ impl Gone {
 }
 
 /// Whether the agent is uninstalled: nothing of it is left, or its tool is missing from the
-/// user's whole `PATH` as the login shell gives it now (uninstalling leaves the folder behind).
-/// Asked fresh, since the daemon's own `PATH` dates from its start. Where that can't be asked
-/// (Windows), a missing tool proves nothing.
+/// user's whole `PATH` as it is now (uninstalling leaves the folder behind): from the login
+/// shell, or on Windows from the registry, since the daemon's own `PATH` dates from its start.
+/// When that `PATH` can't be read, a missing tool proves nothing.
 fn agent_absent(env: &Env, provider: Provider) -> bool {
     env.locate(provider).is_none() || env.tool_gone(provider.cli())
 }

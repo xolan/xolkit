@@ -383,62 +383,122 @@ fn fresh_path() -> Option<OsString> {
 }
 
 /// The `PATH` a program started now would get: the system's and the user's from the registry,
-/// with `%VARIABLES%` expanded. A running program's own `PATH` misses changes made since.
+/// with `%VARIABLES%` expanded from the registry's environment too, since this program's own
+/// may be stale. `None` when any of it can't be read or a variable can't be resolved, so an
+/// unreadable `PATH` never counts as proof that a tool is gone.
 #[cfg(windows)]
 fn fresh_path() -> Option<OsString> {
-    use std::os::windows::process::CommandExt;
-    let read = |key: &str| -> Option<String> {
-        let output = Command::new("reg")
-            .args(["query", key, "/v", "Path"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout).into_owned();
-        // `    Path    REG_EXPAND_SZ    C:\x;%USERPROFILE%\y`
-        text.lines().find_map(|line| {
-            let rest = line.trim_start().strip_prefix("Path")?.trim_start();
-            let (_kind, value) = rest.split_once(char::is_whitespace)?;
-            Some(value.trim().to_owned())
-        })
-    };
-    let system = read(r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment");
-    let user = read(r"HKCU\Environment");
-    if system.is_none() && user.is_none() {
-        return None;
-    }
-    let joined = [system, user]
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    const SYSTEM: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+    const USER: &str = "Environment";
+    let system = registry_string(HKEY_LOCAL_MACHINE, SYSTEM, "Path").ok()??;
+    let user = registry_string(HKEY_CURRENT_USER, USER, "Path").ok()?;
+    let joined = [Some(system), user]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
         .join(";");
-    Some(OsString::from(expand_variables(&joined)))
+    let lookup = |name: &str| -> Option<String> {
+        match registry_string(HKEY_CURRENT_USER, USER, name) {
+            Ok(Some(value)) => return Some(value),
+            Ok(None) => {}
+            Err(()) => return None,
+        }
+        match registry_string(HKEY_LOCAL_MACHINE, SYSTEM, name) {
+            Ok(Some(value)) => return Some(value),
+            Ok(None) => {}
+            Err(()) => return None,
+        }
+        // Set by Windows for each session, not stored with the others: these don't go stale.
+        std::env::var(name).ok()
+    };
+    expand_variables(&joined, &lookup).map(OsString::from)
 }
 
-/// `text` with each `%NAME%` replaced by that environment variable, or kept when it isn't set.
-#[cfg(any(windows, test))]
-fn expand_variables(text: &str) -> String {
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(start) = rest.find('%') {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 1..];
-        match after.find('%') {
-            Some(end) => {
-                let name = &after[..end];
-                match std::env::var(name) {
-                    Ok(value) if !name.is_empty() => out.push_str(&value),
-                    _ => out.push_str(&rest[start..start + end + 2]),
-                }
-                rest = &after[end + 1..];
-            }
-            None => {
-                out.push_str(&rest[start..]);
-                rest = "";
-            }
-        }
+/// A string value from the registry, as stored (`%VARIABLES%` not expanded): `Ok(None)` when
+/// there is no such value, `Err` when it can't be read.
+#[cfg(windows)]
+fn registry_string(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    key: &str,
+    name: &str,
+) -> Result<Option<String>, ()> {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
+    };
+    let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain([0]).collect() };
+    let (key, name) = (wide(key), wide(name));
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+    let mut bytes = 0u32;
+    // SAFETY: the key and name are nul-terminated, and a null buffer asks only for the size.
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            key.as_ptr(),
+            name.as_ptr(),
+            flags,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut bytes,
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
     }
-    out.push_str(rest);
-    out
+    if status != ERROR_SUCCESS {
+        return Err(());
+    }
+    let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
+    // SAFETY: the buffer holds `bytes` bytes, as the call above asked for.
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            key.as_ptr(),
+            name.as_ptr(),
+            flags,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(());
+    }
+    let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    String::from_utf16(&buffer[..len]).map(Some).map_err(|_| ())
+}
+
+/// `text` with each `%NAME%` replaced by `lookup(NAME)`, itself expanded in turn. `None` when a
+/// name can't be resolved, or nests too deep.
+#[cfg(any(windows, test))]
+fn expand_variables(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    fn expand(text: &str, lookup: &dyn Fn(&str) -> Option<String>, depth: u8) -> Option<String> {
+        if depth > 4 {
+            return None;
+        }
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(start) = rest.find('%') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('%') else {
+                // A lone `%` is just a character.
+                out.push_str(&rest[start..]);
+                return Some(out);
+            };
+            let name = &after[..end];
+            if name.is_empty() {
+                out.push('%');
+            } else {
+                out.push_str(&expand(&lookup(name)?, lookup, depth + 1)?);
+            }
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        Some(out)
+    }
+    expand(text, lookup, 0)
 }
 
 #[cfg(test)]
@@ -465,18 +525,18 @@ mod tests {
 
     #[test]
     fn expands_variables_in_registry_paths() {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap();
-        let key = if std::env::var("HOME").is_ok() {
-            "HOME"
-        } else {
-            "USERPROFILE"
+        let lookup = |name: &str| match name {
+            "HOME" => Some(r"C:\Users\Jørgen".to_owned()),
+            "TOOLS" => Some(r"%HOME%\tools".to_owned()),
+            _ => None,
         };
         assert_eq!(
-            expand_variables(&format!("%{key}%\\bin;%NOT_SET_XK%;50%")),
-            format!("{home}\\bin;%NOT_SET_XK%;50%")
+            expand_variables(r"%TOOLS%\bin;%HOME%;50%", &lookup).as_deref(),
+            Some(r"C:\Users\Jørgen\tools\bin;C:\Users\Jørgen;50%")
         );
+        // An unknown name means the PATH can't be told.
+        assert_eq!(expand_variables("%UNSET%;x", &lookup), None);
+        assert_eq!(expand_variables("%LOOP%", &|_| Some("%LOOP%".into())), None);
     }
 
     #[test]
