@@ -247,8 +247,14 @@ impl Gateway {
     /// Leaves `name` disconnected with `message`, held until a save releases it with
     /// `release`. Unlike one stopped by hand, the next save holds it again and connects it.
     pub(crate) fn fail(&self, name: &str, message: &str) {
-        if let Err(e) = self.mark(name) {
-            self.log(name, format!("{e:#}"), true);
+        // Held here even if it can't be written down.
+        {
+            let mut held = self.held.lock().unwrap();
+            if held.insert(name.to_owned())
+                && let Err(e) = self.store(&held)
+            {
+                self.log(name, format!("{e:#}"), true);
+            }
         }
         if let Some(connection) = self.connections.lock().unwrap().get_mut(name) {
             connection.state = ServerState::Failed {
@@ -258,14 +264,18 @@ impl Gateway {
         (self.notify)(Notice::ToolsChanged);
     }
 
-    /// Holds `name` until `release`, here and in `run/held`; see `held`. An error means it is
-    /// held only until the daemon exits.
+    /// Holds `name` until `release`, here and in `run/held`; see `held`. On an error it isn't
+    /// held at all.
     pub(crate) fn mark(&self, name: &str) -> Result<()> {
         let mut held = self.held.lock().unwrap();
         if !held.insert(name.to_owned()) {
             return Ok(());
         }
-        self.store(&held)
+        let stored = self.store(&held);
+        if stored.is_err() {
+            held.remove(name);
+        }
+        stored
     }
 
     /// Lets a server held by `mark` or `fail` connect again.
