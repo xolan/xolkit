@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
 use crate::discover::{
-    MAX_PLUGIN, check_source, download_folder, github, head_commit, tree_hash, valid_name,
-    valid_plugin_id,
+    MAX_PLUGIN, call, check_source, download_folder, github, head_commit, read_file, tree_hash,
+    valid_name, valid_plugin_id,
 };
 use crate::lock::{Lock, Pin, PluginPin};
 use crate::ops::Gone;
@@ -58,14 +58,8 @@ pub fn fetch_offers(repos: &[String], token: Option<&str>) -> (Vec<Offer>, Vec<S
     let mut errors = Vec::new();
     for repo in repos {
         let listed = check_source(repo).and_then(|()| {
-            let url = format!(
-                "https://raw.githubusercontent.com/{repo}/HEAD/.claude-plugin/marketplace.json"
-            );
-            let text = github(token, &url)
-                .call()
-                .context("no .claude-plugin/marketplace.json there")?
-                .body_mut()
-                .read_to_string()?;
+            let text = read_file(repo, "HEAD", ".claude-plugin/marketplace.json", token)
+                .context("no .claude-plugin/marketplace.json there")?;
             parse_marketplace(repo, &text)
         });
         match listed {
@@ -207,11 +201,18 @@ pub fn fetch_plugin(env: &Env, offer: &Offer, token: Option<&str>) -> Result<Fet
             version: offer.version.clone(),
             ..PluginPin::default()
         },
+        token,
     )
 }
 
-/// Downloads plugin `id` as `pin` has it, as a shared profile pins it.
-pub fn fetch_plugin_at(env: &Env, id: &str, pin: PluginPin) -> Result<FetchedPlugin> {
+/// Downloads plugin `id` as `pin` has it, as a shared profile pins it. `token` is needed for a
+/// private repository.
+pub fn fetch_plugin_at(
+    env: &Env,
+    id: &str,
+    pin: PluginPin,
+    token: Option<&str>,
+) -> Result<FetchedPlugin> {
     ensure!(valid_plugin_id(id), "unsafe plugin id: {id}");
     let (staging, _) = download_folder(
         env,
@@ -219,6 +220,7 @@ pub fn fetch_plugin_at(env: &Env, id: &str, pin: PluginPin) -> Result<FetchedPlu
         &pin.pin.commit,
         &pin.pin.folder,
         MAX_PLUGIN,
+        token,
     )?;
     // Unpack under a folder named by the id, so it reads like an installed plugin.
     let holder = staging.with_extension("plugin");
@@ -242,15 +244,15 @@ fn commit_of(repo: &str, rev: &str, token: Option<&str>) -> Result<String> {
                 .all(|p| !p.is_empty() && p != "." && p != ".."),
         "unsafe Git ref: {rev}"
     );
-    let commit = github(
+    let request = github(
         token,
         &format!("https://api.github.com/repos/{repo}/commits/{rev}"),
     )
-    .header("Accept", "application/vnd.github.sha")
-    .call()
-    .with_context(|| format!("could not find {rev} in github.com/{repo}"))?
-    .body_mut()
-    .read_to_string()?;
+    .header("Accept", "application/vnd.github.sha");
+    let commit = call(request, token)
+        .with_context(|| format!("could not find {rev} in github.com/{repo}"))?
+        .body_mut()
+        .read_to_string()?;
     let commit = commit.trim().to_owned();
     ensure!(
         commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit()),
@@ -775,5 +777,36 @@ mod tests {
         assert_eq!(fetched.plugin.id, offer.id);
         assert_eq!(fetched.pin.pin.commit.len(), 40);
         fetched.discard();
+    }
+
+    /// Reads a private marketplace, `XOLKIT_TEST_PRIVATE_MARKETPLACE` (`owner/repo`), with the
+    /// GitHub CLI's token, and downloads one of its plugins from its own repository; and says
+    /// without a token that it may be private. Skipped when the variable isn't set.
+    #[test]
+    #[ignore = "uses the network"]
+    fn reads_a_private_marketplace() {
+        let Ok(repo) = std::env::var("XOLKIT_TEST_PRIVATE_MARKETPLACE") else {
+            return;
+        };
+        let gh = std::process::Command::new("gh")
+            .args(["auth", "token"])
+            .output()
+            .unwrap();
+        let token = String::from_utf8(gh.stdout).unwrap().trim().to_owned();
+        let (offers, errors) = fetch_offers(std::slice::from_ref(&repo), Some(&token));
+        assert!(errors.is_empty(), "{errors:?}");
+        let offer = offers
+            .iter()
+            .find(|o| matches!(&o.source, PluginSource::GitHub { repo: r, .. } if *r == repo))
+            .expect("a plugin in the marketplace's own repository");
+        let home = tempfile::tempdir().unwrap();
+        let fetched = fetch_plugin(&Env::at(home.path()), offer, Some(&token)).unwrap();
+        assert_eq!(fetched.plugin.id, offer.id);
+        fetched.discard();
+        let (_, errors) = fetch_offers(std::slice::from_ref(&repo), None);
+        assert!(
+            errors[0].contains("private and needs a token"),
+            "{errors:?}"
+        );
     }
 }

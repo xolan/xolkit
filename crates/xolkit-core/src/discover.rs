@@ -1,11 +1,12 @@
 //! Finding new skills on skills.sh and fetching them from GitHub.
 
 use std::fs;
-use std::io::Read;
-use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Deserialize;
 
 use crate::lock::{Lock, Pin};
@@ -13,6 +14,13 @@ use crate::skills::frontmatter;
 use crate::{Action, Env};
 
 const USER_AGENT: &str = concat!("xolkit/", env!("CARGO_PKG_VERSION"));
+/// A GET request to GitHub, and its answer.
+pub(crate) type Request = ureq::RequestBuilder<ureq::typestate::WithoutBody>;
+pub(crate) type Response = ureq::http::Response<ureq::Body>;
+/// How long a request to GitHub may take.
+const WAIT: Duration = Duration::from_secs(60);
+/// How long a repository's archive may take to download.
+const DOWNLOAD: Duration = Duration::from_secs(30 * 60);
 /// Largest repository archive to download.
 const MAX_ARCHIVE: u64 = 200 * 1024 * 1024;
 /// Largest skill folder to extract.
@@ -92,21 +100,17 @@ pub fn fetch_skill(
     token: Option<&str>,
 ) -> Result<FetchedSkill> {
     let commit = head_commit(source, token)?;
+    let url = format!("https://api.github.com/repos/{source}/git/trees/{commit}?recursive=1");
     let tree: Tree = serde_json::from_str(
-        &github(
-            token,
-            &format!("https://api.github.com/repos/{source}/git/trees/{commit}?recursive=1"),
-        )
-        .call()?
-        .body_mut()
-        .with_config()
-        .limit(MAX_ARCHIVE)
-        .read_to_string()?,
+        &call(github(token, &url), token)?
+            .body_mut()
+            .with_config()
+            .limit(MAX_ARCHIVE)
+            .read_to_string()?,
     )
     .context("unexpected GitHub tree response")?;
     let folder = find_skill_folder(&tree, skill_id, |path| {
-        let url = format!("https://raw.githubusercontent.com/{source}/{commit}/{path}");
-        Ok(github(token, &url).call()?.body_mut().read_to_string()?)
+        read_file(source, &commit, path, token)
     })?;
     let folder_hash = if folder.is_empty() {
         tree.sha.clone()
@@ -117,7 +121,7 @@ pub fn fetch_skill(
             .map(|e| e.sha.clone())
             .context("skill folder missing from the GitHub tree")?
     };
-    download_skill(env, source, &commit, &folder, folder_hash, skill_id)
+    download_skill(env, source, &commit, &folder, folder_hash, skill_id, token)
 }
 
 /// Downloads the skill in `folder` of `source` at `commit`, as a shared profile pins it.
@@ -140,38 +144,40 @@ pub fn fetch_skill_at(
         &pin.folder,
         folder_hash,
         name,
+        token,
     )
 }
 
 /// Extracts `folder` of `source` at `commit` into a new staging directory, returning it and the
-/// files in it. Nothing is left behind when it fails.
+/// files in it. Nothing is left behind when it fails. With a token, the archive comes through
+/// GitHub's API, which serves private repositories too; it redirects to a download signed for
+/// the token, which itself isn't sent there.
 pub(crate) fn download_folder(
     env: &Env,
     source: &str,
     commit: &str,
     folder: &str,
     max: u64,
+    token: Option<&str>,
 ) -> Result<(PathBuf, Vec<String>)> {
     check_source(source)?;
+    let url = match token {
+        Some(_) => format!("https://api.github.com/repos/{source}/tarball/{commit}"),
+        None => format!("https://codeload.github.com/{source}/tar.gz/{commit}"),
+    };
+    let request = github(token, &url)
+        .config()
+        .timeout_global(Some(DOWNLOAD))
+        .build();
+    let archive = call(request, token)
+        .with_context(|| format!("could not download github.com/{source}"))?
+        .into_body()
+        .into_with_config()
+        .limit(MAX_ARCHIVE)
+        .reader();
     let dir = env.staging_dir().join(unique());
-    fs::create_dir_all(&dir)?;
-    let archive = github(
-        None,
-        &format!("https://codeload.github.com/{source}/tar.gz/{commit}"),
-    )
-    .call()
-    .context("could not download the repository")?
-    .into_body()
-    .into_with_config()
-    .limit(MAX_ARCHIVE)
-    .reader();
-    match extract(archive, folder, &dir, max) {
-        Ok(files) => Ok((dir, files)),
-        Err(e) => {
-            let _ = fs::remove_dir_all(&dir);
-            Err(e)
-        }
-    }
+    let files = extract(archive, Some(folder), &dir, max)?;
+    Ok((dir, files))
 }
 
 /// Downloads a skill folder into a staging directory. The skill is named by its frontmatter,
@@ -183,8 +189,9 @@ fn download_skill(
     folder: &str,
     folder_hash: String,
     fallback_name: &str,
+    token: Option<&str>,
 ) -> Result<FetchedSkill> {
-    let (dir, files) = download_folder(env, source, commit, folder, MAX_SKILL)?;
+    let (dir, files) = download_folder(env, source, commit, folder, MAX_SKILL, token)?;
     if !files.iter().any(|f| f == "SKILL.md") {
         let _ = fs::remove_dir_all(&dir);
         bail!("the download has no SKILL.md");
@@ -315,6 +322,7 @@ pub fn fetch_update(env: &Env, update: &SkillUpdate, token: Option<&str>) -> Res
         &update.folder,
         folder_hash,
         &update.name,
+        token,
     )
 }
 
@@ -436,73 +444,115 @@ fn find_skill_folder(
     bail!("no skill named {skill_id} in the repository")
 }
 
-/// Extracts the files under `folder` from a GitHub tarball into `dest`. Refuses links and any
-/// path that would leave `dest`.
+/// Unpacks `archive`, a `.tar.gz` stream, with this computer's `tar` into `dest`, a folder not
+/// yet there: of a repository GitHub wraps in one folder, its `folder` (`Some("")` for all of
+/// it); else (`None`) all of the archive. Returns the files, relative to `dest`. Archives come
+/// from repositories and files the user chose to install from, trusted as any software one
+/// installs is, so `tar` unpacks them as it would any; links are refused, as xolkit copies
+/// skills and plugins on, and so are more than `max` bytes of files. Nothing is left behind when
+/// it fails.
 pub(crate) fn extract(
     archive: impl Read,
-    folder: &str,
+    folder: Option<&str>,
     dest: &Path,
     max: u64,
 ) -> Result<Vec<String>> {
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
-    let folder: Vec<String> = folder
-        .split('/')
-        .filter(|p| !p.is_empty())
-        .map(String::from)
-        .collect();
-    let mut files = Vec::new();
-    let mut total = 0;
-    for entry in tar.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        // GitHub wraps everything in one `<repo>-<commit>/` directory.
-        let parts: Vec<String> = path
-            .components()
-            .skip(1)
-            .map(|c| match c {
-                Component::Normal(part) => Ok(part.to_string_lossy().into_owned()),
-                _ => bail!("unsafe path in archive: {}", path.display()),
-            })
-            .collect::<Result<_>>()?;
-        let Some(rel) = parts.strip_prefix(&folder[..]) else {
-            continue;
+    let unpacked = dest.with_extension("unpacked");
+    let result = unpack(archive, &unpacked).and_then(|()| {
+        let root = match folder {
+            Some(folder) => wrapped_in(&unpacked)?.join(folder),
+            None => unpacked.clone(),
         };
-        if rel.is_empty() {
-            continue;
-        }
         ensure!(
-            rel.iter().all(|part| storable(part)),
-            "the download has a file name Windows can't store: {}",
-            rel.join("/")
+            root.is_dir(),
+            "the download has no {}",
+            folder.unwrap_or("files")
         );
-        let out = rel.iter().fold(dest.to_path_buf(), |p, part| p.join(part));
-        match entry.header().entry_type() {
-            tar::EntryType::Directory => fs::create_dir_all(&out)?,
-            tar::EntryType::Regular | tar::EntryType::Continuous => {
-                total += entry.size();
-                ensure!(total <= max, "the download is larger than {} MB", max >> 20);
-                fs::create_dir_all(out.parent().context("no parent")?)?;
-                entry.unpack(&out)?;
-                files.push(rel.join("/"));
-            }
-            tar::EntryType::Symlink | tar::EntryType::Link => {
-                bail!(
-                    "the download contains a link ({}); refusing to install it",
-                    rel.join("/")
-                )
-            }
-            _ => {}
-        }
+        let mut files = Vec::new();
+        let mut total = 0;
+        list(&root, "", &mut files, &mut total)?;
+        ensure!(
+            total <= max,
+            "the files to install come to more than {} MB",
+            max >> 20
+        );
+        ensure!(!files.is_empty(), "the download is empty");
+        fs::rename(&root, dest)?;
+        files.sort();
+        Ok(files)
+    });
+    let _ = fs::remove_dir_all(&unpacked);
+    if result.is_err() {
+        let _ = fs::remove_dir_all(dest);
     }
-    ensure!(!files.is_empty(), "the download is empty");
-    files.sort();
-    Ok(files)
+    result
 }
 
-/// Whether this computer can store a file named `name` as it is: on Windows, whether
-/// [`windows_storable`] is; elsewhere every name is fine.
-fn storable(name: &str) -> bool {
-    !cfg!(windows) || windows_storable(name)
+/// Unpacks `archive` into `into` with `tar`, which every system xolkit runs on has: GNU tar on
+/// Linux, bsdtar on Windows 10 and 11. A failure says `tar`'s first line of complaint, or that
+/// the download itself failed.
+fn unpack(mut archive: impl Read, into: &Path) -> Result<()> {
+    fs::create_dir_all(into)?;
+    let mut tar = Command::new("tar")
+        .args(["-x", "-z", "-f", "-", "-C"])
+        .arg(into)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("could not run tar, which xolkit unpacks downloads with")?;
+    let copied = io::copy(&mut archive, tar.stdin.as_mut().context("no input to tar")?);
+    drop(tar.stdin.take());
+    let output = tar.wait_with_output()?;
+    // The download failing comes first: tar then fails only for what it got.
+    if let Err(e) = copied
+        && e.kind() != io::ErrorKind::BrokenPipe
+    {
+        return Err(anyhow!(e).context("the download failed"));
+    }
+    if !output.status.success() {
+        let said = String::from_utf8_lossy(&output.stderr);
+        let said = said.lines().next().unwrap_or("").trim();
+        bail!("could not unpack the download: {said}");
+    }
+    Ok(())
+}
+
+/// The one folder GitHub wraps a repository's archive in, unpacked in `unpacked`.
+fn wrapped_in(unpacked: &Path) -> Result<PathBuf> {
+    let mut folders = fs::read_dir(unpacked)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()));
+    match (folders.next(), folders.next()) {
+        (Some(only), None) => Ok(only.path()),
+        _ => bail!("the download isn't one repository's archive"),
+    }
+}
+
+/// Adds the files in `dir` to `files`, by their names below `prefix`, and their sizes to
+/// `total`, refusing links.
+fn list(dir: &Path, prefix: &str, files: &mut Vec<String>, total: &mut u64) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let kind = entry.file_type()?;
+        ensure!(
+            !kind.is_symlink(),
+            "the download contains a link ({rel}); refusing to install it"
+        );
+        if kind.is_dir() {
+            list(&entry.path(), &rel, files, total)?;
+        } else {
+            *total += entry.metadata()?.len();
+            files.push(rel);
+        }
+    }
+    Ok(())
 }
 
 /// Whether Windows can store a file named `name` as it is. Windows would fail on the others
@@ -561,17 +611,17 @@ pub(crate) fn check_source(source: &str) -> Result<()> {
 /// The commit `HEAD` of a GitHub repository points to.
 pub(crate) fn head_commit(source: &str, token: Option<&str>) -> Result<String> {
     check_source(source)?;
-    let commit = github(
+    let request = github(
         token,
         &format!("https://api.github.com/repos/{source}/commits/HEAD"),
     )
-    .header("Accept", "application/vnd.github.sha")
-    .call()
-    .with_context(|| format!("could not reach github.com/{source}"))?
-    .body_mut()
-    .read_to_string()?
-    .trim()
-    .to_owned();
+    .header("Accept", "application/vnd.github.sha");
+    let commit = call(request, token)
+        .with_context(|| format!("could not reach github.com/{source}"))?
+        .body_mut()
+        .read_to_string()?
+        .trim()
+        .to_owned();
     ensure!(
         commit.chars().all(|c| c.is_ascii_hexdigit()),
         "unexpected commit id from GitHub"
@@ -603,23 +653,22 @@ pub(crate) fn tree_hash(
     } else {
         format!("{rev}:{folder}")
     };
-    let tree: Tree = github(
-        token,
-        &format!("https://api.github.com/repos/{source}/git/trees/{rev}"),
-    )
-    .call()
-    .with_context(|| format!("could not read {folder} in github.com/{source}"))?
-    .body_mut()
-    .read_json()
-    .context("unexpected GitHub tree response")?;
+    let url = format!("https://api.github.com/repos/{source}/git/trees/{rev}");
+    let tree: Tree = call(github(token, &url), token)
+        .with_context(|| format!("could not read {folder} in github.com/{source}"))?
+        .body_mut()
+        .read_json()
+        .context("unexpected GitHub tree response")?;
     Ok(tree.sha)
 }
 
-pub(crate) fn github(
-    token: Option<&str>,
-    url: &str,
-) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
-    let request = ureq::get(url).header("User-Agent", USER_AGENT);
+/// A GET request for `url` on GitHub, which gives up after [`WAIT`].
+pub(crate) fn github(token: Option<&str>, url: &str) -> Request {
+    let request = ureq::get(url)
+        .header("User-Agent", USER_AGENT)
+        .config()
+        .timeout_global(Some(WAIT))
+        .build();
     // Only the API needs the token; never send it anywhere else.
     match token {
         Some(token) if url.starts_with("https://api.github.com/") => {
@@ -627,6 +676,59 @@ pub(crate) fn github(
         }
         _ => request,
     }
+}
+
+/// Sends `request` to GitHub; `token` says whether it carries one. A failure says what it means.
+pub(crate) fn call(request: Request, token: Option<&str>) -> Result<Response> {
+    request.call().map_err(|e| refused(e, token.is_some()))
+}
+
+/// What GitHub refusing a request means, in words; `token` says whether it carried one.
+fn refused(error: ureq::Error, token: bool) -> anyhow::Error {
+    match (error, token) {
+        (ureq::Error::StatusCode(401), true) => {
+            anyhow!("GitHub rejected the token: it is invalid or has expired")
+        }
+        (ureq::Error::StatusCode(403 | 429), true) => anyhow!(
+            "GitHub refused the request: the token can't read the repository, or its rate limit \
+             is used up"
+        ),
+        (ureq::Error::StatusCode(403 | 429), false) => anyhow!(
+            "GitHub refused the request: without a token it allows 60 requests an hour; add one \
+             in Settings"
+        ),
+        (ureq::Error::StatusCode(404), true) => {
+            anyhow!("GitHub found nothing there, or the token can't read the repository")
+        }
+        (ureq::Error::StatusCode(404), false) => anyhow!(
+            "GitHub found nothing there, or the repository is private and needs a token (add one \
+             in Settings)"
+        ),
+        (error, _) => error.into(),
+    }
+}
+
+/// The file `path` of the GitHub repository `source` at `rev` (a commit, or `HEAD`): from the
+/// raw host, or with a token from the API, which serves private repositories too.
+pub(crate) fn read_file(
+    source: &str,
+    rev: &str,
+    path: &str,
+    token: Option<&str>,
+) -> Result<String> {
+    check_source(source)?;
+    let request = match token {
+        Some(_) => github(
+            token,
+            &format!("https://api.github.com/repos/{source}/contents/{path}?ref={rev}"),
+        )
+        .header("Accept", "application/vnd.github.raw"),
+        None => github(
+            None,
+            &format!("https://raw.githubusercontent.com/{source}/{rev}/{path}"),
+        ),
+    };
+    Ok(call(request, token)?.body_mut().read_to_string()?)
 }
 
 /// The token the GitHub CLI is signed in with (`gh auth token`).
@@ -744,6 +846,7 @@ mod tests {
     #[test]
     fn extracts_only_the_skill_folder() {
         let dest = tempfile::tempdir().unwrap();
+        let dest = dest.path().join("skill");
         let archive = tarball(&[
             ("repo-abc/README.md", tar::EntryType::Regular, b"x"),
             (
@@ -762,53 +865,86 @@ mod tests {
                 b"other",
             ),
         ]);
-        let files = extract(&archive[..], "skills/a", dest.path(), MAX_SKILL).unwrap();
+        let files = extract(&archive[..], Some("skills/a"), &dest, MAX_SKILL).unwrap();
         assert_eq!(files, ["SKILL.md", "scripts/run.sh"]);
-        assert!(dest.path().join("scripts/run.sh").is_file());
-        assert!(!dest.path().join("README.md").exists());
+        assert!(dest.join("scripts/run.sh").is_file());
+        assert!(!dest.join("README.md").exists());
+        // Nothing else is left beside it.
+        let left: Vec<_> = fs::read_dir(dest.parent().unwrap()).unwrap().collect();
+        assert_eq!(left.len(), 1);
     }
 
     #[test]
     fn refuses_links_and_traversal() {
-        let dest = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dest = home.path().join("skill");
         let link = tarball(&[
             ("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x"),
             ("repo-abc/s/evil", tar::EntryType::Symlink, b""),
         ]);
-        assert!(extract(&link[..], "s", dest.path(), MAX_SKILL).is_err());
-        let traversal = tarball(&[("repo-abc/s/../../evil", tar::EntryType::Regular, b"x")]);
-        assert!(extract(&traversal[..], "s", dest.path(), MAX_SKILL).is_err());
-        assert!(!dest.path().parent().unwrap().join("evil").exists());
+        let error = extract(&link[..], Some("s"), &dest, MAX_SKILL).unwrap_err();
+        assert!(
+            error.to_string().contains("contains a link (evil)"),
+            "{error}"
+        );
+        assert!(!dest.exists());
+        // tar itself keeps a name with `..` from leading out.
+        let traversal = tarball(&[
+            ("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x"),
+            ("repo-abc/s/../../evil", tar::EntryType::Regular, b"x"),
+        ]);
+        let _ = extract(&traversal[..], Some("s"), &dest, MAX_SKILL);
+        assert!(!home.path().join("evil").exists());
     }
 
+    /// What tar can't unpack, and a download that isn't one repository's archive, say so; and
+    /// leave nothing behind.
     #[test]
-    fn refuses_names_windows_cannot_store_on_windows() {
-        for name in [
-            "C:/evil",
-            "SKILL.md:hidden",
-            "CON",
-            "nul.txt",
-            "a?b",
-            "trail.",
-            "trail ",
-        ] {
-            let dest = tempfile::tempdir().unwrap();
-            let archive = tarball(&[
-                ("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x"),
-                (&format!("repo-abc/s/{name}"), tar::EntryType::Regular, b"x"),
-            ]);
-            let result = extract(&archive[..], "s", dest.path(), MAX_SKILL);
-            assert_eq!(result.is_err(), cfg!(windows), "{name}");
-        }
-        // `C:evil` would be relative to the current directory on drive C.
-        assert!(!Path::new("C:evil").exists());
-        // Names elsewhere in the repository don't matter.
-        let dest = tempfile::tempdir().unwrap();
-        let archive = tarball(&[
-            ("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x"),
-            ("repo-abc/other/CON", tar::EntryType::Regular, b"x"),
+    fn says_what_tar_could_not_unpack() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = home.path().join("skill");
+        let error = extract(&b"not gzip"[..], Some(""), &dest, MAX_SKILL).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("could not unpack the download: "),
+            "{error}"
+        );
+        let two = tarball(&[
+            ("a/SKILL.md", tar::EntryType::Regular, b"x"),
+            ("b/SKILL.md", tar::EntryType::Regular, b"x"),
         ]);
-        assert!(extract(&archive[..], "s", dest.path(), MAX_SKILL).is_ok());
+        let error = extract(&two[..], Some(""), &dest, MAX_SKILL).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the download isn't one repository's archive"
+        );
+        let big = tarball(&[(
+            "repo-abc/s/SKILL.md",
+            tar::EntryType::Regular,
+            &[b'x'; 2048],
+        )]);
+        let error = extract(&big[..], Some("s"), &dest, 1024).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the files to install come to more than 0 MB"
+        );
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    /// What GitHub refusing a request means, with a token and without.
+    #[test]
+    fn says_what_github_refusing_means() {
+        let said = |status, token| refused(ureq::Error::StatusCode(status), token).to_string();
+        assert_eq!(
+            said(401, true),
+            "GitHub rejected the token: it is invalid or has expired"
+        );
+        assert!(said(404, false).contains("private and needs a token"));
+        assert!(said(404, true).contains("the token can't read the repository"));
+        assert!(said(403, false).contains("60 requests an hour"));
+        assert!(said(429, true).contains("rate limit is used up"));
+        assert_eq!(said(500, true), "http status: 500");
     }
 
     fn fetched(env: &Env, name: &str, text: &str) -> FetchedSkill {

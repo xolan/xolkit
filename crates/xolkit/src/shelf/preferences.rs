@@ -476,8 +476,9 @@ impl Shelf {
                             .child(divider(cx))
                             .child(section("GitHub access"))
                             .child(div().text_sm().text_color(muted).child(
-                                "Skills download from GitHub. Without a token GitHub allows 60 \
-                                 requests an hour, and each download uses two or three.",
+                                "Skills and plugins download from GitHub. Without a token \
+                                 GitHub allows 60 requests an hour, and each download uses two \
+                                 or three. Private repositories need a token that can read them.",
                             ))
                             .child(
                                 RadioGroup::vertical("github-access")
