@@ -1,97 +1,40 @@
-//! Installed skills and plugins: lists with per-provider switches, details, uninstall.
+//! The library's skills and plugins: lists with a switch per agent, details, updates and
+//! uninstall.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, Sizable, StyledExt, button::Button, button::ButtonVariants,
-    h_flex, scroll::ScrollableElement, spinner::Spinner, text::TextView, v_flex,
+    ActiveTheme, Disableable, IconName, Sizable, StyledExt, WindowExt, button::Button,
+    button::ButtonVariants, h_flex, notification::Notification, scroll::ScrollableElement,
+    spinner::Spinner, text::TextView, v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use xolkit_core::{
-    Plugin, Provider, Skill, check_skill_update, fetch_update, skill_state, toggle_plugin,
-    toggle_skill,
-};
+use xolkit_core::{Agent, Kind, Plugin, Provider, Skill, check_skill_update, fetch_update};
 
 use super::change::{Change, open_change_dialog};
-use super::{SEARCH_DELAY, Selection, Shelf, cell, divider, fact, list_body, matches, warning};
-use crate::settings::GitHubAccess;
-
-/// The skills to list when xolkit manages only `agents`: those an agent has, or Claude can
-/// link in from the shared folder. Each keeps its installs for those agents, and the links and
-/// copies of its shared folder that other agents have, so they go with the folder on uninstall.
-pub(super) fn for_agents(skills: Vec<Skill>, agents: &[Provider]) -> Vec<Skill> {
-    skills
-        .into_iter()
-        .filter_map(|mut skill| {
-            skill
-                .installs
-                .retain(|i| agents.contains(&i.provider) || i.shared);
-            let listed = skill.installs.iter().any(|i| agents.contains(&i.provider))
-                || (agents.contains(&Provider::Claude) && skill.shared.is_some());
-            listed.then_some(skill)
-        })
-        .collect()
-}
-
-/// Puts the "Default installs" heading on top of the first default row. It goes inside that row, so each
-/// row stays one child of the list and `scroll_to_item` keeps finding it.
-fn with_default_heading(rows: &mut [AnyElement], first: Option<usize>, cx: &mut Context<Shelf>) {
-    let Some(row) = first.and_then(|ix| rows.get_mut(ix)) else {
-        return;
-    };
-    let theme = cx.theme();
-    // A tinted band between rule lines, so it reads as a section break and not as another row.
-    let heading = h_flex()
-        .px_4()
-        .py_2()
-        .gap_2()
-        .bg(theme.primary.opacity(0.12))
-        .border_t_2()
-        .border_b_1()
-        .border_color(theme.primary.opacity(0.5))
-        .child(Icon::new(Lucide::Lock).small().text_color(theme.primary))
-        .child(div().font_semibold().child("Default installs"))
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .truncate()
-                .child("Come with the agent; cannot be removed or turned off"),
-        );
-    let taken = std::mem::replace(row, div().into_any_element());
-    *row = v_flex().child(heading).child(taken).into_any_element();
-}
-
-/// The plugins `agents` have installed, each with those agents' installs only.
-pub(super) fn plugins_for(plugins: &[Plugin], agents: &[Provider]) -> Vec<Plugin> {
-    plugins
-        .iter()
-        .filter_map(|plugin| {
-            let mut plugin = plugin.clone();
-            plugin.installs.retain(|p, _| agents.contains(p));
-            (!plugin.installs.is_empty()).then_some(plugin)
-        })
-        .collect()
-}
+use super::{
+    Page, SEARCH_DELAY, Selection, Shelf, cell, count, divider, fact, list_body, matches, section,
+    warning,
+};
+use crate::settings;
 
 impl Shelf {
-    pub(super) fn skill(&self, name: &str) -> Option<&Skill> {
-        self.skills.iter().find(|s| s.name == name)
-    }
-
     pub(super) fn plugin(&self, id: &str) -> Option<&Plugin> {
-        self.plugins.iter().find(|p| p.id == id)
+        self.library.plugin(id)
     }
 
     pub(super) fn visible_skills(&self, cx: &App) -> impl Iterator<Item = &Skill> {
         let filter = self.filter_text(cx);
-        self.skills
+        self.library
+            .skills
             .iter()
             .filter(move |s| matches(&filter, &[&s.name, &s.description]))
     }
 
     pub(super) fn visible_plugins(&self, cx: &App) -> impl Iterator<Item = &Plugin> {
         let filter = self.filter_text(cx);
-        self.plugins
+        self.library
+            .plugins
             .iter()
             .filter(move |p| matches(&filter, &[&p.id, &p.description]))
     }
@@ -106,19 +49,18 @@ impl Shelf {
         let Some(Selection::Skill(name)) = self.selected.clone() else {
             return;
         };
-        let (Some(env), Some(skill)) = (self.env.clone(), self.skill(&name)) else {
-            return;
-        };
-        if skill.source.is_none() || skill.shared.is_none() || self.updates.contains_key(&name) {
+        if !self.library.lock.skills.contains_key(&name) || self.updates.contains_key(&name) {
             return;
         }
+        let env = self.env.clone();
+        let access = self.settings().github;
         // Waits like the search does, so arrowing through the list sends no requests.
         self.update_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DELAY).await;
             let result = {
                 let name = name.clone();
                 cx.background_spawn(async move {
-                    let token = GitHubAccess::load().token(&env).ok().flatten();
+                    let token = settings::github_token(access, &env).ok().flatten();
                     check_skill_update(&env, &name, token.as_deref())
                 })
                 .await
@@ -137,21 +79,22 @@ impl Shelf {
         let Some(Selection::Skill(name)) = self.selected.clone() else {
             return;
         };
-        let (Some(env), Some(Ok(Some(update)))) = (self.env.clone(), self.updates.get(&name))
-        else {
+        let Some(Ok(Some(update))) = self.updates.get(&name) else {
             return;
         };
         if self.busy || self.fetching {
             return;
         }
         let update = update.clone();
+        let env = self.env.clone();
+        let access = self.settings().github;
         self.fetching = true;
         self.fetch_error = None;
         let selection = Selection::Skill(name.clone());
         self.fetch_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let token = GitHubAccess::load().token(&env).ok().flatten();
+                    let token = settings::github_token(access, &env).ok().flatten();
                     fetch_update(&env, &update, token.as_deref())
                 })
                 .await;
@@ -184,7 +127,7 @@ impl Shelf {
 
     /// Whether a newer version is on GitHub, with the button that installs it.
     fn update_status(&self, skill: &Skill, cx: &mut Context<Self>) -> Option<AnyElement> {
-        skill.source.as_ref()?;
+        self.library.lock.skills.get(&skill.name)?;
         let muted = cx.theme().muted_foreground;
         let line = |text: SharedString| h_flex().gap_2().text_sm().text_color(muted).child(text);
         let element = if self.fetching {
@@ -218,57 +161,22 @@ impl Shelf {
         Some(element.into_any_element())
     }
 
-    fn set_skill_enabled(
-        &mut self,
-        name: &str,
-        providers: &[Provider],
-        enabled: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let (Some(env), Some(skill)) = (&self.env, self.skill(name)) else {
-            return;
-        };
-        let steps = providers
-            .iter()
-            .flat_map(|&p| toggle_skill(env, skill, p, enabled))
-            .collect();
-        self.run(steps, None, window, cx);
-    }
-
-    fn set_plugin_enabled(
-        &mut self,
-        id: &str,
-        providers: &[Provider],
-        enabled: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(plugin) = self.plugin(id) else {
-            return;
-        };
-        let steps = providers
-            .iter()
-            .flat_map(|&p| toggle_plugin(plugin, p, enabled))
-            .collect();
-        self.run(steps, None, window, cx);
-    }
-
     pub(super) fn confirm_uninstall(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
         let change = match &self.selected {
             Some(Selection::Skill(name)) => self
+                .library
                 .skill(name)
-                .filter(|s| !s.default)
                 .cloned()
                 .map(Change::UninstallSkill),
-            Some(Selection::Plugin(id)) => self
-                .plugin(id)
-                .filter(|p| !p.is_default())
-                .cloned()
-                .map(Change::UninstallPlugin),
+            Some(Selection::Plugin(id)) => self.plugin(id).cloned().map(Change::UninstallPlugin),
+            Some(Selection::Server(name)) => {
+                let name = name.clone();
+                self.confirm_remove_server(&name, window, cx);
+                None
+            }
             _ => None,
         };
         if let Some(change) = change {
@@ -278,158 +186,163 @@ impl Shelf {
 
     pub(super) fn render_skills(&self, cx: &mut Context<Self>) -> AnyElement {
         let skills: Vec<_> = self.visible_skills(cx).collect();
-        let first_default = skills.iter().position(|s| s.default);
-        let mut rows: Vec<_> = skills.into_iter().map(|s| self.skill_row(s, cx)).collect();
-        with_default_heading(&mut rows, first_default, cx);
+        let rows: Vec<_> = skills.into_iter().map(|s| self.skill_row(s, cx)).collect();
+        let empty = self.library.skills.is_empty();
         v_flex()
             .size_full()
-            .child(self.page_header("Skills", Some(rows.len()), cx))
+            .child(
+                self.page_header("Skills", Some(rows.len()), cx).child(
+                    Button::new("add-folder")
+                        .small()
+                        .icon(IconName::FolderOpen)
+                        .label("Add folder…")
+                        .tooltip("Add a skill folder from your disk")
+                        .disabled(self.busy)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.add_skill_folder(window, cx)),
+                        ),
+                ),
+            )
             .child(self.column_header(&self.installed_columns(), cx))
-            .child(list_body("skill-list", rows, &self.list_scroll, cx))
+            .child(if empty {
+                self.empty_library(
+                    "No skills yet",
+                    "Find skills under Discover, or add a skill folder from your disk.",
+                    Page::FindSkills,
+                    cx,
+                )
+            } else {
+                list_body("skill-list", rows, &self.list_scroll, cx)
+            })
+            .into_any_element()
+    }
+
+    fn empty_library(
+        &self,
+        title: &str,
+        body: &str,
+        discover: Page,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        super::empty_state(IconName::Inbox, title, body, cx)
+            .child(
+                Button::new("discover")
+                    .small()
+                    .primary()
+                    .icon(IconName::Search)
+                    .label("Discover")
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.open_page(discover, window, cx)
+                        }),
+                    ),
+            )
             .into_any_element()
     }
 
     fn skill_row(&self, skill: &Skill, cx: &mut Context<Self>) -> AnyElement {
         let name = skill.name.clone();
-        // A shared skill can be turned on for Claude by linking it in.
-        let togglable: Vec<Provider> = self
-            .agents()
-            .iter()
-            .copied()
-            .filter(|&p| skill_state(skill, p).is_some())
-            .collect();
-        let all_on = togglable.iter().all(|&p| skill.enabled(p) == Some(true));
-        let mut switches = Vec::new();
-        if self.agents().len() > 1 {
-            switches.push(self.switch(
-                format!("skill-all-{name}"),
-                all_on,
-                togglable.is_empty(),
-                "All agents",
-                {
-                    let name = name.clone();
-                    let togglable = togglable.clone();
-                    cx.listener(move |this, on: &bool, window, cx| {
-                        this.set_skill_enabled(&name, &togglable, *on, window, cx)
-                    })
-                },
-            ));
-        }
-        for &provider in self.agents() {
-            let name = name.clone();
-            switches.push(self.switch(
-                format!("skill-{}-{name}", provider.cli()),
-                skill.enabled(provider) == Some(true),
-                !togglable.contains(&provider),
-                provider.label(),
-                cx.listener(move |this, on: &bool, window, cx| {
-                    this.set_skill_enabled(&name, &[provider], *on, window, cx)
-                }),
-            ));
-        }
+        let mut controls = self.item_switches(Kind::Skill, &name, false, cx);
         let selection = Selection::Skill(name.clone());
-        switches.push(self.row_uninstall(
-            format!("uninstall-skill-{name}"),
-            &selection,
-            skill.default,
-            cx,
-        ));
+        controls.push(self.row_uninstall(format!("uninstall-skill-{name}"), &selection, cx));
         let selected = self.selected.as_ref() == Some(&selection);
+        let tag = if self.has_update(&name) {
+            Some("update available")
+        } else if !self.library.lock.skills.contains_key(&name) {
+            Some("local")
+        } else {
+            None
+        };
         self.row(
             format!("skill-{name}"),
             selected,
-            if skill.default {
-                skill.title.clone()
-            } else {
-                skill.name.clone()
-            },
-            if skill.default {
-                None
-            } else if skill.shared.is_none() {
-                Some("unmanaged")
-            } else {
-                self.has_update(&skill.name).then_some("update available")
-            },
+            name,
+            tag,
             skill.description.clone(),
-            switches,
+            controls,
             cx.listener(move |this, _, _, cx| this.select(Some(selection.clone()), cx)),
             cx,
         )
     }
 
+    /// Asks for a skill folder, then copies it into the library.
+    fn add_skill_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add skill".into()),
+        });
+        let env = self.env.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(dir) = paths.into_iter().next() else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                match xolkit_core::add_local_skill(&env, &dir) {
+                    Ok((name, mut steps)) => {
+                        let mut settings = this.settings().clone();
+                        for agent in this.agents().to_vec() {
+                            settings.active_mut().set(Kind::Skill, &name, agent, true);
+                        }
+                        steps.push(xolkit_core::Action::SaveSettings {
+                            settings: Box::new(settings),
+                        });
+                        this.run(steps, Some(format!("Added {name}").into()), window, cx);
+                    }
+                    Err(e) => window.push_notification(Notification::error(format!("{e:#}")), cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(super) fn render_plugins(&self, cx: &mut Context<Self>) -> AnyElement {
         let plugins: Vec<_> = self.visible_plugins(cx).collect();
-        let first_default = plugins.iter().position(|p| p.is_default());
-        let mut rows: Vec<_> = plugins
+        let rows: Vec<_> = plugins
             .into_iter()
             .map(|p| self.plugin_row(p, cx))
             .collect();
-        with_default_heading(&mut rows, first_default, cx);
-        let warnings: Vec<_> = self
-            .plugin_errors
-            .iter()
-            .filter(|(provider, _)| self.agents().contains(provider))
-            .map(|(_, error)| warning(error.clone(), cx))
-            .collect();
+        let empty = self.library.plugins.is_empty();
         v_flex()
             .size_full()
             .child(self.page_header("Plugins", Some(rows.len()), cx))
-            .children(warnings)
             .child(self.column_header(&self.installed_columns(), cx))
-            .child(list_body("plugin-list", rows, &self.list_scroll, cx))
+            .child(if empty {
+                self.empty_library(
+                    "No plugins yet",
+                    "Find plugins in the marketplaces you add under Discover.",
+                    Page::FindPlugins,
+                    cx,
+                )
+            } else {
+                list_body("plugin-list", rows, &self.list_scroll, cx)
+            })
             .into_any_element()
     }
 
     fn plugin_row(&self, plugin: &Plugin, cx: &mut Context<Self>) -> AnyElement {
         let id = plugin.id.clone();
-        let installed: Vec<Provider> = plugin
-            .installs
-            .iter()
-            .filter(|(_, i)| !i.default)
-            .map(|(&p, _)| p)
-            .collect();
-        let all_on = plugin.installs.values().all(|i| i.enabled);
-        let mut switches = Vec::new();
-        if self.agents().len() > 1 {
-            let locked = installed.is_empty();
-            switches.push(
-                self.switch(format!("plugin-all-{id}"), all_on, locked, "All agents", {
-                    let id = id.clone();
-                    let installed = installed.clone();
-                    cx.listener(move |this, on: &bool, window, cx| {
-                        this.set_plugin_enabled(&id, &installed, *on, window, cx)
-                    })
-                }),
-            );
-        }
-        for &provider in self.agents() {
-            let id = id.clone();
-            let install = plugin.installs.get(&provider);
-            switches.push(self.switch(
-                format!("plugin-{}-{id}", provider.cli()),
-                install.is_some_and(|i| i.enabled),
-                install.is_none_or(|i| i.default),
-                provider.label(),
-                cx.listener(move |this, on: &bool, window, cx| {
-                    this.set_plugin_enabled(&id, &[provider], *on, window, cx)
-                }),
-            ));
-        }
+        let mut controls = self.item_switches(Kind::Plugin, &id, false, cx);
         let selection = Selection::Plugin(id.clone());
-        switches.push(self.row_uninstall(
-            format!("uninstall-plugin-{id}"),
-            &selection,
-            plugin.is_default(),
-            cx,
-        ));
+        controls.push(self.row_uninstall(format!("uninstall-plugin-{id}"), &selection, cx));
         let selected = self.selected.as_ref() == Some(&selection);
+        let tag = if plugin.needs_native() {
+            format!("{} · native", plugin.marketplace)
+        } else {
+            plugin.marketplace.clone()
+        };
         self.row(
             format!("plugin-{id}"),
             selected,
             plugin.name.clone(),
-            Some(plugin.marketplace.as_str()).filter(|m| !m.is_empty()),
+            Some(tag.as_str()),
             plugin.description.clone(),
-            switches,
+            controls,
             cx.listener(move |this, _, _, cx| this.select(Some(selection.clone()), cx)),
             cx,
         )
@@ -442,18 +355,13 @@ impl Shelf {
         columns
     }
 
-    /// A row's own uninstall button: selects the row and asks to confirm. Defaults get an empty
-    /// cell, so the columns stay aligned.
-    fn row_uninstall(
+    /// A row's own uninstall button: selects the row and asks to confirm.
+    pub(super) fn row_uninstall(
         &self,
         id: String,
         selection: &Selection,
-        default: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if default {
-            return cell().into_any_element();
-        }
         let selection = selection.clone();
         cell()
             .child(
@@ -461,7 +369,7 @@ impl Shelf {
                     .ghost()
                     .small()
                     .icon(Lucide::Trash)
-                    .tooltip("Uninstall… (Delete)")
+                    .tooltip("Remove… (Delete)")
                     .disabled(self.busy)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         // The row's click would focus the list, taking focus from the dialog.
@@ -482,47 +390,39 @@ impl Shelf {
             .on_click(cx.listener(|this, _, window, cx| this.confirm_uninstall(window, cx)))
     }
 
-    pub(super) fn skill_detail(&self, skill: &Skill, cx: &mut Context<Self>) -> AnyElement {
-        let Some(env) = &self.env else {
-            return div().into_any_element();
-        };
-        let mut locations: Vec<_> = skill
-            .installs
-            .iter()
-            .filter(|install| self.agents().contains(&install.provider))
-            .map(|install| {
-                let kind = match std::fs::read_link(&install.path) {
-                    Ok(target) => format!("link to {}", env.tilde(&target)),
-                    Err(_) if Some(&install.path) == skill.shared.as_ref() => "shared copy".into(),
-                    Err(_) if install.shared => "copy".into(),
-                    Err(_) => "folder".to_owned(),
+    /// Which agents get the item from the active profile, as a line per agent.
+    fn served_to(&self, kind: Kind, name: &str, cx: &mut Context<Self>) -> Vec<Div> {
+        let profile = self.settings().active();
+        Agent::ALL
+            .into_iter()
+            .map(|agent| {
+                let state = if !profile.serves(agent) {
+                    "not served by this profile"
+                } else if profile.is_on(kind, name, agent) {
+                    "on"
+                } else {
+                    "off"
                 };
-                let state = if install.enabled { "on" } else { "off" };
-                let place = env.tilde(&install.path);
-                fact(
-                    install.provider.label(),
-                    format!("{place} ({kind}, {state})"),
-                    cx,
-                )
+                fact(agent.label(), state.to_owned(), cx)
             })
-            .collect();
-        if locations.is_empty()
-            && let Some(shared) = &skill.shared
-        {
-            locations.push(fact("Shared", env.tilde(shared), cx));
+            .collect()
+    }
+
+    pub(super) fn skill_detail(&self, skill: &Skill, cx: &mut Context<Self>) -> AnyElement {
+        let pin = self.library.lock.skills.get(&skill.name);
+        let subtitle = Some(match pin {
+            Some(pin) if pin.folder.is_empty() => pin.source.clone(),
+            Some(pin) => format!("{}/{}", pin.source, pin.folder),
+            None => "Added from your disk".to_owned(),
+        });
+        let mut facts = vec![fact("Folder", self.env.tilde(&skill.dir), cx)];
+        if let Some(pin) = pin {
+            let commit: String = pin.commit.chars().take(12).collect();
+            facts.push(fact("Commit", commit, cx));
         }
-        let subtitle = if skill.default {
-            Some("Ships with Codex; cannot be removed or turned off".into())
-        } else {
-            skill.source.clone().or(skill
-                .shared
-                .is_none()
-                .then(|| "Not managed by xolkit".into()))
-        };
-        let uninstall = (!skill.default).then(|| self.uninstall_button(cx));
         v_flex()
             .size_full()
-            .child(self.detail_header(skill.title.clone(), subtitle, uninstall, cx))
+            .child(self.detail_header(skill.title.clone(), subtitle, self.uninstall_button(cx), cx))
             .child(
                 div()
                     .id("skill-detail")
@@ -535,7 +435,13 @@ impl Shelf {
                             .gap_3()
                             .child(skill.description.clone())
                             .children(self.update_status(skill, cx))
-                            .child(v_flex().gap_1().children(locations))
+                            .child(v_flex().gap_1().children(facts))
+                            .child(section("In the active profile"))
+                            .child(v_flex().gap_1().children(self.served_to(
+                                Kind::Skill,
+                                &skill.name,
+                                cx,
+                            )))
                             .child(divider(cx))
                             .child(
                                 TextView::markdown("skill-md", self.skill_md.clone())
@@ -547,133 +453,141 @@ impl Shelf {
     }
 
     pub(super) fn plugin_detail(&self, plugin: &Plugin, cx: &mut Context<Self>) -> AnyElement {
-        let Some(env) = &self.env else {
-            return div().into_any_element();
+        let parts = &plugin.parts;
+        let muted = cx.theme().muted_foreground;
+        let native = self.library.lock.native(&plugin.id);
+        let mut served = Vec::new();
+        if !parts.skills.is_empty() {
+            served.push(count(parts.skills.len(), "skill"));
+        }
+        if !parts.commands.is_empty() {
+            served.push(count(parts.commands.len(), "command"));
+        }
+        if !parts.servers.is_empty() {
+            served.push(count(parts.servers.len(), "MCP server"));
+        }
+        let served = if served.is_empty() {
+            "nothing".to_owned()
+        } else {
+            served.join(", ")
         };
-        let installs: Vec<_> = plugin
-            .installs
-            .iter()
-            .map(|(provider, install)| {
-                let state = if install.enabled { "on" } else { "off" };
-                let place = install
-                    .path
-                    .as_deref()
-                    .map(|p| format!(", {}", env.tilde(p)))
-                    .unwrap_or_default();
-                let summary = format!("{} ({state}{place})", install.version);
-                fact(provider.label(), summary, cx)
-            })
-            .collect();
-        let uninstall = (!plugin.is_default()).then(|| self.uninstall_button(cx));
+        let native_lines: Vec<Div> = if plugin.needs_native() {
+            Provider::ALL
+                .into_iter()
+                .map(|provider| {
+                    let state = if native.contains(&provider) {
+                        "installed natively"
+                    } else {
+                        "not installed"
+                    };
+                    let install = (!native.contains(&provider)).then(|| {
+                        let id = plugin.id.clone();
+                        Button::new(SharedString::from(format!("native-{}", provider.cli())))
+                            .small()
+                            .label("Install natively…")
+                            .disabled(self.busy)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.confirm_native_install(&id, provider, window, cx)
+                            }))
+                    });
+                    h_flex()
+                        .gap_2()
+                        .child(fact(provider.label(), state.to_owned(), cx).flex_1())
+                        .children(install)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let pin = self.library.lock.plugins.get(&plugin.id);
+        let version = if plugin.version.is_empty() {
+            pin.map(|p| p.version.clone()).unwrap_or_default()
+        } else {
+            plugin.version.clone()
+        };
         v_flex()
             .size_full()
             .child(self.detail_header(
                 plugin.name.clone(),
                 Some(plugin.marketplace.clone()),
-                uninstall,
+                self.uninstall_button(cx),
                 cx,
             ))
             .child(
-                v_flex()
-                    .p_4()
-                    .gap_3()
-                    .text_color(cx.theme().foreground)
-                    .child(plugin.description.clone())
-                    .child(v_flex().gap_1().children(installs)),
+                div()
+                    .id("plugin-detail")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .child(
+                        v_flex()
+                            .p_4()
+                            .gap_3()
+                            .child(plugin.description.clone())
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .when(!version.is_empty(), |this| {
+                                        this.child(fact("Version", version.clone(), cx))
+                                    })
+                                    .when_some(pin, |this, pin| {
+                                        this.child(fact("Source", pin.pin.source.clone(), cx))
+                                    })
+                                    .child(fact("Served", served, cx)),
+                            )
+                            .child(section("In the active profile"))
+                            .child(v_flex().gap_1().children(self.served_to(
+                                Kind::Plugin,
+                                &plugin.id,
+                                cx,
+                            )))
+                            .when(plugin.needs_native(), |this| {
+                                this.child(divider(cx))
+                                    .child(section("Native installs"))
+                                    .child(warning(
+                                        format!(
+                                            "This plugin has {}, which only work from an agent's \
+                                             own folders. xolkit installs it there through the \
+                                             agent's own tool, from xolkit's local marketplace.",
+                                            parts.native.join(" and ")
+                                        ),
+                                        cx,
+                                    ))
+                                    .child(v_flex().gap_2().children(native_lines))
+                            })
+                            .when(!parts.commands.is_empty(), |this| {
+                                this.child(divider(cx)).child(section("Commands")).child(
+                                    v_flex()
+                                        .gap_1()
+                                        .text_sm()
+                                        .children(parts.commands.iter().map(|c| {
+                                            h_flex()
+                                                .gap_2()
+                                                .child(div().font_medium().child(c.name.clone()))
+                                                .child(
+                                                    div()
+                                                        .text_color(muted)
+                                                        .truncate()
+                                                        .child(c.description.clone()),
+                                                )
+                                        })),
+                                )
+                            }),
+                    ),
             )
             .into_any_element()
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use xolkit_core::{Provider, Skill, SkillInstall};
-
-    use super::for_agents;
-
-    fn install(provider: Provider, path: &str, shared: bool) -> SkillInstall {
-        SkillInstall {
-            provider,
-            path: PathBuf::from(path),
-            shared,
-            enabled: true,
+    /// Asks to install a plugin natively in one more agent.
+    fn confirm_native_install(
+        &mut self,
+        id: &str,
+        provider: Provider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(plugin) = self.plugin(id).cloned() {
+            open_change_dialog(self, Change::NativeInstall { plugin, provider }, window, cx);
         }
-    }
-
-    fn skill(name: &str, shared: bool, installs: Vec<SkillInstall>) -> Skill {
-        Skill {
-            name: name.into(),
-            title: name.into(),
-            description: String::new(),
-            shared: shared.then(|| PathBuf::from(format!("agents/{name}"))),
-            source: None,
-            installs,
-            default: false,
-        }
-    }
-
-    fn skills() -> Vec<Skill> {
-        vec![
-            // In the shared folder (Codex reads it) and linked into Claude.
-            skill(
-                "linked",
-                true,
-                vec![
-                    install(Provider::Codex, "agents/linked", true),
-                    install(Provider::Claude, "claude/linked", true),
-                ],
-            ),
-            // Only in the shared folder.
-            skill(
-                "stored",
-                true,
-                vec![install(Provider::Codex, "agents/stored", true)],
-            ),
-            // Claude's own folder, unrelated to the shared one.
-            skill(
-                "own",
-                false,
-                vec![install(Provider::Claude, "claude/own", false)],
-            ),
-        ]
-    }
-
-    fn names(skills: &[Skill]) -> Vec<&str> {
-        skills.iter().map(|s| s.name.as_str()).collect()
-    }
-
-    #[test]
-    fn lists_what_the_managed_agents_have_or_can_link() {
-        assert_eq!(
-            names(&for_agents(skills(), &Provider::ALL)),
-            ["linked", "stored", "own"]
-        );
-        assert_eq!(
-            names(&for_agents(skills(), &[Provider::Claude])),
-            ["linked", "stored", "own"]
-        );
-        assert_eq!(
-            names(&for_agents(skills(), &[Provider::Codex])),
-            ["linked", "stored"]
-        );
-        assert!(for_agents(skills(), &[]).is_empty());
-    }
-
-    #[test]
-    fn keeps_other_agents_links_to_the_shared_folder_only() {
-        let listed = for_agents(skills(), &[Provider::Claude]);
-        // The shared folder stays, so uninstalling from Claude knows to remove it.
-        assert_eq!(listed[0].installs.len(), 2);
-        let mut own = skills();
-        own[2]
-            .installs
-            .push(install(Provider::Codex, "codex/own", false));
-        let listed = for_agents(own, &[Provider::Claude]);
-        assert_eq!(
-            listed[2].installs,
-            [install(Provider::Claude, "claude/own", false)]
-        );
     }
 }

@@ -7,7 +7,7 @@ _version=@VERSION@
 # pacman versions can't hold hyphens, which pre-release versions use.
 pkgver=${_version//-/_}
 pkgrel=1
-pkgdesc='Desktop app for managing agent skills and plugins for Claude Code and Codex CLI'
+pkgdesc='One library of skills, plugins and MCP servers, served to Claude Code, Codex CLI and other agents'
 arch=('x86_64' 'aarch64')
 url='https://github.com/xolan/xolkit'
 license=('MIT' 'OFL-1.1')
@@ -24,9 +24,10 @@ depends=(
   'wayland'
 )
 optdepends=(
-  'claude-code: manage Claude Code skills and plugins'
-  'openai-codex: manage Codex CLI skills and plugins'
-  'github-cli: sign in to GitHub for skill downloads'
+  'claude-code: register xolkit with Claude Code'
+  'openai-codex: register xolkit with Codex CLI'
+  'github-cli: sign in to GitHub for downloads'
+  'gnome-keyring: store secrets (or another Secret Service provider, such as KeePassXC)'
 )
 provides=('xolkit')
 conflicts=('xolkit')

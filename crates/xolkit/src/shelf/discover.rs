@@ -2,19 +2,23 @@
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, IconName, Sizable, button::Button, button::ButtonVariants, h_flex,
-    scroll::ScrollableElement, spinner::Spinner, text::TextView, v_flex,
+    ActiveTheme, Disableable, IconName, Sizable, WindowExt, button::Button, button::ButtonVariants,
+    h_flex, input::Input, notification::Notification, scroll::ScrollableElement, spinner::Spinner,
+    text::TextView, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use xolkit_core::{AvailablePlugin, SkillHit, available_plugins, fetch_skill, search_skills};
+use xolkit_core::{
+    Offer, PluginSource, SkillHit, fetch_offers, fetch_plugin, fetch_skill, search_skills,
+    valid_marketplace,
+};
 
 use super::change::{Change, open_change_dialog};
 use super::{
     SEARCH_DELAY, Selection, Shelf, cell, divider, empty_state, fact, icon_line, list_body,
     matches, warning,
 };
-use crate::settings::GitHubAccess;
+use crate::settings;
 
 /// Most marketplace plugins to list at once; the filter narrows the rest.
 pub(super) const MAX_OFFERS: usize = 200;
@@ -54,9 +58,8 @@ impl Shelf {
 
     /// Downloads a search result so its files can be reviewed and installed.
     pub(super) fn fetch(&mut self, hit: SkillHit, cx: &mut Context<Self>) {
-        let Some(env) = self.env.clone() else {
-            return;
-        };
+        let env = self.env.clone();
+        let access = self.settings().github;
         self.fetching = true;
         let selection = Selection::Hit(hit.id.clone());
         // shortcut: a download still running when the selection changes is dropped, and its
@@ -67,7 +70,7 @@ impl Shelf {
             let result = cx
                 .background_spawn(async move {
                     // Without a usable token the download still works, within the anonymous limit.
-                    let token = GitHubAccess::load().token(&env).ok().flatten();
+                    let token = settings::github_token(access, &env).ok().flatten();
                     fetch_skill(&env, &hit.source, &hit.skill_id, token.as_deref())
                 })
                 .await;
@@ -91,15 +94,17 @@ impl Shelf {
     }
 
     pub(super) fn load_offers(&mut self, cx: &mut Context<Self>) {
-        let Some(env) = self.env.clone() else {
-            return;
-        };
-        let agents = self.agents().to_vec();
+        let env = self.env.clone();
+        let access = self.settings().github;
+        let repos = self.settings().marketplaces.clone();
         self.loading_offers = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let (offers, errors) = cx
-                .background_spawn(async move { available_plugins(&env, &agents) })
+                .background_spawn(async move {
+                    let token = settings::github_token(access, &env).ok().flatten();
+                    fetch_offers(&repos, token.as_deref())
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.loading_offers = false;
@@ -112,16 +117,57 @@ impl Shelf {
         .detach();
     }
 
-    pub(super) fn offer(&self, id: &str) -> Option<&AvailablePlugin> {
+    pub(super) fn offer(&self, id: &str) -> Option<&Offer> {
         self.offers.as_ref()?.iter().find(|o| o.id == id)
     }
 
-    pub(super) fn visible_offers(&self, cx: &App) -> impl Iterator<Item = &AvailablePlugin> {
+    pub(super) fn visible_offers(&self, cx: &App) -> impl Iterator<Item = &Offer> {
         let filter = self.filter_text(cx);
         self.offers
             .iter()
             .flatten()
             .filter(move |o| matches(&filter, &[&o.id, &o.description]))
+    }
+
+    fn add_marketplace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repo = self.marketplace_input.read(cx).value().trim().to_owned();
+        let repo = repo
+            .trim_start_matches("https://github.com/")
+            .trim_end_matches('/')
+            .trim_end_matches(".git")
+            .to_owned();
+        if !valid_marketplace(&repo) {
+            window.push_notification(
+                Notification::error(format!("“{repo}” is not a GitHub owner/repository")),
+                cx,
+            );
+            return;
+        }
+        let mut settings = self.settings().clone();
+        if settings.marketplaces.contains(&repo) {
+            return;
+        }
+        settings.marketplaces.push(repo.clone());
+        self.marketplace_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.offers = None;
+        self.save_settings(
+            settings,
+            Vec::new(),
+            Some(format!("Added {repo}").into()),
+            window,
+            cx,
+        );
+        // The settings changed in memory at once, so this reads the new list.
+        self.load_offers(cx);
+    }
+
+    fn remove_marketplace(&mut self, repo: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let mut settings = self.settings().clone();
+        settings.marketplaces.retain(|m| m != repo);
+        self.offers = None;
+        self.save_settings(settings, Vec::new(), None, window, cx);
+        self.load_offers(cx);
     }
 
     /// Asks to install the downloaded search result.
@@ -142,21 +188,54 @@ impl Shelf {
         }
     }
 
-    /// Asks to install the selected marketplace plugin.
+    /// Downloads the selected marketplace plugin, then asks to install it.
     pub(super) fn install_offer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Selection::Offer(id)) = &self.selected else {
             return;
         };
-        if let Some(offer) = self.offer(id).cloned()
-            && offer.providers.values().any(|installed| !installed)
-            && !self.busy
-        {
-            open_change_dialog(self, Change::InstallPlugin(offer), window, cx);
+        let Some(offer) = self.offer(id).cloned() else {
+            return;
+        };
+        if self.library.plugin(&offer.id).is_some() || self.busy || self.fetching {
+            return;
         }
+        let env = self.env.clone();
+        let access = self.settings().github;
+        self.fetching = true;
+        self.fetch_error = None;
+        let selection = Selection::Offer(offer.id.clone());
+        self.fetch_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let token = settings::github_token(access, &env).ok().flatten();
+                    fetch_plugin(&env, &offer, token.as_deref())
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.fetching = false;
+                if this.selected.as_ref() != Some(&selection) {
+                    if let Ok(fetched) = result {
+                        fetched.discard();
+                    }
+                    return;
+                }
+                match result {
+                    Ok(fetched) => {
+                        this.set_fetched_plugin(Some(fetched.clone()));
+                        open_change_dialog(this, Change::InstallPlugin(fetched), window, cx);
+                    }
+                    Err(e) => this.fetch_error = Some(format!("{e:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     fn installed_skill(&self, hit: &SkillHit) -> bool {
-        self.skills
+        self.library
+            .skills
             .iter()
             .any(|s| s.name == hit.skill_id || s.name == hit.name)
     }
@@ -294,14 +373,67 @@ impl Shelf {
             .iter()
             .map(|error| warning(error.clone(), cx))
             .collect();
+        let marketplaces = self.settings().marketplaces.clone();
+        let muted = cx.theme().muted_foreground;
+        let bar = v_flex()
+            .px_4()
+            .py_2()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().text_sm().text_color(muted).child("Marketplaces"))
+                    .children(marketplaces.iter().map(|repo| {
+                        let remove = repo.clone();
+                        Button::new(SharedString::from(format!("market-{repo}")))
+                            .xsmall()
+                            .outline()
+                            .label(repo.clone())
+                            .icon(IconName::Close)
+                            .tooltip("Remove this marketplace")
+                            .disabled(self.busy)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.remove_marketplace(&remove, window, cx)
+                            }))
+                    }))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .w(px(220.))
+                            .child(Input::new(&self.marketplace_input).small()),
+                    )
+                    .child(
+                        Button::new("add-marketplace")
+                            .small()
+                            .icon(IconName::Plus)
+                            .label("Add")
+                            .disabled(self.busy)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.add_marketplace(window, cx)),
+                            ),
+                    ),
+            );
         let (count, body) = match &self.offers {
+            _ if marketplaces.is_empty() => (
+                None,
+                empty_state(
+                    IconName::Inbox,
+                    "No marketplaces yet",
+                    "Add a GitHub repository with a .claude-plugin/marketplace.json, such as \
+                     anthropics/claude-plugins-official.",
+                    cx,
+                )
+                .into_any_element(),
+            ),
             None => (
                 None,
                 empty_state(IconName::Search, "Reading your marketplaces…", "", cx)
                     .into_any_element(),
             ),
             Some(_) => {
-                let matching: Vec<&AvailablePlugin> = self.visible_offers(cx).collect();
+                let matching: Vec<&Offer> = self.visible_offers(cx).collect();
                 let mut rows: Vec<_> = matching
                     .iter()
                     .take(MAX_OFFERS)
@@ -316,7 +448,7 @@ impl Shelf {
                         div()
                             .p_4()
                             .text_sm()
-                            .text_color(cx.theme().muted_foreground)
+                            .text_color(muted)
                             .child(note)
                             .into_any_element(),
                     );
@@ -330,87 +462,82 @@ impl Shelf {
         v_flex()
             .size_full()
             .child(self.page_header("Find plugins", count, cx))
+            .child(bar)
             .children(warnings)
-            .child(self.column_header(&self.offer_columns(), cx))
+            .child(self.column_header(&["Version"], cx))
             .child(body)
             .into_any_element()
     }
 
-    fn offer_columns(&self) -> Vec<&'static str> {
-        let agents = self.agents().iter().map(|p| p.label());
-        ["Installs"].into_iter().chain(agents).collect()
-    }
-
-    fn offer_row(&self, offer: &AvailablePlugin, cx: &mut Context<Self>) -> AnyElement {
+    fn offer_row(&self, offer: &Offer, cx: &mut Context<Self>) -> AnyElement {
         let selection = Selection::Offer(offer.id.clone());
         let selected = self.selected.as_ref() == Some(&selection);
-        let muted = cx.theme().muted_foreground;
-        let mut cells = vec![
-            cell()
-                .text_sm()
-                .text_color(muted)
-                .child(offer.install_count.map(compact).unwrap_or_default())
-                .into_any_element(),
-        ];
-        for provider in self.agents() {
-            let state = match offer.providers.get(provider) {
-                Some(true) => "installed",
-                Some(false) => "available",
-                None => "",
-            };
-            cells.push(
-                cell()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(state)
-                    .into_any_element(),
-            );
-        }
+        let version = cell()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(offer.version.clone())
+            .into_any_element();
+        let installed = self.library.plugin(&offer.id).is_some();
+        let tag = if installed {
+            format!("{} · installed", offer.marketplace)
+        } else {
+            offer.marketplace.clone()
+        };
         self.row(
             format!("offer-{}", offer.id),
             selected,
             offer.name.clone(),
-            Some(offer.marketplace.as_str()),
+            Some(tag.as_str()),
             offer.description.clone(),
-            cells,
+            vec![version],
             cx.listener(move |this, _, _, cx| this.select(Some(selection.clone()), cx)),
             cx,
         )
     }
 
-    pub(super) fn offer_detail(
-        &self,
-        offer: &AvailablePlugin,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let installable = offer.providers.values().any(|installed| !installed);
+    pub(super) fn offer_detail(&self, offer: &Offer, cx: &mut Context<Self>) -> AnyElement {
+        let installed = self.library.plugin(&offer.id).is_some();
+        let source = match &offer.source {
+            PluginSource::GitHub { repo, folder, rev } => {
+                let mut text = repo.clone();
+                if !folder.is_empty() {
+                    text = format!("{text}/{folder}");
+                }
+                if let Some(rev) = rev {
+                    text = format!("{text} at {rev}");
+                }
+                Ok(text)
+            }
+            PluginSource::Unsupported(what) => Err(format!("xolkit can't install from {what}")),
+        };
         let install = Button::new("install")
             .primary()
             .icon(Lucide::Download)
-            .label(if installable {
-                "Install…"
-            } else {
-                "Installed"
-            })
-            .disabled(!installable || self.busy)
+            .label(if installed { "Installed" } else { "Install…" })
+            .disabled(installed || source.is_err() || self.busy || self.fetching)
             .on_click(cx.listener(|this, _, window, cx| this.install_offer(window, cx)));
-        let providers: Vec<_> = self
-            .agents()
-            .iter()
-            .map(|provider| {
-                let state = match offer.providers.get(provider) {
-                    Some(true) => "Installed",
-                    Some(false) => "Available",
-                    None => "Not in its marketplaces",
-                };
-                fact(provider.label(), state.to_owned(), cx)
-            })
-            .collect();
+        let status = if self.fetching {
+            h_flex()
+                .gap_2()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(Spinner::new().small())
+                .child("Downloading…")
+                .into_any_element()
+        } else if let Some(error) = &self.fetch_error {
+            div()
+                .text_sm()
+                .text_color(cx.theme().danger)
+                .child(error.clone())
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
         v_flex()
             .size_full()
             .child(self.detail_header(
                 offer.name.clone(),
-                Some(offer.marketplace.clone()),
+                Some(offer.marketplace_repo.clone()),
                 install,
                 cx,
             ))
@@ -419,10 +546,18 @@ impl Shelf {
                     .p_4()
                     .gap_3()
                     .child(offer.description.clone())
-                    .when_some(offer.install_count, |this, count| {
-                        this.child(fact("Installs", count.to_string(), cx))
-                    })
-                    .child(v_flex().gap_1().children(providers)),
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .when(!offer.version.is_empty(), |this| {
+                                this.child(fact("Version", offer.version.clone(), cx))
+                            })
+                            .child(match source {
+                                Ok(text) => fact("Source", text, cx),
+                                Err(text) => warning(text, cx),
+                            }),
+                    )
+                    .child(status),
             )
             .into_any_element()
     }

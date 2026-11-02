@@ -1,0 +1,419 @@
+//! Registering xolkit with an agent: one MCP server entry, written once by the agent's own
+//! tool, that starts `xolkit mcp`. Plus the optional router skill.
+
+use std::path::{Path, PathBuf};
+
+use crate::config::{read_json, read_toml};
+use crate::lock::Lock;
+use crate::marketplace::MARKETPLACE;
+use crate::ops::Gone;
+use crate::{Action, Env, Provider, Settings, XOLKIT};
+
+/// How xolkit is registered with an agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Registration {
+    /// No `xolkit` server in the agent's config.
+    Missing,
+    /// Registered to start this program.
+    Current,
+    /// Registered, but to start another program (such as an older copy).
+    Other(String),
+}
+
+/// The command line an agent starts xolkit with.
+fn command_line(exe: &Path, provider: Provider) -> Vec<String> {
+    vec![
+        exe.to_string_lossy().into_owned(),
+        "mcp".to_owned(),
+        "--agent".to_owned(),
+        provider.cli().to_owned(),
+    ]
+}
+
+/// How xolkit is registered with `provider`, read from the agent's config file.
+pub fn registration(env: &Env, provider: Provider, exe: &Path) -> Registration {
+    let command = match provider {
+        Provider::Claude => read_json(&env.claude_json()).ok().and_then(|json| {
+            json["mcpServers"][XOLKIT]["command"]
+                .as_str()
+                .map(str::to_owned)
+        }),
+        Provider::Codex => read_toml(&env.codex_config()).ok().and_then(|doc| {
+            doc.get("mcp_servers")?
+                .get(XOLKIT)?
+                .get("command")?
+                .as_str()
+                .map(str::to_owned)
+        }),
+    };
+    match command {
+        None => Registration::Missing,
+        Some(command) if Path::new(&command) == exe => Registration::Current,
+        Some(command) => Registration::Other(command),
+    }
+}
+
+/// Whether `provider`'s config has a `xolkit` server entry. Fails when the config can't be read,
+/// so an unreadable file never passes for "no entry".
+pub(crate) fn has_entry(env: &Env, provider: Provider) -> anyhow::Result<bool> {
+    Ok(match provider {
+        Provider::Claude => read_json(&env.claude_json())?["mcpServers"]
+            .get(XOLKIT)
+            .is_some(),
+        Provider::Codex => read_toml(&env.codex_config())?
+            .get("mcp_servers")
+            .and_then(|servers| servers.get(XOLKIT))
+            .is_some(),
+    })
+}
+
+/// Takes xolkit's server entry out of `provider`'s config directly, for when the agent's own
+/// tool can't: it is gone, or fails.
+pub(crate) fn remove_entry_from_config(env: &Env, provider: Provider) -> anyhow::Result<()> {
+    match provider {
+        Provider::Claude => {
+            let path = env.claude_json();
+            let mut json = read_json(&path)?;
+            let removed = json
+                .get_mut("mcpServers")
+                .and_then(|s| s.as_object_mut())
+                .is_some_and(|servers| servers.shift_remove(XOLKIT).is_some());
+            if removed {
+                crate::config::write_json(&path, &json)?;
+            }
+        }
+        Provider::Codex => {
+            let path = env.codex_config();
+            let mut doc = read_toml(&path)?;
+            let removed = doc
+                .get_mut("mcp_servers")
+                .and_then(|s| s.as_table_like_mut())
+                .is_some_and(|servers| servers.remove(XOLKIT).is_some());
+            if removed {
+                crate::config::write_toml(&path, &doc)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Steps that register xolkit with `provider`, replacing an entry that starts another program.
+pub fn register(env: &Env, provider: Provider, exe: &Path) -> Vec<Action> {
+    let mut actions = Vec::new();
+    if registration(env, provider, exe) != Registration::Missing {
+        actions.push(remove_entry(provider));
+    }
+    let start: &[&str] = match provider {
+        Provider::Claude => &["mcp", "add", "--scope", "user", XOLKIT, "--"],
+        Provider::Codex => &["mcp", "add", XOLKIT, "--"],
+    };
+    let mut args: Vec<String> = start.iter().map(|a| (*a).to_owned()).collect();
+    args.extend(command_line(exe, provider));
+    actions.push(Action::Run { provider, args });
+    actions
+}
+
+fn remove_entry(provider: Provider) -> Action {
+    let args: &[&str] = match provider {
+        Provider::Claude => &["mcp", "remove", "--scope", "user", XOLKIT],
+        Provider::Codex => &["mcp", "remove", XOLKIT],
+    };
+    Action::Undo {
+        provider,
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+        gone: Gone::McpEntry,
+    }
+}
+
+/// Where the router skill goes for `provider`.
+pub(crate) fn router_dir(env: &Env, provider: Provider) -> PathBuf {
+    match provider {
+        Provider::Claude => env.claude_skills(),
+        Provider::Codex => env.codex_skills(),
+    }
+    .join(XOLKIT)
+}
+
+/// Marks a router skill as xolkit's, so a skill of the user's own named `xolkit` is left alone.
+pub(crate) const ROUTER_MARK: &str = "This skill is written by xolkit";
+
+/// Whether the router skill in `provider`'s folder is one xolkit wrote.
+pub fn router_is_ours(env: &Env, provider: Provider) -> bool {
+    std::fs::read_to_string(router_dir(env, provider).join("SKILL.md"))
+        .is_ok_and(|text| text.contains(ROUTER_MARK))
+}
+
+/// The files of xolkit's router skill: the skill, and a write of it cut short.
+const ROUTER_FILES: [&str; 2] = ["SKILL.md", ".SKILL.md.xolkit-tmp"];
+
+/// Whether the router's folder holds nothing of the user's: it is xolkit's, missing, or empty
+/// but for a write of xolkit's cut short. Only then may xolkit write or remove it.
+fn router_free(env: &Env, provider: Provider) -> bool {
+    let dir = router_dir(env, provider);
+    if !dir.exists() || router_is_ours(env, provider) {
+        return true;
+    }
+    std::fs::read_dir(&dir)
+        .is_ok_and(|entries| entries.flatten().all(|e| e.file_name() == ROUTER_FILES[1]))
+}
+
+/// Writes the router skill for `provider`, or removes it when `skill` is `None`. Leaves the file
+/// alone when it already says the same, so the agent's file watcher has nothing to report, and
+/// never touches a skill named `xolkit` that xolkit didn't write.
+pub fn write_router(env: &Env, provider: Provider, skill: Option<&str>) -> anyhow::Result<()> {
+    let dir = router_dir(env, provider);
+    let path = dir.join("SKILL.md");
+    if !router_free(env, provider) {
+        anyhow::ensure!(
+            skill.is_none(),
+            "{} holds a skill of your own; rename it to use the router skill",
+            env.tilde(&dir)
+        );
+        return Ok(());
+    }
+    match skill {
+        Some(text) => {
+            if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
+                return Ok(());
+            }
+            crate::config::write_atomic(&path, text.as_bytes())
+        }
+        None => {
+            // xolkit's own files only; anything the user put beside them stays, with the folder.
+            for file in ROUTER_FILES {
+                match std::fs::remove_file(dir.join(file)) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                    _ => {}
+                }
+            }
+            let _ = std::fs::remove_dir(&dir);
+            Ok(())
+        }
+    }
+}
+
+/// Steps that take everything xolkit wrote out of `provider`: its MCP server entry, the router
+/// skill (turned off first, so the daemon doesn't write it again), and the plugins it installed
+/// natively, with xolkit's marketplace.
+pub fn unregister(env: &Env, provider: Provider, lock: &Lock, settings: &Settings) -> Vec<Action> {
+    let mut actions = Vec::new();
+    // A config that can't be read may still have the entry: try, and let the check decide.
+    if has_entry(env, provider).unwrap_or(true) {
+        actions.push(remove_entry(provider));
+    }
+    if settings.router.contains(&provider) {
+        let mut settings = settings.clone();
+        settings.router.retain(|p| *p != provider);
+        actions.push(Action::SaveSettings {
+            settings: Box::new(settings),
+        });
+    }
+    let router = router_dir(env, provider);
+    if router.exists() && router_free(env, provider) {
+        actions.push(Action::RemoveRouter { provider });
+    }
+    let run = |args: &[&str], gone: Gone| Action::Undo {
+        provider,
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+        gone,
+    };
+    let mut any_native = false;
+    for (id, pin) in &lock.plugins {
+        if !pin.native.contains(&provider) {
+            continue;
+        }
+        any_native = true;
+        let name = id.split_once('@').map_or(id.as_str(), |(name, _)| name);
+        let native = format!("{name}@{MARKETPLACE}");
+        let gone = Gone::Plugin { id: native.clone() };
+        actions.push(match provider {
+            Provider::Claude => run(&["plugin", "uninstall", &native, "--scope", "user"], gone),
+            Provider::Codex => run(&["plugin", "remove", &native], gone),
+        });
+        actions.push(Action::SetNative {
+            id: id.clone(),
+            provider,
+            installed: false,
+        });
+    }
+    if any_native {
+        actions.push(run(
+            &["plugin", "marketplace", "remove", MARKETPLACE],
+            Gone::Marketplace,
+        ));
+    }
+    actions
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    use super::*;
+    use crate::PluginPin;
+
+    #[test]
+    fn reads_registrations_from_agent_configs() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        let exe = home.path().join("bin/xolkit");
+        assert_eq!(
+            registration(&env, Provider::Claude, &exe),
+            Registration::Missing
+        );
+        fs::write(
+            env.claude_json(),
+            format!(
+                r#"{{"mcpServers": {{"xolkit": {{"command": {:?}}}}}}}"#,
+                exe.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            registration(&env, Provider::Claude, &exe),
+            Registration::Current
+        );
+        fs::create_dir_all(&env.codex_dir).unwrap();
+        fs::write(
+            env.codex_config(),
+            "[mcp_servers.xolkit]\ncommand = \"/old/xolkit\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            registration(&env, Provider::Codex, &exe),
+            Registration::Other("/old/xolkit".into())
+        );
+    }
+
+    #[test]
+    fn leaves_a_users_own_xolkit_folder_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        let dir = router_dir(&env, Provider::Claude);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.md"), "mine").unwrap();
+        let settings = Settings::default();
+        let lock = Lock::default();
+        // No SKILL.md, but files of the user's: neither removed nor written over.
+        assert!(unregister(&env, Provider::Claude, &lock, &settings).is_empty());
+        assert!(write_router(&env, Provider::Claude, Some("x")).is_err());
+        write_router(&env, Provider::Claude, None).unwrap();
+        assert!(dir.join("notes.md").exists());
+        // An empty leftover is xolkit's to use.
+        fs::remove_file(dir.join("notes.md")).unwrap();
+        write_router(&env, Provider::Claude, Some(ROUTER_MARK)).unwrap();
+        assert!(router_is_ours(&env, Provider::Claude));
+    }
+
+    #[test]
+    fn removes_its_own_entry_from_agent_configs() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        fs::write(
+            env.claude_json(),
+            r#"{"mcpServers": {"xolkit": {"command": "x"}, "other": {"command": "y"}}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(&env.codex_dir).unwrap();
+        fs::write(
+            env.codex_config(),
+            "[mcp_servers.xolkit]\ncommand = \"x\"\n[mcp_servers.other]\ncommand = \"y\"\n",
+        )
+        .unwrap();
+        for provider in Provider::ALL {
+            remove_entry_from_config(&env, provider).unwrap();
+            assert!(!has_entry(&env, provider).unwrap());
+        }
+        assert!(
+            fs::read_to_string(env.claude_json())
+                .unwrap()
+                .contains("other")
+        );
+        assert!(
+            fs::read_to_string(env.codex_config())
+                .unwrap()
+                .contains("other")
+        );
+    }
+
+    #[test]
+    fn registers_through_the_agents_tools() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        let exe = Path::new("/usr/bin/xolkit");
+        let line = |a: &Action| match a {
+            Action::Run { provider, args } | Action::Undo { provider, args, .. } => {
+                format!("{} {}", provider.cli(), args.join(" "))
+            }
+            other => format!("{other:?}"),
+        };
+        let claude: Vec<_> = register(&env, Provider::Claude, exe)
+            .iter()
+            .map(line)
+            .collect();
+        assert_eq!(
+            claude,
+            ["claude mcp add --scope user xolkit -- /usr/bin/xolkit mcp --agent claude"]
+        );
+        fs::create_dir_all(&env.codex_dir).unwrap();
+        fs::write(
+            env.codex_config(),
+            "[mcp_servers.xolkit]\ncommand = \"/old\"\n",
+        )
+        .unwrap();
+        let codex: Vec<_> = register(&env, Provider::Codex, exe)
+            .iter()
+            .map(line)
+            .collect();
+        assert_eq!(
+            codex,
+            [
+                "codex mcp remove xolkit",
+                "codex mcp add xolkit -- /usr/bin/xolkit mcp --agent codex"
+            ]
+        );
+    }
+
+    #[test]
+    fn unregistering_takes_out_everything_xolkit_wrote() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        fs::create_dir_all(router_dir(&env, Provider::Claude)).unwrap();
+        fs::write(
+            router_dir(&env, Provider::Claude).join("SKILL.md"),
+            format!("---\nname: xolkit\n---\n{ROUTER_MARK}\n"),
+        )
+        .unwrap();
+        fs::write(
+            env.claude_json(),
+            r#"{"mcpServers": {"xolkit": {"command": "x"}}}"#,
+        )
+        .unwrap();
+        let mut lock = Lock::default();
+        lock.plugins.insert(
+            "hooks@m".into(),
+            PluginPin {
+                native: BTreeSet::from([Provider::Claude]),
+                ..PluginPin::default()
+            },
+        );
+        let settings = Settings {
+            router: vec![Provider::Claude],
+            ..Settings::default()
+        };
+        let actions = unregister(&env, Provider::Claude, &lock, &settings);
+        assert_eq!(actions.len(), 6, "{actions:?}");
+        let Action::SaveSettings { settings: saved } = &actions[1] else {
+            panic!("{actions:?}");
+        };
+        assert!(saved.router.is_empty());
+        assert_eq!(
+            actions[2],
+            Action::RemoveRouter {
+                provider: Provider::Claude
+            }
+        );
+        assert!(unregister(&env, Provider::Codex, &lock, &settings).is_empty());
+    }
+}

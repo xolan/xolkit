@@ -11,10 +11,12 @@ use crate::Provider;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Where providers keep their files, and how to run their command-line tools.
+/// Where xolkit and the providers keep their files, and how to run the providers' tools.
 #[derive(Clone, Debug)]
 pub struct Env {
     pub home: PathBuf,
+    /// `~/.xolkit`, or `$XOLKIT_HOME`: everything xolkit keeps.
+    pub xolkit_dir: PathBuf,
     /// `~/.claude`, or `$CLAUDE_CONFIG_DIR`.
     pub claude_dir: PathBuf,
     /// `~/.codex`, or `$CODEX_HOME`.
@@ -26,6 +28,14 @@ pub struct Env {
 
 impl Env {
     pub fn detect() -> Result<Env> {
+        let mut env = Env::detect_dirs()?;
+        env.path = merge_paths(std::env::var_os("PATH"), login_shell_path());
+        Ok(env)
+    }
+
+    /// The folders only, without asking the login shell for its `PATH`, which can take a few
+    /// seconds: enough to read the library and reach the daemon, not to run an agent's tool.
+    pub fn detect_dirs() -> Result<Env> {
         let home = std::env::home_dir().context("no home directory")?;
         let dir_or = |var: &str, default: &str| {
             std::env::var_os(var)
@@ -34,9 +44,10 @@ impl Env {
                 .unwrap_or_else(|| home.join(default))
         };
         Ok(Env {
+            xolkit_dir: dir_or("XOLKIT_HOME", ".xolkit"),
             claude_dir: dir_or("CLAUDE_CONFIG_DIR", ".claude"),
             codex_dir: dir_or("CODEX_HOME", ".codex"),
-            path: merge_paths(std::env::var_os("PATH"), login_shell_path()),
+            path: None,
             home,
         })
     }
@@ -45,26 +56,70 @@ impl Env {
     pub fn at(home: &Path) -> Env {
         Env {
             home: home.to_path_buf(),
+            xolkit_dir: home.join(".xolkit"),
             claude_dir: home.join(".claude"),
             codex_dir: home.join(".codex"),
             path: None,
         }
     }
 
-    pub fn agents_skills(&self) -> PathBuf {
-        self.home.join(".agents").join("skills")
+    /// Installed skills, one folder each.
+    pub fn skills_dir(&self) -> PathBuf {
+        self.xolkit_dir.join("skills")
     }
 
-    pub fn skill_lock(&self) -> PathBuf {
-        self.home.join(".agents").join(".skill-lock.json")
+    /// Installed plugins, one folder each, named by plugin id.
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.xolkit_dir.join("plugins")
+    }
+
+    /// The local marketplace the agents install native plugins from.
+    pub fn marketplace_dir(&self) -> PathBuf {
+        self.xolkit_dir.join("marketplace")
+    }
+
+    pub fn settings_file(&self) -> PathBuf {
+        self.xolkit_dir.join("settings.json")
+    }
+
+    /// Where skills and plugins came from, and the commits they are pinned to.
+    pub fn lock_file(&self) -> PathBuf {
+        self.xolkit_dir.join("lock.json")
+    }
+
+    /// The MCP servers xolkit connects to.
+    pub fn servers_file(&self) -> PathBuf {
+        self.xolkit_dir.join("servers.toml")
+    }
+
+    /// The daemon's socket, pid file and log.
+    pub fn run_dir(&self) -> PathBuf {
+        self.xolkit_dir.join("run")
+    }
+
+    /// Downloads wait here until they are installed: inside `~/.xolkit`, so installing is a
+    /// rename, but outside `skills/`, so no agent sees a skill that is only being previewed.
+    pub fn staging_dir(&self) -> PathBuf {
+        self.xolkit_dir.join("staging")
+    }
+
+    /// Extra Base16 themes.
+    pub fn themes_dir(&self) -> PathBuf {
+        self.xolkit_dir.join("themes")
+    }
+
+    /// Claude Code's own config, where `claude mcp add --scope user` writes: `~/.claude.json`,
+    /// or `.claude.json` inside `$CLAUDE_CONFIG_DIR` when that moves Claude's directory.
+    pub fn claude_json(&self) -> PathBuf {
+        if self.claude_dir == self.home.join(".claude") {
+            self.home.join(".claude.json")
+        } else {
+            self.claude_dir.join(".claude.json")
+        }
     }
 
     pub fn claude_skills(&self) -> PathBuf {
         self.claude_dir.join("skills")
-    }
-
-    pub fn claude_settings(&self) -> PathBuf {
-        self.claude_dir.join("settings.json")
     }
 
     pub fn codex_skills(&self) -> PathBuf {
@@ -89,6 +144,14 @@ impl Env {
 
     /// Runs a provider tool and returns its stdout.
     pub fn run(&self, program: &str, args: &[String]) -> Result<String> {
+        // A tool installed since this process started isn't on its `PATH`; look again with the
+        // `PATH` as it is now before giving up.
+        if !self.has_tool(program)
+            && let Some(fresh) = self.with_fresh_path()
+            && fresh.has_tool(program)
+        {
+            return fresh.run(program, args);
+        }
         let mut command = Command::new(self.find(program));
         // Run from home: a project's tool config (e.g. a mise.toml pinning another codex) must
         // not leak into global changes.
@@ -102,8 +165,7 @@ impl Env {
         // Provider tools are console programs; each would flash a console window over the app.
         #[cfg(windows)]
         std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
-        let output = command
-            .output()
+        let output = output_within(command, RUN_TIMEOUT)
             .with_context(|| format!("could not run `{program}`"))?;
         if !output.status.success() {
             bail!(
@@ -117,13 +179,36 @@ impl Env {
 
     /// The file to start for `program`. On Windows, `Command` only looks for `<program>.exe`,
     /// but npm installs `claude.cmd` and `codex.cmd`, so look on `PATH` the way a shell does.
-    fn find(&self, program: &str) -> PathBuf {
+    pub fn find(&self, program: &str) -> PathBuf {
         if cfg!(windows)
             && let Some(found) = self.tool_path(program)
         {
             return found;
         }
         PathBuf::from(program)
+    }
+
+    /// Whether `program` is missing from the user's whole `PATH` as it is now: from the login
+    /// shell, or on Windows from the registry, as a newly started program would get it. `false`
+    /// when that can't be told.
+    pub fn tool_gone(&self, program: &str) -> bool {
+        // A PATH that can't be read or put together can't tell either.
+        self.with_fresh_path()
+            .is_some_and(|fresh| !fresh.has_tool(program))
+    }
+
+    /// This environment with the `PATH` as it is now, merged with this process's own.
+    pub fn with_fresh_path(&self) -> Option<Env> {
+        let path = merge_paths(std::env::var_os("PATH"), Some(fresh_path()?))?;
+        Some(Env {
+            path: Some(path),
+            ..self.clone()
+        })
+    }
+
+    /// Whether `program` is on `PATH`.
+    pub fn has_tool(&self, program: &str) -> bool {
+        self.tool_path(program).is_some()
     }
 
     /// Where `program` is on `PATH`, if it is.
@@ -151,6 +236,85 @@ impl Env {
     }
 }
 
+/// How long an agent's tool may run before it counts as hung and is stopped.
+const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// How long to wait for a pipe to close once the process exited: a helper it left running can
+/// hold the pipe open for good.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A pipe read on its own thread into a buffer, so a full pipe never stalls the process, and
+/// whatever arrived can be taken without waiting for the pipe to close.
+struct Drain {
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+/// Most output kept from one pipe; past it, the rest is read and dropped.
+const MAX_OUTPUT: usize = 4 * 1024 * 1024;
+
+impl Drain {
+    fn new(pipe: Option<impl std::io::Read + Send + 'static>) -> Drain {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sender, done) = std::sync::mpsc::channel();
+        // Once the buffer is taken, the thread holds the only other handle; a helper that keeps
+        // writing then has its output dropped, not kept.
+        let filling = std::sync::Arc::downgrade(&buffer);
+        std::thread::spawn(move || {
+            if let Some(mut pipe) = pipe {
+                let mut chunk = [0; 8192];
+                while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                    if let Some(buffer) = filling.upgrade() {
+                        let mut buffer = buffer.lock().unwrap();
+                        let room = MAX_OUTPUT.saturating_sub(buffer.len());
+                        buffer.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                }
+            }
+            let _ = sender.send(());
+        });
+        Drain { buffer, done }
+    }
+
+    /// What was read, once the pipe closes or `grace` passes.
+    fn take(self, grace: std::time::Duration) -> Vec<u8> {
+        let _ = self.done.recv_timeout(grace);
+        std::mem::take(&mut *self.buffer.lock().unwrap())
+    }
+}
+
+/// Runs `command` to the end and collects its output, killing it after `timeout`.
+fn output_within(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = Drain::new(child.stdout.take());
+    let stderr = Drain::new(child.stderr.take());
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "it took over {} minutes, so it was stopped",
+                timeout.as_secs() / 60
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.take(DRAIN_GRACE),
+        stderr: stderr.take(DRAIN_GRACE),
+    })
+}
+
 /// The first `<dir>\<program><ext>` on `path`, trying the extensions in `PATHEXT` that
 /// `CreateProcess` can start: programs and batch files, not scripts such as `.ps1` or `.js`.
 #[cfg(windows)]
@@ -161,7 +325,15 @@ fn find_on_path(program: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
         .map(str::to_ascii_lowercase)
         .filter(|ext| [".com", ".exe", ".bat", ".cmd"].contains(&ext.as_str()))
         .collect();
+    // `npx.cmd` names its file already; `npx` gets each extension tried.
+    let named = Path::new(program)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| extensions.contains(&format!(".{}", e.to_ascii_lowercase())));
     std::env::split_paths(path).find_map(|dir| {
+        if named {
+            return Some(dir.join(program)).filter(|file| file.is_file());
+        }
         extensions
             .iter()
             .map(|ext| dir.join(format!("{program}{ext}")))
@@ -185,24 +357,34 @@ fn merge_paths(first: Option<OsString>, extra: Option<OsString>) -> Option<OsStr
 fn login_shell_path() -> Option<OsString> {
     use std::time::{Duration, Instant};
     let shell = std::env::var_os("SHELL")?;
-    let mut child = Command::new(shell)
+    let mut command = Command::new(shell);
+    command
         .args(["-l", "-i", "-c", "env"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    // shortcut: `env` output over the pipe buffer (64 KiB) stalls until the timeout; read it on a thread if that happens.
+        .stderr(Stdio::null());
+    // An interactive shell in a background process group of a terminal stops itself, and the
+    // whole group with it, when it touches the terminal; its own session has no terminal.
+    // SAFETY: setsid is async-signal-safe, which is all pre_exec requires.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().ok()?;
+    let stdout = Drain::new(child.stdout.take());
     let deadline = Instant::now() + Duration::from_secs(5);
     while child.try_wait().ok()?.is_none() {
         if Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             return None;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let output = child.wait_with_output().ok()?;
-    String::from_utf8_lossy(&output.stdout)
+    let output = stdout.take(DRAIN_GRACE);
+    String::from_utf8_lossy(&output)
         .lines()
         .find_map(|line| line.strip_prefix("PATH="))
         .map(OsString::from)
@@ -214,6 +396,131 @@ fn login_shell_path() -> Option<OsString> {
     None
 }
 
+/// The `PATH` a program started now would get.
+#[cfg(unix)]
+fn fresh_path() -> Option<OsString> {
+    login_shell_path()
+}
+
+/// The `PATH` a program started now would get: the system's and the user's from the registry,
+/// with `%VARIABLES%` expanded from the registry's environment too, since this program's own
+/// may be stale. `None` when any of it can't be read or a variable can't be resolved, so an
+/// unreadable `PATH` never counts as proof that a tool is gone.
+#[cfg(windows)]
+fn fresh_path() -> Option<OsString> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    const SYSTEM: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+    const USER: &str = "Environment";
+    let system = registry_string(HKEY_LOCAL_MACHINE, SYSTEM, "Path").ok()??;
+    let user = registry_string(HKEY_CURRENT_USER, USER, "Path").ok()?;
+    let joined = [Some(system), user]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(";");
+    let lookup = |name: &str| -> Option<String> {
+        match registry_string(HKEY_CURRENT_USER, USER, name) {
+            Ok(Some(value)) => return Some(value),
+            Ok(None) => {}
+            Err(()) => return None,
+        }
+        match registry_string(HKEY_LOCAL_MACHINE, SYSTEM, name) {
+            Ok(Some(value)) => return Some(value),
+            Ok(None) => {}
+            Err(()) => return None,
+        }
+        // Set by Windows for each session, not stored with the others: these don't go stale.
+        std::env::var(name).ok()
+    };
+    expand_variables(&joined, &lookup).map(OsString::from)
+}
+
+/// A string value from the registry, as stored (`%VARIABLES%` not expanded): `Ok(None)` when
+/// there is no such value, `Err` when it can't be read.
+#[cfg(windows)]
+fn registry_string(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    key: &str,
+    name: &str,
+) -> Result<Option<String>, ()> {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
+    };
+    let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain([0]).collect() };
+    let (key, name) = (wide(key), wide(name));
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+    let mut bytes = 0u32;
+    // SAFETY: the key and name are nul-terminated, and a null buffer asks only for the size.
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            key.as_ptr(),
+            name.as_ptr(),
+            flags,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut bytes,
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if status != ERROR_SUCCESS {
+        return Err(());
+    }
+    let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
+    // SAFETY: the buffer holds `bytes` bytes, as the call above asked for.
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            key.as_ptr(),
+            name.as_ptr(),
+            flags,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(());
+    }
+    let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    String::from_utf16(&buffer[..len]).map(Some).map_err(|_| ())
+}
+
+/// `text` with each `%NAME%` replaced by `lookup(NAME)`, itself expanded in turn. `None` when a
+/// name can't be resolved, or nests too deep.
+#[cfg(any(windows, test))]
+fn expand_variables(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    fn expand(text: &str, lookup: &dyn Fn(&str) -> Option<String>, depth: u8) -> Option<String> {
+        if depth > 4 {
+            return None;
+        }
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(start) = rest.find('%') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('%') else {
+                // A lone `%` is just a character.
+                out.push_str(&rest[start..]);
+                return Some(out);
+            };
+            let name = &after[..end];
+            if name.is_empty() {
+                out.push('%');
+            } else {
+                out.push_str(&expand(&lookup(name)?, lookup, depth + 1)?);
+            }
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        Some(out)
+    }
+    expand(text, lookup, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,21 +529,34 @@ mod tests {
     fn paths_use_the_platform_separator() {
         let home = if cfg!(windows) { r"C:\h" } else { "/h" };
         let env = Env::at(Path::new(home));
-        let shown = env.tilde(&env.agents_skills().join("s"));
+        let shown = env.tilde(&env.skills_dir().join("s"));
         if cfg!(windows) {
-            assert_eq!(shown, r"~\.agents\skills\s");
-            assert_eq!(
-                env.skill_lock(),
-                Path::new(r"C:\h\.agents\.skill-lock.json")
-            );
+            assert_eq!(shown, r"~\.xolkit\skills\s");
+            assert_eq!(env.lock_file(), Path::new(r"C:\h\.xolkit\lock.json"));
             assert_eq!(
                 env.codex_plugin_cache().to_str(),
                 Some(r"C:\h\.codex\plugins\cache")
             );
         } else {
-            assert_eq!(shown, "~/.agents/skills/s");
+            assert_eq!(shown, "~/.xolkit/skills/s");
         }
         assert_eq!(env.tilde(Path::new("../x")), "../x");
+    }
+
+    #[test]
+    fn expands_variables_in_registry_paths() {
+        let lookup = |name: &str| match name {
+            "HOME" => Some(r"C:\Users\Jørgen".to_owned()),
+            "TOOLS" => Some(r"%HOME%\tools".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            expand_variables(r"%TOOLS%\bin;%HOME%;50%", &lookup).as_deref(),
+            Some(r"C:\Users\Jørgen\tools\bin;C:\Users\Jørgen;50%")
+        );
+        // An unknown name means the PATH can't be told.
+        assert_eq!(expand_variables("%UNSET%;x", &lookup), None);
+        assert_eq!(expand_variables("%LOOP%", &|_| Some("%LOOP%".into())), None);
     }
 
     #[test]

@@ -1,0 +1,39 @@
+[package]
+name = "xolkit-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+http = "1"
+interprocess = { version = "2", features = ["tokio"] }
+rmcp = { version = "3.8", default-features = false, features = [
+  "server",
+  "client",
+  "reqwest",
+  "transport-async-rw",
+  "transport-child-process",
+  "transport-io",
+  "transport-streamable-http-client-reqwest",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+xolkit-core = { path = "../xolkit-core" }
+
+[target.'cfg(windows)'.dependencies]
+widestring = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+# A tiny MCP server the end-to-end tests connect to; not part of xolkit.
+[[bin]]
+name = "echo-server"
+path = "src/bin/echo-server.rs"
+test = false
+doc = false

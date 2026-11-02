@@ -1,307 +1,278 @@
+//! Plugins in the library, unpacked under `~/.xolkit/plugins/<id>`, in Claude Code's plugin
+//! layout. xolkit serves the parts MCP can carry itself: skills, commands (as prompts) and MCP
+//! servers. Hooks, subagents, output styles and LSP servers only work from an agent's own
+//! folders, so a plugin with any of them is installed natively as well.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde_json::Value;
 
-use crate::{Env, Provider};
+use crate::config::read_json;
+use crate::servers::from_json;
+use crate::skills::{frontmatter, scan_skills, strip_frontmatter};
+use crate::{ServerConfig, Skill};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Plugin {
-    /// `name@marketplace`, as both providers spell it.
+    /// `name@marketplace`.
     pub id: String,
     pub name: String,
     pub marketplace: String,
+    pub version: String,
     pub description: String,
-    pub installs: BTreeMap<Provider, PluginInstall>,
+    pub dir: PathBuf,
+    pub parts: Parts,
 }
 
+/// What a plugin brings.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Parts {
+    pub skills: Vec<Skill>,
+    /// Slash commands, served as prompts.
+    pub commands: Vec<Command>,
+    /// MCP servers, by the name the plugin gives them.
+    pub servers: BTreeMap<String, ServerConfig>,
+    /// Parts only an agent can run, such as "hooks": a plugin with any needs a native install.
+    pub native: Vec<&'static str>,
+}
+
+/// A plugin's slash command: a Markdown prompt, `$ARGUMENTS` replaced by what the user types.
 #[derive(Clone, Debug, PartialEq)]
-pub struct PluginInstall {
-    pub version: String,
-    /// The plugin's files, when they are on disk.
-    pub path: Option<PathBuf>,
-    pub enabled: bool,
-    /// The provider installs it by default; it cannot be removed or turned off.
-    pub default: bool,
+pub struct Command {
+    pub name: String,
+    pub description: String,
+    pub path: PathBuf,
+}
+
+impl Command {
+    /// The prompt text, with `$ARGUMENTS` replaced.
+    pub fn render(&self, arguments: &str) -> String {
+        let text = fs::read_to_string(&self.path).unwrap_or_default();
+        strip_frontmatter(&text).replace("$ARGUMENTS", arguments)
+    }
 }
 
 impl Plugin {
-    pub fn is_default(&self) -> bool {
-        self.installs.values().any(|i| i.default)
+    /// Reads the plugin unpacked in `dir`, whose folder name is its id. `None` when the folder
+    /// name isn't an id.
+    pub fn read(dir: &Path) -> Option<Plugin> {
+        Plugin::read_as(dir, dir.file_name()?.to_str()?)
     }
-}
 
-/// Installed user-scope plugins of the given providers. Each provider's tool is the source of
-/// truth; a provider whose tool fails is reported in the error list, with its message, and skipped.
-pub fn scan_plugins(env: &Env, providers: &[Provider]) -> (Vec<Plugin>, Vec<(Provider, String)>) {
-    let mut plugins: BTreeMap<String, Plugin> = BTreeMap::new();
-    let mut errors = Vec::new();
-    for &provider in providers {
-        let listed = env
-            .run(
-                provider.cli(),
-                &["plugin".into(), "list".into(), "--json".into()],
-            )
-            .and_then(|json| match provider {
-                Provider::Claude => parse_claude(&json),
-                Provider::Codex => parse_codex(env, &json),
-            });
-        match listed {
-            Ok(listed) => {
-                for (id, install) in listed {
-                    let plugin = plugins.entry(id.clone()).or_insert_with(|| new_plugin(&id));
-                    if plugin.description.is_empty() {
-                        plugin.description =
-                            install.path.as_deref().map(description).unwrap_or_default();
-                    }
-                    plugin.installs.insert(provider, install);
-                }
-            }
-            Err(e) => errors.push((provider, format!("{}: {e:#}", provider.label()))),
-        }
-    }
-    (plugins.into_values().collect(), errors)
-}
-
-fn new_plugin(id: &str) -> Plugin {
-    let (name, marketplace) = id.split_once('@').unwrap_or((id, ""));
-    Plugin {
-        id: id.to_owned(),
-        name: name.to_owned(),
-        marketplace: marketplace.to_owned(),
-        description: String::new(),
-        installs: BTreeMap::new(),
-    }
-}
-
-/// `claude plugin list --json`: an array with one entry per installed scope.
-fn parse_claude(json: &str) -> Result<Vec<(String, PluginInstall)>> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Entry {
-        id: String,
-        #[serde(default)]
-        version: String,
-        scope: String,
-        enabled: bool,
-        install_path: Option<PathBuf>,
-    }
-    let entries: Vec<Entry> =
-        serde_json::from_str(json).context("unexpected `claude plugin list` output")?;
-    Ok(entries
-        .into_iter()
-        .filter(|e| e.scope == "user")
-        .map(|e| {
-            (
-                e.id,
-                PluginInstall {
-                    version: e.version,
-                    path: e.install_path,
-                    enabled: e.enabled,
-                    default: false,
-                },
-            )
+    /// Reads the plugin in `dir` as plugin `id`, wherever it is unpacked.
+    pub fn read_as(dir: &Path, id: &str) -> Option<Plugin> {
+        let id = id.to_owned();
+        let (name, marketplace) = id.split_once('@')?;
+        let manifest =
+            read_json(&dir.join(".claude-plugin").join("plugin.json")).unwrap_or(Value::Null);
+        Some(Plugin {
+            name: name.to_owned(),
+            marketplace: marketplace.to_owned(),
+            version: manifest["version"].as_str().unwrap_or_default().to_owned(),
+            description: manifest["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            parts: read_parts(dir, &manifest),
+            dir: dir.to_path_buf(),
+            id,
         })
-        .collect())
+    }
+
+    pub fn needs_native(&self) -> bool {
+        !self.parts.native.is_empty()
+    }
 }
 
-/// `codex plugin list --json`: `{ "installed": [...] }`. Files live in
-/// `plugins/cache/<marketplace>/<name>/<version>`.
-fn parse_codex(env: &Env, json: &str) -> Result<Vec<(String, PluginInstall)>> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Entry {
-        plugin_id: String,
-        name: String,
-        marketplace_name: String,
-        #[serde(default)]
-        version: String,
-        enabled: bool,
-        #[serde(default)]
-        install_policy: String,
-    }
-    #[derive(Deserialize)]
-    struct List {
-        installed: Vec<Entry>,
-    }
-    let list: List = serde_json::from_str(json).context("unexpected `codex plugin list` output")?;
-    Ok(list
-        .installed
-        .into_iter()
-        .map(|e| {
-            let path = env
-                .codex_plugin_cache()
-                .join(&e.marketplace_name)
-                .join(&e.name)
-                .join(&e.version);
-            let path = path.is_dir().then_some(path);
-            (
-                e.plugin_id,
-                PluginInstall {
-                    version: e.version,
-                    path,
-                    enabled: e.enabled,
-                    default: e.install_policy == "INSTALLED_BY_DEFAULT",
-                },
-            )
-        })
-        .collect())
-}
-
-/// A plugin a configured marketplace offers.
-#[derive(Clone, Debug, PartialEq)]
-pub struct AvailablePlugin {
-    pub id: String,
-    pub name: String,
-    pub marketplace: String,
-    pub description: String,
-    /// Installs across Claude users, when the marketplace reports it.
-    pub install_count: Option<u64>,
-    /// Providers whose marketplaces offer it, and whether it is installed there.
-    pub providers: BTreeMap<Provider, bool>,
-}
-
-/// Every plugin the given providers' marketplaces offer, most installed first. A provider whose
-/// tool fails is reported in the error list and skipped.
-pub fn available_plugins(env: &Env, providers: &[Provider]) -> (Vec<AvailablePlugin>, Vec<String>) {
-    let mut plugins: BTreeMap<String, AvailablePlugin> = BTreeMap::new();
-    let mut errors = Vec::new();
-    let args: Vec<String> = ["plugin", "list", "--available", "--json"]
-        .map(String::from)
-        .into();
-    for &provider in providers {
-        let listed = env
-            .run(provider.cli(), &args)
-            .and_then(|json| match provider {
-                Provider::Claude => parse_claude_available(&json),
-                Provider::Codex => parse_codex_available(&json),
-            });
-        match listed {
-            Ok(listed) => {
-                for (offer, installed) in listed {
-                    let plugin = plugins
-                        .entry(offer.id.clone())
-                        .or_insert_with(|| offer.clone());
-                    if plugin.description.is_empty() {
-                        plugin.description = offer.description;
-                    }
-                    plugin.install_count = plugin.install_count.or(offer.install_count);
-                    plugin.providers.insert(provider, installed);
-                }
-            }
-            Err(e) => errors.push(format!("{}: {e:#}", provider.label())),
-        }
-    }
-    let mut plugins: Vec<_> = plugins.into_values().collect();
-    plugins.sort_by(|a, b| {
-        b.install_count
-            .cmp(&a.install_count)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    (plugins, errors)
-}
-
-/// `claude plugin list --available --json`.
-fn parse_claude_available(json: &str) -> Result<Vec<(AvailablePlugin, bool)>> {
-    #[derive(Deserialize)]
-    struct Installed {
-        id: String,
-        scope: String,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Offer {
-        plugin_id: String,
-        name: String,
-        marketplace_name: String,
-        #[serde(default)]
-        description: String,
-        install_count: Option<u64>,
-    }
-    #[derive(Deserialize)]
-    struct List {
-        installed: Vec<Installed>,
-        available: Vec<Offer>,
-    }
-    let list: List =
-        serde_json::from_str(json).context("unexpected `claude plugin list` output")?;
-    let installed: Vec<String> = list
-        .installed
-        .into_iter()
-        .filter(|i| i.scope == "user")
-        .map(|i| i.id)
+/// The plugins in `root`, sorted by id.
+pub(crate) fn scan_plugins(root: &Path) -> Vec<Plugin> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut plugins: Vec<Plugin> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| Plugin::read(&e.path()))
         .collect();
-    Ok(list
-        .available
-        .into_iter()
-        .map(|o| {
-            let is_installed = installed.contains(&o.plugin_id);
-            let offer = AvailablePlugin {
-                id: o.plugin_id,
-                name: o.name,
-                marketplace: o.marketplace_name,
-                description: o.description,
-                install_count: o.install_count,
-                providers: BTreeMap::new(),
-            };
-            (offer, is_installed)
-        })
-        .collect())
+    plugins.sort_by(|a, b| a.id.cmp(&b.id));
+    plugins
 }
 
-/// `codex plugin list --available --json`. Descriptions come from the manifests of plugins
-/// whose marketplace is checked out locally.
-fn parse_codex_available(json: &str) -> Result<Vec<(AvailablePlugin, bool)>> {
-    #[derive(Deserialize)]
-    struct Source {
-        path: Option<PathBuf>,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Offer {
-        plugin_id: String,
-        name: String,
-        marketplace_name: String,
-        installed: bool,
-        source: Source,
-    }
-    #[derive(Deserialize)]
-    struct List {
-        available: Vec<Offer>,
-    }
-    let list: List = serde_json::from_str(json).context("unexpected `codex plugin list` output")?;
-    Ok(list
-        .available
-        .into_iter()
-        .map(|o| {
-            let offer = AvailablePlugin {
-                id: o.plugin_id,
-                name: o.name,
-                marketplace: o.marketplace_name,
-                description: o
-                    .source
-                    .path
-                    .as_deref()
-                    .map(description)
-                    .unwrap_or_default(),
-                install_count: None,
-                providers: BTreeMap::new(),
-            };
-            (offer, o.installed)
+/// Paths a manifest field lists, relative to the plugin, as a string or a list of strings.
+fn manifest_paths(dir: &Path, value: &Value) -> Vec<PathBuf> {
+    let list: Vec<&str> = match value {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    // Only paths inside the plugin: "/" or "../.." would have xolkit read the whole disk, or
+    // the user's own files.
+    list.into_iter()
+        .map(Path::new)
+        .filter(|p| {
+            p.components().all(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
         })
-        .collect())
+        .map(|p| dir.join(p))
+        .collect()
 }
 
-/// `description` from the plugin manifest, whichever provider's manifest the plugin ships.
-fn description(dir: &Path) -> String {
-    [".claude-plugin", ".codex-plugin"]
-        .iter()
-        .filter_map(|m| fs::read_to_string(dir.join(m).join("plugin.json")).ok())
-        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .find_map(|v| v["description"].as_str().map(str::to_owned))
-        .unwrap_or_default()
+fn read_parts(dir: &Path, manifest: &Value) -> Parts {
+    let mut parts = Parts {
+        skills: scan_skills(&dir.join("skills")),
+        ..Parts::default()
+    };
+    // A manifest path is a skill folder itself, or a folder of them.
+    for extra in manifest_paths(dir, &manifest["skills"]) {
+        match Skill::read(&extra) {
+            Some(skill) => parts.skills.push(skill),
+            None => parts.skills.extend(scan_skills(&extra)),
+        }
+    }
+
+    let mut command_dirs = vec![dir.join("commands")];
+    command_dirs.extend(manifest_paths(dir, &manifest["commands"]));
+    for path in command_dirs {
+        parts.commands.extend(read_commands(&path));
+    }
+    parts.commands.sort_by(|a, b| a.name.cmp(&b.name));
+    parts.commands.dedup_by(|a, b| a.name == b.name);
+
+    // `.mcp.json`, and whatever the manifest adds: servers inline, or files of them.
+    let mut servers = serde_json::Map::new();
+    let mut add = |json: Value| {
+        let json = json.get("mcpServers").cloned().unwrap_or(json);
+        if let Value::Object(more) = json {
+            servers.extend(more);
+        }
+    };
+    add(read_json(&dir.join(".mcp.json")).unwrap_or(Value::Null));
+    match &manifest["mcpServers"] {
+        Value::Object(_) => add(manifest["mcpServers"].clone()),
+        other => {
+            for path in manifest_paths(dir, other) {
+                add(read_json(&path).unwrap_or(Value::Null));
+            }
+        }
+    }
+    for (name, entry) in &servers {
+        if let Some(config) = from_json(entry, Some(dir)) {
+            parts.servers.insert(name.clone(), config);
+        }
+    }
+
+    let non_empty =
+        |path: PathBuf| fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some());
+    if non_empty(dir.join("agents")) || !manifest["agents"].is_null() {
+        parts.native.push("subagents");
+    }
+    if dir.join("hooks").join("hooks.json").is_file() || !manifest["hooks"].is_null() {
+        parts.native.push("hooks");
+    }
+    if non_empty(dir.join("output-styles")) || !manifest["outputStyles"].is_null() {
+        parts.native.push("output styles");
+    }
+    if dir.join(".lsp.json").is_file() || !manifest["lspServers"].is_null() {
+        parts.native.push("LSP servers");
+    }
+    parts
+}
+
+/// The `.md` files in `dir` and its subfolders; a subfolder becomes part of the name
+/// (`git/commit.md` is `git:commit`), as in Claude Code.
+fn read_commands(dir: &Path) -> Vec<Command> {
+    let mut commands = Vec::new();
+    collect_commands(dir, "", &mut commands);
+    commands
+}
+
+fn collect_commands(dir: &Path, prefix: &str, commands: &mut Vec<Command>) {
+    // A manifest path may name one command file.
+    if dir.is_file() {
+        if dir.extension().is_some_and(|e| e == "md")
+            && let Some(stem) = dir.file_stem().and_then(|s| s.to_str())
+        {
+            commands.push(read_command(dir, stem.to_owned()));
+        }
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        let name = if prefix.is_empty() {
+            stem.clone()
+        } else {
+            format!("{prefix}:{stem}")
+        };
+        if path.is_dir() {
+            collect_commands(&path, &name, commands);
+        } else if path.extension().is_some_and(|e| e == "md") {
+            commands.push(read_command(&path, name));
+        }
+    }
+}
+
+/// The command in the Markdown file `path`: its description from the frontmatter, else its
+/// first line.
+fn read_command(path: &Path, name: String) -> Command {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let description = frontmatter(&text).description.unwrap_or_else(|| {
+        strip_frontmatter(&text)
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_default()
+            .trim_start_matches('#')
+            .trim()
+            .to_owned()
+    });
+    Command {
+        name,
+        description,
+        path: path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn write_plugin(root: &Path, id: &str, native: bool) -> PathBuf {
+    use crate::skills::write_skill;
+    let dir = root.join(id);
+    fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
+    fs::write(
+        dir.join(".claude-plugin/plugin.json"),
+        r#"{"name": "p", "version": "1.2.0", "description": "A plugin."}"#,
+    )
+    .unwrap();
+    write_skill(&dir.join("skills/helper"), "helper");
+    fs::create_dir_all(dir.join("commands/git")).unwrap();
+    fs::write(
+        dir.join("commands/review.md"),
+        "---\ndescription: Review code\n---\nReview $ARGUMENTS carefully.\n",
+    )
+    .unwrap();
+    fs::write(dir.join("commands/git/commit.md"), "# Commit the work\n").unwrap();
+    fs::write(
+        dir.join(".mcp.json"),
+        r#"{"mcpServers": {"tool": {"command": "${CLAUDE_PLUGIN_ROOT}/bin/tool"}}}"#,
+    )
+    .unwrap();
+    if native {
+        fs::create_dir_all(dir.join("hooks")).unwrap();
+        fs::write(dir.join("hooks/hooks.json"), "{}").unwrap();
+        fs::create_dir_all(dir.join("agents")).unwrap();
+        fs::write(dir.join("agents/a.md"), "x").unwrap();
+    }
+    dir
 }
 
 #[cfg(test)]
@@ -309,66 +280,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_available_lists() {
-        let claude = r#"{"installed":[{"id":"a@m","scope":"user"},{"id":"b@m","scope":"project"}],
-            "available":[{"pluginId":"a@m","name":"a","marketplaceName":"m","description":"A.","installCount":5},
-                         {"pluginId":"b@m","name":"b","marketplaceName":"m"}]}"#;
-        let listed = parse_claude_available(claude).unwrap();
-        assert_eq!((listed[0].0.install_count, listed[0].1), (Some(5), true));
-        assert_eq!((listed[1].0.description.as_str(), listed[1].1), ("", false));
-        let codex = r#"{"installed":[],"available":[{"pluginId":"r@n","name":"r","marketplaceName":"n",
-            "installed":true,"enabled":true,"source":{"source":"remote","id":"x"}}]}"#;
-        let listed = parse_codex_available(codex).unwrap();
-        assert_eq!((listed[0].0.id.as_str(), listed[0].1), ("r@n", true));
-    }
-
-    #[test]
-    fn parses_claude_list_and_skips_project_scope() {
-        let json = r#"[
-            {"id":"a@m","version":"1.0","scope":"user","enabled":true,"installPath":"/x/a","notes":[]},
-            {"id":"b@m","version":"2.0","scope":"project","enabled":true,"installPath":"/x/b"}
-        ]"#;
+    fn reads_a_plugins_parts() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = write_plugin(root.path(), "p@market", false);
+        fs::create_dir_all(root.path().join("not-an-id")).unwrap();
+        let plugins = scan_plugins(root.path());
+        assert_eq!(plugins.len(), 1);
+        let plugin = &plugins[0];
         assert_eq!(
-            parse_claude(json).unwrap(),
-            [(
-                "a@m".to_owned(),
-                PluginInstall {
-                    version: "1.0".into(),
-                    path: Some("/x/a".into()),
-                    enabled: true,
-                    default: false
-                }
-            )]
+            (plugin.name.as_str(), plugin.marketplace.as_str()),
+            ("p", "market")
         );
+        assert_eq!(plugin.version, "1.2.0");
+        assert_eq!(plugin.parts.skills[0].name, "helper");
+        let commands: Vec<_> = plugin.parts.commands.iter().map(|c| &c.name).collect();
+        assert_eq!(commands, ["git:commit", "review"]);
+        assert_eq!(plugin.parts.commands[0].description, "Commit the work");
+        assert_eq!(
+            plugin.parts.commands[1].render("main.rs"),
+            "Review main.rs carefully.\n"
+        );
+        let tool = &plugin.parts.servers["tool"];
+        // The plugin's own `/` stays, after the folder in the platform's separators.
+        assert_eq!(
+            tool.command.as_deref(),
+            Some(format!("{}/bin/tool", dir.display()).as_str())
+        );
+        assert!(!plugin.needs_native());
     }
 
     #[test]
-    fn parses_codex_list_and_finds_cache_dir() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::at(home.path());
-        let dir = env.codex_plugin_cache().join("m/a/1.2");
-        fs::create_dir_all(dir.join(".codex-plugin")).unwrap();
+    fn manifest_paths_name_skills_and_commands_directly() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("p@m");
+        crate::skills::write_skill(&dir.join("extra/task"), "task");
+        fs::write(dir.join("extra/review.md"), "# Review it\n").unwrap();
+        fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
         fs::write(
-            dir.join(".codex-plugin/plugin.json"),
-            r#"{"description":"Does a."}"#,
+            dir.join(".claude-plugin/plugin.json"),
+            r#"{"skills": ["./extra/task"], "commands": ["./extra/review.md"]}"#,
         )
         .unwrap();
-        let json = r#"{"installed":[
-            {"pluginId":"a@m","name":"a","marketplaceName":"m","version":"1.2","installed":true,"enabled":false},
-            {"pluginId":"r@m","name":"r","marketplaceName":"m","version":"0.1","installed":true,"enabled":true,"installPolicy":"INSTALLED_BY_DEFAULT"}
-        ],"available":[]}"#;
-        let listed = parse_codex(&env, json).unwrap();
-        assert_eq!(
-            listed[0].1,
-            PluginInstall {
-                version: "1.2".into(),
-                path: Some(dir.clone()),
-                enabled: false,
-                default: false
-            }
+        let plugin = Plugin::read(&dir).unwrap();
+        assert_eq!(plugin.parts.skills[0].name, "task");
+        assert_eq!(plugin.parts.commands[0].name, "review");
+        assert_eq!(plugin.parts.commands[0].description, "Review it");
+    }
+
+    #[test]
+    fn manifest_paths_stay_inside_the_plugin() {
+        let dir = Path::new("/p");
+        let paths = manifest_paths(
+            dir,
+            &serde_json::json!(["./extra", "/", "../x", "a/../../b", "more/cmds"]),
         );
-        assert_eq!(listed[1].1.path, None);
-        assert!(listed[1].1.default);
-        assert_eq!(description(&dir), "Does a.");
+        assert_eq!(paths, [dir.join("./extra"), dir.join("more/cmds")]);
+    }
+
+    #[test]
+    fn hooks_and_subagents_need_a_native_install() {
+        let root = tempfile::tempdir().unwrap();
+        write_plugin(root.path(), "p@m", true);
+        let plugin = &scan_plugins(root.path())[0];
+        assert!(plugin.needs_native());
+        assert_eq!(plugin.parts.native, ["subagents", "hooks"]);
     }
 }

@@ -1,13 +1,12 @@
 //! Reading and editing provider config files without disturbing their formatting.
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
-use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, Item, value};
 
 pub(crate) fn read_json(path: &Path) -> Result<Value> {
     match fs::read_to_string(path) {
@@ -40,7 +39,7 @@ pub(crate) fn write_toml(path: &Path, doc: &DocumentMut) -> Result<()> {
 
 /// Replaces a file in one step, keeping its permissions. Writes through symlinks, so files
 /// managed by a dotfile tool stay links.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let path = canonical(path);
     let dir = path
         .parent()
@@ -83,73 +82,6 @@ fn replace_error(error: std::io::Error, path: &Path) -> anyhow::Error {
     anyhow::Error::new(error).context(format!("could not replace {shown}"))
 }
 
-/// Skill names turned off in Claude's `skillOverrides`.
-pub(crate) fn claude_disabled_skills(settings: &Value) -> HashSet<String> {
-    settings
-        .get("skillOverrides")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter(|(_, v)| v.as_str() == Some("off"))
-        .map(|(k, _)| k.clone())
-        .collect()
-}
-
-pub(crate) fn set_claude_skill(settings: &mut Value, name: &str, enabled: bool) -> Result<()> {
-    let root = settings
-        .as_object_mut()
-        .context("settings.json is not a JSON object")?;
-    let overrides = root
-        .entry("skillOverrides")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .context("skillOverrides in settings.json is not an object")?;
-    if !enabled {
-        overrides.insert(name.to_owned(), "off".into());
-    } else if overrides.get(name).and_then(Value::as_str) == Some("off") {
-        overrides.shift_remove(name);
-    }
-    if overrides.is_empty() {
-        root.shift_remove("skillOverrides");
-    }
-    Ok(())
-}
-
-/// `SKILL.md` paths turned off in Codex's `[[skills.config]]`, as [`codex_skill_key`]s.
-pub(crate) fn codex_disabled_skills(doc: &DocumentMut) -> HashSet<String> {
-    doc.get("skills")
-        .and_then(|s| s.get("config"))
-        .and_then(Item::as_array_of_tables)
-        .into_iter()
-        .flatten()
-        .filter(|t| t.get("enabled").and_then(Item::as_bool) == Some(false))
-        .filter_map(|t| t.get("path").and_then(Item::as_str))
-        .map(|path| codex_skill_key(Path::new(path)))
-        .collect()
-}
-
-/// What Codex compares `[[skills.config]]` paths by: both sides canonicalized, and on Windows
-/// without regard to separators or ASCII case. So an entry still matches when another tool
-/// spelled the path differently.
-pub(crate) fn codex_skill_key(path: &Path) -> String {
-    let key = canonical(path).to_string_lossy().into_owned();
-    if cfg!(windows) {
-        key.replace('/', "\\").to_ascii_lowercase()
-    } else {
-        key
-    }
-}
-
-/// The path Codex writes for a skill: on Windows canonical, as `dunce` makes it (backslashes, the
-/// real case, links resolved, no `\\?\`). Elsewhere the path as given.
-fn codex_skill_path(skill_md: &Path) -> String {
-    if cfg!(windows) {
-        canonical(skill_md).to_string_lossy().into_owned()
-    } else {
-        skill_md.to_string_lossy().into_owned()
-    }
-}
-
 /// `path` with links resolved, or as given when it does not exist.
 fn canonical(path: &Path) -> std::path::PathBuf {
     #[cfg(windows)]
@@ -159,47 +91,18 @@ fn canonical(path: &Path) -> std::path::PathBuf {
     resolved
 }
 
-pub(crate) fn set_codex_skill(doc: &mut DocumentMut, skill_md: &Path, enabled: bool) -> Result<()> {
-    let skills = doc
-        .entry("skills")
-        .or_insert_with(implicit_table)
-        .as_table_mut()
-        .context("`skills` in config.toml is not a table")?;
-    let configs = skills
-        .entry("config")
-        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
-        .as_array_of_tables_mut()
-        .context("`skills.config` in config.toml is not an array of tables")?;
-    let key = codex_skill_key(skill_md);
-    configs.retain(|t| {
-        t.get("path")
-            .and_then(Item::as_str)
-            .is_none_or(|path| codex_skill_key(Path::new(path)) != key)
-    });
-    if !enabled {
-        let mut entry = Table::new();
-        entry["path"] = value(codex_skill_path(skill_md));
-        entry["enabled"] = value(false);
-        configs.push(entry);
-    }
-    if configs.is_empty() {
-        skills.remove("config");
-    }
-    if skills.is_empty() {
-        doc.remove("skills");
-    }
-    Ok(())
-}
-
+/// Turns a plugin Codex has on or off. One Codex doesn't have (no `plugins."<id>"` table) is
+/// left alone: there is nothing to switch, and no entry is made for it.
 pub(crate) fn set_codex_plugin(doc: &mut DocumentMut, id: &str, enabled: bool) -> Result<()> {
-    let plugins = doc
-        .entry("plugins")
-        .or_insert_with(implicit_table)
-        .as_table_mut()
-        .context("`plugins` in config.toml is not a table")?;
-    let plugin = plugins
-        .entry(id)
-        .or_insert_with(toml_edit::table)
+    let Some(plugin) = doc
+        .get_mut("plugins")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|plugins| plugins.get_mut(id))
+        .filter(|plugin| !plugin.is_none())
+    else {
+        return Ok(());
+    };
+    let plugin = plugin
         .as_table_mut()
         .with_context(|| format!("`plugins.\"{id}\"` in config.toml is not a table"))?;
     plugin["enabled"] = value(enabled);
@@ -226,90 +129,9 @@ pub(crate) fn forget_codex_hooks(doc: &mut DocumentMut, id: &str) {
     }
 }
 
-fn implicit_table() -> Item {
-    let mut table = Table::new();
-    table.set_implicit(true);
-    Item::Table(table)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn claude_skill_toggle_round_trips() {
-        let mut settings: Value =
-            serde_json::from_str(r#"{"model":"x","skillOverrides":{"a":"name-only"}}"#).unwrap();
-        set_claude_skill(&mut settings, "b", false).unwrap();
-        assert_eq!(
-            claude_disabled_skills(&settings),
-            HashSet::from(["b".to_owned()])
-        );
-        set_claude_skill(&mut settings, "b", true).unwrap();
-        set_claude_skill(&mut settings, "a", true).unwrap();
-        assert_eq!(
-            settings.to_string(),
-            r#"{"model":"x","skillOverrides":{"a":"name-only"}}"#
-        );
-    }
-
-    #[test]
-    fn codex_skill_toggle_keeps_other_config() {
-        let original = "# mine\nmodel = \"x\"\n\n[tui]\nfoo = 1\n";
-        let skill_md = Path::new("/h/.agents/skills/a/SKILL.md");
-        let mut doc: DocumentMut = original.parse().unwrap();
-        set_codex_skill(&mut doc, skill_md, false).unwrap();
-        assert!(codex_disabled_skills(&doc).contains(&codex_skill_key(skill_md)));
-        assert!(doc.to_string().contains("[[skills.config]]"));
-        set_codex_skill(&mut doc, skill_md, true).unwrap();
-        assert_eq!(doc.to_string(), original);
-    }
-
-    #[test]
-    fn codex_skill_entries_match_like_codex_matches_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let skill_md = dir.path().join("a").join("SKILL.md");
-        fs::create_dir_all(dir.path().join("a")).unwrap();
-        fs::write(&skill_md, "").unwrap();
-        crate::testing::link_dir("a", dir.path().join("alias"));
-        let mut spellings = vec![
-            dir.path()
-                .join("alias")
-                .join("SKILL.md")
-                .display()
-                .to_string(),
-        ];
-        if cfg!(windows) {
-            let plain = skill_md.display().to_string();
-            spellings.push(plain.replace('\\', "/"));
-            spellings.push(plain.to_lowercase());
-        }
-        for spelling in spellings {
-            let entry = format!("[[skills.config]]\npath = '{spelling}'\nenabled = false\n");
-            let mut doc: DocumentMut = entry.parse().unwrap();
-            assert!(
-                codex_disabled_skills(&doc).contains(&codex_skill_key(&skill_md)),
-                "{spelling}"
-            );
-            set_codex_skill(&mut doc, &skill_md, true).unwrap();
-            assert_eq!(doc.to_string(), "", "{spelling}");
-        }
-
-        // Windows gets the spelling Codex itself writes: canonical, with backslashes.
-        let mut doc = DocumentMut::new();
-        let mixed = dir.path().join("alias/SKILL.md");
-        set_codex_skill(&mut doc, &mixed, false).unwrap();
-        let written = doc["skills"]["config"][0]["path"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        if cfg!(windows) {
-            let real = fs::canonicalize(&skill_md).unwrap().display().to_string();
-            assert_eq!(Some(written.as_str()), real.strip_prefix(r"\\?\"));
-        } else {
-            assert_eq!(Path::new(&written), mixed);
-        }
-    }
 
     #[test]
     fn codex_plugin_toggle_and_hook_cleanup() {
@@ -322,6 +144,9 @@ mod tests {
         assert!(text.contains("[plugins.\"p@m\"]\nenabled = false"));
         assert!(!text.contains("p@m:hooks"));
         assert!(text.contains("q@m:h:0"));
+        // A plugin Codex doesn't have gets no entry.
+        set_codex_plugin(&mut doc, "gone@m", true).unwrap();
+        assert!(!doc.to_string().contains("gone@m"));
     }
 
     #[test]

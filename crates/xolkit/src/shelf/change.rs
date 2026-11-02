@@ -1,4 +1,4 @@
-//! The install, update and uninstall dialogs: which providers it applies to, and every step that
+//! The install, update and uninstall dialogs: which agents get the item, and every step that
 //! will run.
 
 use std::collections::BTreeSet;
@@ -10,33 +10,39 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use xolkit_core::{
-    Action as Step, AvailablePlugin, Env, FetchedSkill, Plugin, Provider, Skill, install_plugin,
-    install_skill, uninstall_plugin, uninstall_skill, update_skill,
+    Action as Step, Agent, Env, FetchedPlugin, FetchedSkill, Kind, Lock, Plugin, Provider,
+    Settings, Skill, install_plugin, install_skill, native_install, native_toggle,
+    uninstall_plugin, uninstall_skill, update_skill,
 };
 
 use super::discover::is_code;
 use super::{Shelf, icon_line};
 
 pub(super) enum Change {
-    UninstallSkill(Skill),
-    UninstallPlugin(Plugin),
     InstallSkill(FetchedSkill),
-    InstallPlugin(AvailablePlugin),
     /// Replaces installed skill `name` with a downloaded newer version.
     UpdateSkill {
         name: String,
         download: FetchedSkill,
+    },
+    UninstallSkill(Skill),
+    InstallPlugin(FetchedPlugin),
+    UninstallPlugin(Plugin),
+    /// Installs an installed plugin natively in one more agent.
+    NativeInstall {
+        plugin: Plugin,
+        provider: Provider,
     },
 }
 
 impl Change {
     fn name(&self) -> &str {
         match self {
-            Change::UninstallSkill(skill) => &skill.name,
-            Change::UninstallPlugin(plugin) => &plugin.id,
             Change::InstallSkill(skill) => &skill.name,
-            Change::InstallPlugin(plugin) => &plugin.id,
             Change::UpdateSkill { name, .. } => name,
+            Change::UninstallSkill(skill) => &skill.name,
+            Change::InstallPlugin(fetched) => &fetched.plugin.id,
+            Change::UninstallPlugin(plugin) | Change::NativeInstall { plugin, .. } => &plugin.id,
         }
     }
 
@@ -44,113 +50,120 @@ impl Change {
         !matches!(self, Change::UninstallSkill(_) | Change::UninstallPlugin(_))
     }
 
-    /// Agents the user can pick from, out of the ones xolkit manages.
-    fn choices(&self, agents: &[Provider]) -> BTreeSet<Provider> {
-        let offered: BTreeSet<Provider> = match self {
-            Change::UninstallSkill(skill) => skill.installs.iter().map(|i| i.provider).collect(),
-            Change::UninstallPlugin(plugin) => plugin.installs.keys().copied().collect(),
-            Change::InstallSkill(_) => Provider::ALL.into(),
-            Change::InstallPlugin(plugin) => plugin
-                .providers
-                .iter()
-                .filter(|(_, installed)| !**installed)
-                .map(|(p, _)| *p)
-                .collect(),
-            Change::UpdateSkill { .. } => BTreeSet::new(),
-        };
-        offered.into_iter().filter(|p| agents.contains(p)).collect()
+    /// Whether the dialog asks which agents get the item.
+    fn picks_agents(&self) -> bool {
+        matches!(self, Change::InstallSkill(_) | Change::InstallPlugin(_))
+    }
+
+    /// Files nobody has reviewed yet, to list with scripts flagged.
+    fn new_files(&self) -> &[String] {
+        match self {
+            Change::InstallSkill(skill)
+            | Change::UpdateSkill {
+                download: skill, ..
+            } => &skill.files,
+            _ => &[],
+        }
     }
 }
 
 pub(super) struct ChangeForm {
     env: Env,
     change: Change,
-    /// The agents xolkit manages.
-    agents: Vec<Provider>,
-    providers: BTreeSet<Provider>,
-    delete_data: bool,
+    settings: Settings,
+    lock: Lock,
+    /// The agents the active profile serves; the install turns the item on for `chosen`.
+    agents: Vec<Agent>,
+    chosen: BTreeSet<Agent>,
 }
 
 impl ChangeForm {
     fn steps(&self) -> Result<Vec<Step>> {
-        let providers: Vec<Provider> = self.providers.iter().copied().collect();
+        let chosen: Vec<Agent> = self.chosen.iter().copied().collect();
         Ok(match &self.change {
+            Change::InstallSkill(skill) => {
+                let mut steps = install_skill(&self.env, skill)?;
+                let mut settings = self.settings.clone();
+                for &agent in &chosen {
+                    settings
+                        .active_mut()
+                        .set(Kind::Skill, &skill.name, agent, true);
+                }
+                steps.push(Step::SaveSettings {
+                    settings: Box::new(settings),
+                });
+                steps
+            }
+            Change::UpdateSkill { name, download } => update_skill(&self.env, name, download)?,
             Change::UninstallSkill(skill) => {
-                // The skill only holds an unmanaged agent's links to its shared folder, which go
-                // when the folder does.
-                let unmanaged = Provider::ALL
-                    .into_iter()
-                    .filter(|p| !self.agents.contains(p));
-                let providers: Vec<Provider> = providers.iter().copied().chain(unmanaged).collect();
-                uninstall_skill(skill, &providers)
+                uninstall_skill(&self.env, &self.settings, &skill.name)
+            }
+            Change::InstallPlugin(fetched) => {
+                install_plugin(&self.env, &self.settings, &self.lock, fetched, &chosen)?
             }
             Change::UninstallPlugin(plugin) => {
-                uninstall_plugin(plugin, &providers, self.delete_data)
+                uninstall_plugin(&self.env, &self.settings, &self.lock, plugin)
             }
-            Change::InstallSkill(skill) => {
-                install_skill(&self.env, skill, &providers, &self.agents)?
+            Change::NativeInstall { plugin, provider } => {
+                let mut steps = native_install(&self.env, &self.lock, plugin, *provider)?;
+                // Installed natively, it is on there; match what the profile has.
+                let agent = Agent::from(*provider);
+                if !self
+                    .settings
+                    .active()
+                    .is_on(Kind::Plugin, &plugin.id, agent)
+                {
+                    steps.push(native_toggle(plugin, *provider, false));
+                }
+                steps
             }
-            Change::InstallPlugin(plugin) => install_plugin(plugin, &providers),
-            Change::UpdateSkill { name, download } => update_skill(&self.env, name, download)?,
         })
     }
 }
 
 impl Render for ChangeForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let claude_plugin = matches!(&self.change,
-            Change::UninstallPlugin(p) if p.installs.contains_key(&Provider::Claude));
         let steps = self.steps();
         let theme = cx.theme();
-        // An update brings files nobody has reviewed yet; list them, flagging code.
-        let new_files = match &self.change {
-            Change::UpdateSkill { download, .. } => download.files.as_slice(),
-            _ => &[],
-        };
+        let new_files = self.change.new_files();
         let summary = match &steps {
-            Ok(steps) if steps.is_empty() => v_flex().child("Pick at least one agent."),
+            Ok(steps) if steps.is_empty() => v_flex().child("Nothing to do."),
             Ok(steps) => v_flex().children(steps.iter().map(|step| step.describe(&self.env))),
             Err(e) => v_flex().text_color(theme.danger).child(format!("{e:#}")),
         };
+        let native_note = match &self.change {
+            Change::InstallPlugin(fetched) if fetched.plugin.needs_native() => Some(format!(
+                "This plugin has {}, so it is also installed in Claude Code and Codex through \
+                 their own tools, for the agents you pick.",
+                fetched.plugin.parts.native.join(" and ")
+            )),
+            _ => None,
+        };
         v_flex()
             .gap_3()
-            .child(
-                h_flex()
-                    .gap_4()
-                    .children(
-                        self.change
-                            .choices(&self.agents)
-                            .into_iter()
-                            .map(|provider| {
-                                Checkbox::new(SharedString::from(format!(
-                                    "change-{}",
-                                    provider.cli()
-                                )))
-                                .label(provider.label())
-                                .checked(self.providers.contains(&provider))
-                                .on_change(cx.listener(
-                                    move |this, on: &bool, _, cx| {
-                                        if *on {
-                                            this.providers.insert(provider);
-                                        } else {
-                                            this.providers.remove(&provider);
-                                        }
-                                        cx.notify();
-                                    },
-                                ))
-                            }),
-                    ),
-            )
-            .when(claude_plugin, |this| {
-                this.child(
-                    Checkbox::new("change-data")
-                        .label("Also delete the plugin's saved data (Claude)")
-                        .checked(self.delete_data)
-                        .on_change(cx.listener(|this, on: &bool, _, cx| {
-                            this.delete_data = *on;
-                            cx.notify();
-                        })),
-                )
+            .when(self.change.picks_agents(), |this| {
+                let note = if self.agents.is_empty() {
+                    "The active profile serves no agents yet; you can turn it on later."
+                } else {
+                    "Turn it on in the active profile for:"
+                };
+                this.child(div().text_sm().child(note))
+                    .child(h_flex().gap_4().children(self.agents.iter().map(|&agent| {
+                        Checkbox::new(SharedString::from(format!("change-{}", agent.key())))
+                            .label(agent.label())
+                            .checked(self.chosen.contains(&agent))
+                            .on_change(cx.listener(move |this, on: &bool, _, cx| {
+                                if *on {
+                                    this.chosen.insert(agent);
+                                } else {
+                                    this.chosen.remove(&agent);
+                                }
+                                cx.notify();
+                            }))
+                    })))
+            })
+            .when_some(native_note, |this, note| {
+                this.child(div().text_sm().text_color(theme.warning).child(note))
             })
             .child(
                 summary
@@ -167,8 +180,8 @@ impl Render for ChangeForm {
                         .gap_1()
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child("Files in the new version (scripts an agent may run are flagged):")
-                        .children(new_files.iter().map(|file| {
+                        .child("Files (scripts an agent may run are flagged):")
+                        .children(new_files.iter().take(40).map(|file| {
                             h_flex()
                                 .gap_2()
                                 .line_height(icon_line())
@@ -176,42 +189,47 @@ impl Render for ChangeForm {
                                     row.text_color(theme.warning).child(IconName::TriangleAlert)
                                 })
                                 .child(file.clone())
-                        })),
+                        }))
+                        .when(new_files.len() > 40, |this| {
+                            this.child(format!("…and {} more", new_files.len() - 40))
+                        }),
                 )
             })
     }
 }
 
-/// Asks for confirmation, then runs the change.
+/// Asks for confirmation, then sends the change to the daemon.
 pub(super) fn open_change_dialog(
     shelf: &mut Shelf,
     change: Change,
     window: &mut Window,
     cx: &mut Context<Shelf>,
 ) {
-    let Some(env) = shelf.env.clone() else {
-        return;
-    };
     let name = change.name().to_owned();
     let installs = change.installs();
-    let moves_download = matches!(change, Change::InstallSkill(_) | Change::UpdateSkill { .. });
+    let moves_download = matches!(
+        change,
+        Change::InstallSkill(_) | Change::UpdateSkill { .. } | Change::InstallPlugin(_)
+    );
     let updates = matches!(change, Change::UpdateSkill { .. });
-    let (verb, done) = if updates {
-        ("Update", format!("Updated {name}"))
-    } else if installs {
-        ("Install", format!("Installed {name}"))
-    } else {
-        ("Uninstall", format!("Uninstalled {name}"))
+    let (verb, done) = match &change {
+        Change::UpdateSkill { .. } => ("Update", format!("Updated {name}")),
+        Change::NativeInstall { provider, .. } => (
+            "Install",
+            format!("Installed {name} in {}", provider.name()),
+        ),
+        _ if installs => ("Install", format!("Installed {name}")),
+        _ => ("Uninstall", format!("Uninstalled {name}")),
     };
     let title = format!("{verb} “{name}”?");
-    let providers = change.choices(shelf.agents());
     let agents = shelf.agents().to_vec();
     let form = cx.new(|_| ChangeForm {
-        env,
+        env: shelf.env.clone(),
         change,
+        settings: shelf.library.settings.clone(),
+        lock: shelf.library.lock.clone(),
+        chosen: agents.iter().copied().collect(),
         agents,
-        providers,
-        delete_data: true,
     });
     let shelf = cx.entity();
     window.open_alert_dialog(cx, move |alert, _, _| {
@@ -238,6 +256,7 @@ pub(super) fn open_change_dialog(
                     if moves_download {
                         // The change moves the download into place; keep it from being discarded.
                         shelf.fetched = None;
+                        shelf.fetched_plugin = None;
                     }
                     if updates {
                         // Checked again once the reload after the update finishes.
@@ -248,70 +267,4 @@ pub(super) fn open_change_dialog(
                 true
             })
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
-
-    use xolkit_core::{Action, Env, Provider, Skill, SkillInstall};
-
-    use super::{Change, ChangeForm};
-
-    fn uninstall(agents: &[Provider]) -> (BTreeSet<Provider>, Vec<Action>) {
-        let home = Path::new(if cfg!(windows) { r"C:\h" } else { "/h" });
-        let env = Env::at(home);
-        let install = |provider, path: PathBuf| SkillInstall {
-            provider,
-            path,
-            shared: true,
-            enabled: true,
-        };
-        let shared = env.agents_skills().join("s");
-        let skill = Skill {
-            name: "s".into(),
-            title: "s".into(),
-            description: String::new(),
-            shared: Some(shared.clone()),
-            source: Some("o/r".into()),
-            installs: vec![
-                install(Provider::Codex, shared),
-                install(Provider::Claude, env.claude_skills().join("s")),
-            ],
-            default: false,
-        };
-        let change = Change::UninstallSkill(skill);
-        let choices = change.choices(agents);
-        let form = ChangeForm {
-            env,
-            change,
-            agents: agents.to_vec(),
-            providers: choices.clone(),
-            delete_data: false,
-        };
-        (choices, form.steps().unwrap())
-    }
-
-    #[test]
-    fn uninstall_offers_managed_agents_and_leaves_no_link_dangling() {
-        let home = Env::at(Path::new(if cfg!(windows) { r"C:\h" } else { "/h" }));
-        let shared = Action::Remove(home.agents_skills().join("s"));
-        let link = Action::Remove(home.claude_skills().join("s"));
-
-        // Claude isn't managed, but its link to the shared folder goes with the folder.
-        let (choices, steps) = uninstall(&[Provider::Codex]);
-        assert_eq!(choices, BTreeSet::from([Provider::Codex]));
-        assert!(
-            steps.contains(&shared) && steps.contains(&link),
-            "{steps:?}"
-        );
-
-        let (choices, steps) = uninstall(&[Provider::Claude]);
-        assert_eq!(choices, BTreeSet::from([Provider::Claude]));
-        assert!(
-            steps.contains(&shared) && steps.contains(&link),
-            "{steps:?}"
-        );
-    }
 }
