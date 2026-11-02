@@ -123,7 +123,8 @@ impl Gone {
 /// shell, or on Windows from the registry, since the daemon's own `PATH` dates from its start.
 /// When that `PATH` can't be read, a missing tool proves nothing.
 fn agent_absent(env: &Env, provider: Provider) -> bool {
-    env.locate(provider).is_none() || env.tool_gone(provider.cli())
+    // A missing folder proves nothing either: a fresh install may not have made it yet.
+    env.tool_gone(provider.cli())
 }
 
 impl Action {

@@ -187,8 +187,12 @@ impl Env {
         let Some(login) = fresh_path() else {
             return false;
         };
+        // A PATH that can't be put together can't tell either.
+        let Some(path) = merge_paths(std::env::var_os("PATH"), Some(login)) else {
+            return false;
+        };
         let fresh = Env {
-            path: merge_paths(std::env::var_os("PATH"), Some(login)),
+            path: Some(path),
             ..self.clone()
         };
         !fresh.has_tool(program)

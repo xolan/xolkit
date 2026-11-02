@@ -58,6 +58,71 @@ impl ServerInputs {
     }
 }
 
+/// A command line as typed: words split at spaces, except inside double quotes, where `\"`
+/// is a quote and `\\` a backslash. So `"C:\Program Files\x.exe" --flag "a b"` is three words.
+fn split_command(text: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quoted = false;
+    let mut chars = text.trim().chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                in_word = true;
+            }
+            '\\' if quoted => match chars.next() {
+                Some(next @ ('"' | '\\')) => word.push(next),
+                Some(next) => {
+                    word.push('\\');
+                    word.push(next);
+                }
+                None => word.push('\\'),
+            },
+            c if c.is_whitespace() && !quoted => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if quoted {
+        return Err("A quote in the command isn't closed.".to_owned());
+    }
+    if in_word {
+        words.push(word);
+    }
+    Ok(words)
+}
+
+/// A server's command line for the form: words with spaces or quotes are quoted, so
+/// [`split_command`] reads it back as it was.
+fn join_command(config: &ServerConfig) -> String {
+    let quote = |word: &str| {
+        if !word.is_empty() && !word.contains(|c: char| c.is_whitespace() || c == '"' || c == '\\')
+        {
+            word.to_owned()
+        } else if !word.contains(['"', '\\']) {
+            format!("\"{word}\"")
+        } else {
+            format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\""))
+        }
+    };
+    config
+        .command
+        .iter()
+        .chain(&config.args)
+        .map(|w| quote(w))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// `KEY=value` or `Key: value` lines as pairs; blank lines are skipped.
 fn pairs(text: &str, remote: bool) -> Result<BTreeMap<String, String>, String> {
     let mut out = BTreeMap::new();
@@ -107,7 +172,7 @@ fn read_form(
         config.url = Some(url.trim().to_owned());
         config.headers = pairs(plain, true)?;
     } else {
-        let mut words = command.split_whitespace().map(str::to_owned);
+        let mut words = split_command(command)?.into_iter();
         config.command = words.next();
         config.args = words.collect();
         config.env = pairs(plain, false)?;
@@ -345,7 +410,7 @@ impl Shelf {
                 if remote {
                     String::new()
                 } else {
-                    config.summary()
+                    join_command(&config)
                 },
             ),
             (
@@ -457,6 +522,11 @@ impl Shelf {
                 cx,
             );
             return false;
+        }
+        // What the form doesn't show, such as a copied server's working folder, stays.
+        let mut config = config;
+        if let Some(old) = self.library.servers.get(&name).filter(|_| !adding) {
+            config.cwd = old.cwd.clone();
         }
         let mut steps = vec![Step::SaveServer {
             name: name.clone(),
@@ -721,7 +791,7 @@ impl Shelf {
 
 #[cfg(test)]
 mod tests {
-    use super::{lines, read_form};
+    use super::{join_command, lines, read_form, split_command};
 
     #[test]
     fn reads_the_form() {
@@ -754,5 +824,33 @@ mod tests {
         assert!(read_form("x", "", "", "", "").is_err());
         assert!(read_form("x", "cmd", "", "NOEQUALS", "").is_err());
         assert_eq!(lines(&remote.headers, true), "X-Team: core");
+    }
+
+    #[test]
+    fn command_lines_round_trip() {
+        let typed = r#""C:\Program Files\srv.exe" --name "a b" 'x' "say \"hi\"" plain"#;
+        let words = split_command(typed).unwrap();
+        assert_eq!(
+            words,
+            [
+                r"C:\Program Files\srv.exe",
+                "--name",
+                "a b",
+                "'x'",
+                r#"say "hi""#,
+                "plain"
+            ]
+        );
+        let config = xolkit_core::ServerConfig {
+            command: Some(words[0].clone()),
+            args: words[1..].to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(split_command(&join_command(&config)).unwrap(), words);
+        assert!(split_command(r#"npx "unclosed"#).is_err());
+        assert_eq!(
+            split_command(r"C:\tools\x.exe").unwrap(),
+            [r"C:\tools\x.exe"]
+        );
     }
 }
