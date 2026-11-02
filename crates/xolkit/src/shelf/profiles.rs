@@ -67,11 +67,14 @@ impl Shelf {
         cx: &mut Context<Self>,
     ) {
         let mut settings = self.settings().clone();
+        let before = settings.profiles[ix].clone();
         edit(&mut settings.profiles[ix]);
+        // Only what the edit changes; unrelated edits never touch the agents.
         let native = if ix == settings.active_index() {
-            native_steps(
+            native_changes(
                 &self.library.lock,
                 &self.library.plugins,
+                &before,
                 &settings.profiles[ix],
             )
         } else {
@@ -81,38 +84,49 @@ impl Shelf {
     }
 
     /// Makes another profile the active one. What xolkit serves changes at once; plugins
-    /// installed natively are turned on and off in the agents, after a confirmation.
+    /// installed natively are turned on and off in the agents, after a confirmation. Choosing
+    /// the profile in use sets every native plugin as it has them, which also sets right what a
+    /// switch that failed halfway left behind.
     pub(super) fn switch_profile(
         &mut self,
         ix: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if ix == self.settings().active_index() || self.busy {
+        if self.busy {
+            return;
+        }
+        if ix == self.settings().active_index() {
+            let steps = native_steps(
+                &self.library.lock,
+                &self.library.plugins,
+                self.settings().active(),
+            );
+            let done = format!(
+                "Set plugins as “{}” has them",
+                self.settings().active().name
+            );
+            self.run(steps, Some(done.into()), window, cx);
             return;
         }
         let mut settings = self.settings().clone();
         let from = settings.active().clone();
         settings.profile = settings.profiles[ix].name.clone();
         let to = settings.active().clone();
-        let (lock, plugins) = (&self.library.lock, &self.library.plugins);
-        let changes = native_changes(lock, plugins, &from, &to);
-        // Every native plugin is set as the profile has it, so one a failed switch left behind
-        // is set right too; only the changes are worth asking about.
-        let native = native_steps(lock, plugins, &to);
+        let native = native_changes(&self.library.lock, &self.library.plugins, &from, &to);
         let done: SharedString = format!("Switched to {}", to.name).into();
-        if changes.is_empty() {
-            self.save_settings(settings, native, Some(done), window, cx);
+        if native.is_empty() {
+            self.save_settings(settings, Vec::new(), Some(done), window, cx);
             return;
         }
         // The dialog doesn't scroll, so a long list ends in a count.
-        let mut lines: Vec<String> = changes
+        let mut lines: Vec<String> = native
             .iter()
             .take(MAX_STEPS)
             .map(|step| step.describe(&self.env))
             .collect();
-        if changes.len() > MAX_STEPS {
-            lines.push(format!("…and {} more", changes.len() - MAX_STEPS));
+        if native.len() > MAX_STEPS {
+            lines.push(format!("…and {} more", native.len() - MAX_STEPS));
         }
         let title = format!("Switch to “{}”?", to.name);
         let shelf = cx.entity();
@@ -792,10 +806,21 @@ impl Shelf {
         let profile = &self.settings().profiles[ix];
         let active = ix == self.settings().active_index();
         let muted = cx.theme().muted_foreground;
+        // In use, it can set its native plugins again, after a switch that failed halfway.
+        let has_native = self
+            .library
+            .lock
+            .plugins
+            .values()
+            .any(|pin| !pin.native.is_empty());
         let switch = Button::new("switch-profile")
             .primary()
-            .label(if active { "In use" } else { "Switch" })
-            .disabled(active || self.busy)
+            .label(match (active, has_native) {
+                (false, _) => "Switch",
+                (true, true) => "Set plugins again",
+                (true, false) => "In use",
+            })
+            .disabled((active && !has_native) || self.busy)
             .on_click(cx.listener(move |this, _, window, cx| this.switch_profile(ix, window, cx)));
         let note = if ix == 0 {
             "The default profile can't be renamed or removed."

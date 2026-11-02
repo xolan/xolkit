@@ -67,6 +67,36 @@ pub(crate) fn has_entry(env: &Env, provider: Provider) -> anyhow::Result<bool> {
     })
 }
 
+/// Takes xolkit's server entry out of `provider`'s config directly, for when the agent's own
+/// tool can't: it is gone, or fails.
+pub(crate) fn remove_entry_from_config(env: &Env, provider: Provider) -> anyhow::Result<()> {
+    match provider {
+        Provider::Claude => {
+            let path = env.claude_json();
+            let mut json = read_json(&path)?;
+            let removed = json
+                .get_mut("mcpServers")
+                .and_then(|s| s.as_object_mut())
+                .is_some_and(|servers| servers.shift_remove(XOLKIT).is_some());
+            if removed {
+                crate::config::write_json(&path, &json)?;
+            }
+        }
+        Provider::Codex => {
+            let path = env.codex_config();
+            let mut doc = read_toml(&path)?;
+            let removed = doc
+                .get_mut("mcp_servers")
+                .and_then(|s| s.as_table_like_mut())
+                .is_some_and(|servers| servers.remove(XOLKIT).is_some());
+            if removed {
+                crate::config::write_toml(&path, &doc)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Steps that register xolkit with `provider`, replacing an entry that starts another program.
 pub fn register(env: &Env, provider: Provider, exe: &Path) -> Vec<Action> {
     let mut actions = Vec::new();
@@ -274,6 +304,37 @@ mod tests {
         fs::remove_file(dir.join("notes.md")).unwrap();
         write_router(&env, Provider::Claude, Some(ROUTER_MARK)).unwrap();
         assert!(router_is_ours(&env, Provider::Claude));
+    }
+
+    #[test]
+    fn removes_its_own_entry_from_agent_configs() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        fs::write(
+            env.claude_json(),
+            r#"{"mcpServers": {"xolkit": {"command": "x"}, "other": {"command": "y"}}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(&env.codex_dir).unwrap();
+        fs::write(
+            env.codex_config(),
+            "[mcp_servers.xolkit]\ncommand = \"x\"\n[mcp_servers.other]\ncommand = \"y\"\n",
+        )
+        .unwrap();
+        for provider in Provider::ALL {
+            remove_entry_from_config(&env, provider).unwrap();
+            assert!(!has_entry(&env, provider).unwrap());
+        }
+        assert!(
+            fs::read_to_string(env.claude_json())
+                .unwrap()
+                .contains("other")
+        );
+        assert!(
+            fs::read_to_string(env.codex_config())
+                .unwrap()
+                .contains("other")
+        );
     }
 
     #[test]

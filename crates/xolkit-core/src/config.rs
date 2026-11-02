@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, Item, value};
 
 pub(crate) fn read_json(path: &Path) -> Result<Value> {
     match fs::read_to_string(path) {
@@ -91,15 +91,18 @@ fn canonical(path: &Path) -> std::path::PathBuf {
     resolved
 }
 
+/// Turns a plugin Codex has on or off. One Codex doesn't have (no `plugins."<id>"` table) is
+/// left alone: there is nothing to switch, and no entry is made for it.
 pub(crate) fn set_codex_plugin(doc: &mut DocumentMut, id: &str, enabled: bool) -> Result<()> {
-    let plugins = doc
-        .entry("plugins")
-        .or_insert_with(implicit_table)
-        .as_table_mut()
-        .context("`plugins` in config.toml is not a table")?;
-    let plugin = plugins
-        .entry(id)
-        .or_insert_with(toml_edit::table)
+    let Some(plugin) = doc
+        .get_mut("plugins")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|plugins| plugins.get_mut(id))
+        .filter(|plugin| !plugin.is_none())
+    else {
+        return Ok(());
+    };
+    let plugin = plugin
         .as_table_mut()
         .with_context(|| format!("`plugins.\"{id}\"` in config.toml is not a table"))?;
     plugin["enabled"] = value(enabled);
@@ -126,12 +129,6 @@ pub(crate) fn forget_codex_hooks(doc: &mut DocumentMut, id: &str) {
     }
 }
 
-fn implicit_table() -> Item {
-    let mut table = Table::new();
-    table.set_implicit(true);
-    Item::Table(table)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +144,9 @@ mod tests {
         assert!(text.contains("[plugins.\"p@m\"]\nenabled = false"));
         assert!(!text.contains("p@m:hooks"));
         assert!(text.contains("q@m:h:0"));
+        // A plugin Codex doesn't have gets no entry.
+        set_codex_plugin(&mut doc, "gone@m", true).unwrap();
+        assert!(!doc.to_string().contains("gone@m"));
     }
 
     #[test]

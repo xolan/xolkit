@@ -106,9 +106,10 @@ impl Gone {
     /// can't be read means "maybe not".
     fn is_gone(&self, env: &Env, provider: Provider) -> bool {
         match self {
+            // The config decides, never the tool: it can be read, and edited, without it.
+            Gone::McpEntry => crate::registration::has_entry(env, provider).is_ok_and(|has| !has),
             // An uninstalled agent runs nothing that's left of it.
             _ if agent_absent(env, provider) => true,
-            Gone::McpEntry => crate::registration::has_entry(env, provider).is_ok_and(|has| !has),
             Gone::Plugin { id } => {
                 crate::marketplace::native_state(env, provider, id).is_ok_and(|s| s.is_none())
             }
@@ -118,10 +119,11 @@ impl Gone {
 }
 
 /// Whether the agent is uninstalled: nothing of it is left, or its tool is missing from the
-/// user's whole `PATH` (uninstalling leaves the folder behind). A tool missing from a `PATH`
-/// that may be partial proves nothing.
+/// user's whole `PATH` as the login shell gives it now (uninstalling leaves the folder behind).
+/// Asked fresh, since the daemon's own `PATH` dates from its start. Where that can't be asked
+/// (Windows), a missing tool proves nothing.
 fn agent_absent(env: &Env, provider: Provider) -> bool {
-    env.locate(provider).is_none() || (env.path_complete && !env.has_tool(provider.cli()))
+    env.locate(provider).is_none() || env.tool_gone(provider.cli())
 }
 
 impl Action {
@@ -293,6 +295,13 @@ fn run(env: &Env, action: &Action) -> Result<()> {
         } => match env.run(provider.cli(), args) {
             Ok(_) => Ok(()),
             Err(_) if gone.is_gone(env, *provider) => Ok(()),
+            // The agent's tool couldn't take xolkit's own entry out; take it out of the config.
+            Err(error) if *gone == Gone::McpEntry => {
+                crate::registration::remove_entry_from_config(env, *provider)
+                    .with_context(|| format!("{error:#}"))?;
+                anyhow::ensure!(gone.is_gone(env, *provider), error);
+                Ok(())
+            }
             Err(error) => Err(error),
         },
     }

@@ -50,11 +50,18 @@ impl Client {
         serde_json::from_str(&answer).context("the daemon answered something unexpected")
     }
 
-    /// Sends a request, connecting again once if the daemon went away since the last one.
+    /// Sends a request, connecting again if the daemon went away since the last one. A change is
+    /// never sent twice: the connection is checked with a status request first, as a change
+    /// that got through but lost its answer would otherwise run again.
     pub fn request(&mut self, request: &Request) -> Result<Response> {
+        let read_only = matches!(request, Request::Status);
+        if !read_only && self.connection.is_some() && self.send(&Request::Status).is_err() {
+            self.connection = None;
+        }
+        let had_connection = self.connection.is_some();
         match self.send(request) {
             Ok(response) => Ok(response),
-            Err(_) if self.connection.is_some() => {
+            Err(_) if read_only && had_connection => {
                 self.connection = None;
                 self.send(request)
             }
