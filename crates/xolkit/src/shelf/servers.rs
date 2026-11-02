@@ -575,25 +575,21 @@ impl Shelf {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    // Secrets first without reconnecting, then the settings, then one
-                    // reconnect: a new token never goes to the old address, or the reverse.
-                    let mut changed = false;
-                    for (key, value) in secrets.iter().filter(|(_, v)| !v.is_empty()) {
-                        settings::call(
-                            &client,
-                            Request::SetSecret {
-                                key: secret_key(&name, key),
-                                value: Some(value.clone()),
-                                reconnect: false,
-                            },
-                        )?;
-                        changed = true;
-                    }
-                    settings::execute(&client, steps)?;
-                    if changed {
-                        settings::call(&client, Request::RefreshServer { name })?;
-                    }
-                    anyhow::Ok(())
+                    // One change in the daemon: disconnected first, secrets and settings saved
+                    // together (or neither), connected once after.
+                    let secrets = secrets
+                        .iter()
+                        .filter(|(_, v)| !v.is_empty())
+                        .map(|(key, value)| (secret_key(&name, key), Some(value.clone())))
+                        .collect();
+                    settings::call(
+                        &client,
+                        Request::SaveServer {
+                            name,
+                            secrets,
+                            actions: steps,
+                        },
+                    )
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {

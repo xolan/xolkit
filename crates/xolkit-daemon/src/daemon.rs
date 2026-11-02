@@ -341,16 +341,27 @@ impl Daemon {
                 done
             }
             Request::RestartServer { name } => self.gateway().restart(&name),
-            Request::RefreshServer { name } => {
-                let stopped =
-                    self.gateway().status().iter().any(|s| {
-                        s.name == name && s.state == crate::protocol::ServerState::Stopped
-                    });
-                let connected = self.gateway().status().iter().any(|s| s.name == name);
-                if connected && !stopped {
-                    let _ = self.gateway().restart(&name);
+            Request::SaveServer {
+                name,
+                secrets,
+                actions,
+            } => {
+                let _running = self.executing.lock().await;
+                // No connection may read the new secrets with the old settings, or the reverse.
+                self.gateway().detach(&name);
+                let env = self.env.clone();
+                for action in &actions {
+                    self.event("app", action.describe(&env), false);
                 }
-                Ok(())
+                let done =
+                    tokio::task::spawn_blocking(move || save_server(&env, &secrets, &actions))
+                        .await
+                        .context("the change stopped unexpectedly")
+                        .and_then(|r| r);
+                self.reload();
+                // Connect, with whichever settings and secrets are saved now.
+                self.apply();
+                done
             }
             Request::StopServer { name } => self.gateway().stop(&name),
             Request::Disconnect { session } => {
@@ -493,6 +504,29 @@ impl Daemon {
             && self.controls.load(Ordering::SeqCst) == 0
             && self.last_active.lock().unwrap().elapsed() > Duration::from_secs(minutes * 60)
     }
+}
+
+/// Saves secrets, then runs the actions; if either fails, puts the secrets back as they were.
+fn save_server(
+    env: &Env,
+    secrets: &[(String, Option<String>)],
+    actions: &[xolkit_core::Action],
+) -> Result<()> {
+    let mut before = Vec::new();
+    for (key, _) in secrets {
+        before.push((key.clone(), xolkit_core::get_secret(key)?));
+    }
+    let saved = secrets
+        .iter()
+        .try_for_each(|(key, value)| set_secret(key, value.as_deref()))
+        .and_then(|()| execute(env, actions));
+    if let Err(error) = saved {
+        for (key, value) in &before {
+            let _ = set_secret(key, value.as_deref());
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Opens the log, first moving one past `MAX_LOG` to `daemon.log.old`, so it never grows

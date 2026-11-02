@@ -187,6 +187,31 @@ impl Gateway {
         Ok(())
     }
 
+    /// Drops the connection to `name`, and any attempt under way, so the next sync connects
+    /// afresh. A server stopped by hand stays stopped.
+    pub(crate) fn detach(&self, name: &str) {
+        let old = {
+            let mut connections = self.connections.lock().unwrap();
+            match connections.get(name) {
+                Some(c) if c.state == ServerState::Stopped => None,
+                Some(_) => connections.remove(name).and_then(|c| c.service),
+                None => None,
+            }
+        };
+        if let Some(old) = old {
+            tokio::spawn(close(old));
+        }
+    }
+
+    /// Whether attempt `generation` is still the one wanted for `name`.
+    fn current(&self, name: &str, generation: u64) -> bool {
+        self.connections
+            .lock()
+            .unwrap()
+            .get(name)
+            .is_some_and(|c| c.generation == generation)
+    }
+
     /// Disconnects from every server, for when the daemon exits.
     pub(crate) async fn close_all(&self) {
         let services: Vec<_> = {
@@ -205,9 +230,10 @@ impl Gateway {
         let gateway = self.clone();
         tokio::spawn(async move {
             let name = server.name.clone();
-            let result = tokio::time::timeout(CONNECT_TIMEOUT, gateway.connect(&server))
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("it didn't answer within a minute")));
+            let result =
+                tokio::time::timeout(CONNECT_TIMEOUT, gateway.connect(&server, generation))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("it didn't answer within a minute")));
             let mut connections = gateway.connections.lock().unwrap();
             let Some(connection) = connections.get_mut(&name) else {
                 return;
@@ -242,16 +268,30 @@ impl Gateway {
     async fn connect(
         &self,
         server: &Server,
+        generation: u64,
     ) -> Result<(RunningService<RoleClient, Handler>, Vec<Tool>, Option<u32>)> {
         let handler = Handler {
             name: server.name.clone(),
             gateway: self.clone(),
         };
-        // The keyring can block, waiting for the user to unlock it; keep that off the workers.
-        let config = {
-            let (name, config) = (server.name.clone(), server.config.clone());
-            tokio::task::spawn_blocking(move || with_secrets(&name, &config)).await??
+        // The keyring can block, waiting for the user to unlock it, and finding a launcher may
+        // ask the login shell; keep both off the workers.
+        let (config, env) = {
+            let (name, config, env) =
+                (server.name.clone(), server.config.clone(), self.env.clone());
+            tokio::task::spawn_blocking(move || {
+                let config = with_secrets(&name, &config)?;
+                let env = launcher_env(&env, config.command.as_deref().unwrap_or_default());
+                anyhow::Ok((config, env))
+            })
+            .await??
         };
+        // Settings and secrets may have changed while they were read; connect only if this
+        // attempt is still the one wanted, so a secret never goes to an address it wasn't for.
+        anyhow::ensure!(
+            self.current(&server.name, generation),
+            "superseded by a newer connection"
+        );
         let (service, pid) = match &config.url {
             Some(url) => {
                 let mut headers = HashMap::new();
@@ -270,18 +310,8 @@ impl Gateway {
                 (handler.serve(transport).await?, None)
             }
             None => {
-                // Found the way a shell finds it, so `npx` (npx.cmd on Windows) works; with the
-                // PATH as it is now when the daemon's own misses it, for a launcher installed
-                // since the daemon started.
+                // Found the way a shell finds it, so `npx` (npx.cmd on Windows) works.
                 let name = config.command.as_deref().unwrap_or_default();
-                let env = match self.env.has_tool(name) {
-                    true => self.env.clone(),
-                    false => self
-                        .env
-                        .with_fresh_path()
-                        .filter(|fresh| fresh.has_tool(name))
-                        .unwrap_or_else(|| self.env.clone()),
-                };
                 let mut command = tokio::process::Command::new(env.find(name));
                 if let Some(path) = &env.path {
                     command.env("PATH", path);
@@ -455,6 +485,18 @@ impl Gateway {
 fn next_attempt() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The environment to start `program` in: the daemon's own, or, when its `PATH` misses the
+/// program, the `PATH` as it is now, for a launcher installed since the daemon started. A
+/// program given by path is found by its path, so no fresh `PATH` can help it.
+fn launcher_env(env: &Env, program: &str) -> Env {
+    if env.has_tool(program) || program.contains(['/', '\\']) {
+        return env.clone();
+    }
+    env.with_fresh_path()
+        .filter(|fresh| fresh.has_tool(program))
+        .unwrap_or_else(|| env.clone())
 }
 
 async fn close(service: Arc<RunningService<RoleClient, Handler>>) {

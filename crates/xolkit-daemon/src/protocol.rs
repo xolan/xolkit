@@ -31,18 +31,21 @@ pub enum Request {
         actions: Vec<Action>,
     },
     /// Saves a secret in the OS keyring, or deletes it. With `reconnect`, servers using it
-    /// connect again at once; without, the caller sends `RefreshServer` once the server's
-    /// settings are saved too, so a new secret never goes to an old address.
+    /// connect again at once.
     SetSecret {
         key: String,
         value: Option<String>,
         #[serde(default = "yes")]
         reconnect: bool,
     },
-    /// Connects to a server again with its current settings and secrets, unless it was
-    /// stopped by hand.
-    RefreshServer {
+    /// Saves a server's secrets and runs `actions` (its settings) as one change: the server is
+    /// disconnected first, and connects once, after both are saved. If anything fails, the
+    /// secrets are put back as they were, so a new secret never pairs with an old address.
+    SaveServer {
         name: String,
+        /// Keyring keys and values; `None` deletes.
+        secrets: Vec<(String, Option<String>)>,
+        actions: Vec<Action>,
     },
     /// Reconnects to an MCP server, or connects to one that failed or was stopped.
     RestartServer {

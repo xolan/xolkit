@@ -325,7 +325,15 @@ fn find_on_path(program: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
         .map(str::to_ascii_lowercase)
         .filter(|ext| [".com", ".exe", ".bat", ".cmd"].contains(&ext.as_str()))
         .collect();
+    // `npx.cmd` names its file already; `npx` gets each extension tried.
+    let named = Path::new(program)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| extensions.contains(&format!(".{}", e.to_ascii_lowercase())));
     std::env::split_paths(path).find_map(|dir| {
+        if named {
+            return Some(dir.join(program)).filter(|file| file.is_file());
+        }
         extensions
             .iter()
             .map(|ext| dir.join(format!("{program}{ext}")))
