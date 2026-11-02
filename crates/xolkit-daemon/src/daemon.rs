@@ -448,13 +448,19 @@ impl Daemon {
         self.apply();
         // The settings in use are the ones just read; if the library couldn't be read, they're
         // older ones, which mustn't meet the new secrets.
-        if consistent && read {
-            self.gateway().release(&name);
+        // Still held if that can't be written down, or the next daemon would hold it anyway.
+        let released = (consistent && read)
+            .then(|| self.gateway().release(&name))
+            .transpose();
+        if let Ok(Some(())) = released {
             // Connected with the settings just read, unless stopped by hand or no longer on
             // for any agent.
             if !stopped_by_hand {
                 let _ = self.gateway().restart(&name);
             }
+        } else if let Err(e) = &released {
+            self.gateway()
+                .fail(&name, &format!("{e:#}; save the server again"));
         } else if consistent {
             self.gateway().fail(
                 &name,
@@ -462,6 +468,9 @@ impl Daemon {
             );
         } else {
             self.gateway().fail(&name, &stuck);
+        }
+        if let Err(e) = released {
+            return Err(e.context(format!("{name} stays disconnected")));
         }
         match saved {
             Ok(()) if read => Ok(()),

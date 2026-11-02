@@ -264,28 +264,31 @@ impl Gateway {
         (self.notify)(Notice::ToolsChanged);
     }
 
-    /// Holds `name` until `release`, here and in `run/held`; see `held`. On an error it isn't
-    /// held at all.
+    /// Holds `name` until `release`, here and in `run/held`; see `held`. On an error it is held
+    /// only as much as before.
     pub(crate) fn mark(&self, name: &str) -> Result<()> {
         let mut held = self.held.lock().unwrap();
-        if !held.insert(name.to_owned()) {
-            return Ok(());
-        }
+        // Written even if held already: `fail` may not have managed to.
+        let new = held.insert(name.to_owned());
         let stored = self.store(&held);
-        if stored.is_err() {
+        if stored.is_err() && new {
             held.remove(name);
         }
         stored
     }
 
-    /// Lets a server held by `mark` or `fail` connect again.
-    pub(crate) fn release(&self, name: &str) {
+    /// Lets a server held by `mark` or `fail` connect again. On an error it stays held, as
+    /// `run/held` still has it.
+    pub(crate) fn release(&self, name: &str) -> Result<()> {
         let mut held = self.held.lock().unwrap();
-        if held.remove(name)
-            && let Err(e) = self.store(&held)
-        {
-            self.log(name, format!("{e:#}"), true);
+        if !held.remove(name) {
+            return Ok(());
         }
+        let stored = self.store(&held);
+        if stored.is_err() {
+            held.insert(name.to_owned());
+        }
+        stored
     }
 
     /// Writes the held servers to `run/held`, whole or not at all.
@@ -676,7 +679,7 @@ mod tests {
         assert!(matches!(state(&gateway), ServerState::Failed { .. }));
         // A save lets it go, and connects it with the settings synced last.
         assert!(gateway.hold("a"));
-        gateway.release("a");
+        gateway.release("a").unwrap();
         gateway.restart("a").unwrap();
         assert!(!gateway.is_held("a"));
         assert_eq!(state(&gateway), ServerState::Starting);
