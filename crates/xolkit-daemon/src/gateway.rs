@@ -109,8 +109,14 @@ impl Gateway {
                 }
             }
             for server in wanted {
-                match connections.get(&server.name) {
+                match connections.get_mut(&server.name) {
                     Some(c) if c.server.config == server.config => continue,
+                    // A server stopped by hand stays stopped when edited; reconnecting starts
+                    // it with the new settings.
+                    Some(c) if c.state == ServerState::Stopped => {
+                        c.server = server;
+                        continue;
+                    }
                     Some(c) => stopped.extend(c.service.clone()),
                     None => {}
                 }

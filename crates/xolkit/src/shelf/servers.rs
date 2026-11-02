@@ -58,28 +58,39 @@ impl ServerInputs {
     }
 }
 
-/// A command line as typed: words split at spaces, except inside double quotes, where `\"`
-/// is a quote and `\\` a backslash. So `"C:\Program Files\x.exe" --flag "a b"` is three words.
+/// A command line as typed, read the way Windows reads one: words split at spaces, except
+/// inside double quotes; backslashes are literal unless they come before a quote, where each
+/// pair makes one backslash and an odd one makes the quote literal. So
+/// `"C:\Program Files\x.exe" "\\server\my share" --root "C:\My Data\\"` is four words.
 fn split_command(text: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
     let mut quoted = false;
-    let mut chars = text.trim().chars();
+    let mut chars = text.trim().chars().peekable();
     while let Some(c) = chars.next() {
         match c {
+            '\\' => {
+                let mut run = 1;
+                while chars.peek() == Some(&'\\') {
+                    chars.next();
+                    run += 1;
+                }
+                in_word = true;
+                if chars.peek() == Some(&'"') {
+                    word.push_str(&"\\".repeat(run / 2));
+                    if run % 2 == 1 {
+                        chars.next();
+                        word.push('"');
+                    }
+                } else {
+                    word.push_str(&"\\".repeat(run));
+                }
+            }
             '"' => {
                 quoted = !quoted;
                 in_word = true;
             }
-            '\\' if quoted => match chars.next() {
-                Some(next @ ('"' | '\\')) => word.push(next),
-                Some(next) => {
-                    word.push('\\');
-                    word.push(next);
-                }
-                None => word.push('\\'),
-            },
             c if c.is_whitespace() && !quoted => {
                 if in_word {
                     words.push(std::mem::take(&mut word));
@@ -101,18 +112,33 @@ fn split_command(text: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
-/// A server's command line for the form: words with spaces or quotes are quoted, so
-/// [`split_command`] reads it back as it was.
+/// A server's command line for the form, written so [`split_command`] reads it back as it was:
+/// a word with spaces or quotes is quoted, with backslashes doubled before a quote or the end.
 fn join_command(config: &ServerConfig) -> String {
     let quote = |word: &str| {
-        if !word.is_empty() && !word.contains(|c: char| c.is_whitespace() || c == '"' || c == '\\')
-        {
-            word.to_owned()
-        } else if !word.contains(['"', '\\']) {
-            format!("\"{word}\"")
-        } else {
-            format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\""))
+        if !word.is_empty() && !word.contains(|c: char| c.is_whitespace() || c == '"') {
+            return word.to_owned();
         }
+        let mut out = String::from('"');
+        let mut backslashes = 0;
+        for c in word.chars() {
+            match c {
+                '\\' => backslashes += 1,
+                '"' => {
+                    out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                    out.push('"');
+                    backslashes = 0;
+                }
+                c => {
+                    out.push_str(&"\\".repeat(backslashes));
+                    out.push(c);
+                    backslashes = 0;
+                }
+            }
+        }
+        out.push_str(&"\\".repeat(backslashes * 2));
+        out.push('"');
+        out
     };
     config
         .command
@@ -828,17 +854,19 @@ mod tests {
 
     #[test]
     fn command_lines_round_trip() {
-        let typed = r#""C:\Program Files\srv.exe" --name "a b" 'x' "say \"hi\"" plain"#;
+        let typed = r#""C:\Program Files\srv.exe" "\\server\my share" --root "C:\My Data\\" "say \"hi\"" 'x' plain C:\tools\x.exe"#;
         let words = split_command(typed).unwrap();
         assert_eq!(
             words,
             [
                 r"C:\Program Files\srv.exe",
-                "--name",
-                "a b",
-                "'x'",
+                r"\\server\my share",
+                "--root",
+                r"C:\My Data\",
                 r#"say "hi""#,
-                "plain"
+                "'x'",
+                "plain",
+                r"C:\tools\x.exe"
             ]
         );
         let config = xolkit_core::ServerConfig {
@@ -848,9 +876,5 @@ mod tests {
         };
         assert_eq!(split_command(&join_command(&config)).unwrap(), words);
         assert!(split_command(r#"npx "unclosed"#).is_err());
-        assert_eq!(
-            split_command(r"C:\tools\x.exe").unwrap(),
-            [r"C:\tools\x.exe"]
-        );
     }
 }

@@ -144,6 +144,14 @@ impl Env {
 
     /// Runs a provider tool and returns its stdout.
     pub fn run(&self, program: &str, args: &[String]) -> Result<String> {
+        // A tool installed since this process started isn't on its `PATH`; look again with the
+        // `PATH` as it is now before giving up.
+        if !self.has_tool(program)
+            && let Some(fresh) = self.with_fresh_path()
+            && fresh.has_tool(program)
+        {
+            return fresh.run(program, args);
+        }
         let mut command = Command::new(self.find(program));
         // Run from home: a project's tool config (e.g. a mise.toml pinning another codex) must
         // not leak into global changes.
@@ -184,18 +192,18 @@ impl Env {
     /// shell, or on Windows from the registry, as a newly started program would get it. `false`
     /// when that can't be told.
     pub fn tool_gone(&self, program: &str) -> bool {
-        let Some(login) = fresh_path() else {
-            return false;
-        };
-        // A PATH that can't be put together can't tell either.
-        let Some(path) = merge_paths(std::env::var_os("PATH"), Some(login)) else {
-            return false;
-        };
-        let fresh = Env {
+        // A PATH that can't be read or put together can't tell either.
+        self.with_fresh_path()
+            .is_some_and(|fresh| !fresh.has_tool(program))
+    }
+
+    /// This environment with the `PATH` as it is now, merged with this process's own.
+    fn with_fresh_path(&self) -> Option<Env> {
+        let path = merge_paths(std::env::var_os("PATH"), Some(fresh_path()?))?;
+        Some(Env {
             path: Some(path),
             ..self.clone()
-        };
-        !fresh.has_tool(program)
+        })
     }
 
     /// Whether `program` is on `PATH`.
