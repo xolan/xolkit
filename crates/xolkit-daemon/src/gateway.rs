@@ -244,10 +244,12 @@ impl Gateway {
         true
     }
 
-    /// Leaves `name` disconnected with `message` until a save releases it with `release`.
-    /// Unlike one stopped by hand, the next save holds it again and connects it.
+    /// Leaves `name` disconnected with `message`, held until a save releases it with
+    /// `release`. Unlike one stopped by hand, the next save holds it again and connects it.
     pub(crate) fn fail(&self, name: &str, message: &str) {
-        self.mark(name, true);
+        if let Err(e) = self.mark(name) {
+            self.log(name, format!("{e:#}"), true);
+        }
         if let Some(connection) = self.connections.lock().unwrap().get_mut(name) {
             connection.state = ServerState::Failed {
                 message: message.to_owned(),
@@ -256,31 +258,35 @@ impl Gateway {
         (self.notify)(Notice::ToolsChanged);
     }
 
-    /// Lets a server `fail` left disconnected connect again; see `held`.
-    pub(crate) fn release(&self, name: &str) {
-        self.mark(name, false);
+    /// Holds `name` until `release`, here and in `run/held`; see `held`. An error means it is
+    /// held only until the daemon exits.
+    pub(crate) fn mark(&self, name: &str) -> Result<()> {
+        let mut held = self.held.lock().unwrap();
+        if !held.insert(name.to_owned()) {
+            return Ok(());
+        }
+        self.store(&held)
     }
 
-    fn mark(&self, name: &str, held: bool) {
-        let mut set = self.held.lock().unwrap();
-        let changed = if held {
-            set.insert(name.to_owned())
-        } else {
-            set.remove(name)
-        };
-        if !changed {
-            return;
+    /// Lets a server held by `mark` or `fail` connect again.
+    pub(crate) fn release(&self, name: &str) {
+        let mut held = self.held.lock().unwrap();
+        if held.remove(name)
+            && let Err(e) = self.store(&held)
+        {
+            self.log(name, format!("{e:#}"), true);
         }
-        let text: String = set.iter().map(|n| format!("{n}\n")).collect();
+    }
+
+    /// Writes the held servers to `run/held`, whole or not at all.
+    fn store(&self, held: &BTreeSet<String>) -> Result<()> {
         let path = self.env.run_dir().join("held");
-        let written = fs::create_dir_all(self.env.run_dir()).and_then(|()| fs::write(&path, text));
-        if let Err(e) = written {
-            self.log(
-                name,
-                format!("could not write {}: {e:#}", path.display()),
-                true,
-            );
-        }
+        let temp = path.with_extension("tmp");
+        let text: String = held.iter().map(|n| format!("{n}\n")).collect();
+        fs::create_dir_all(self.env.run_dir())
+            .and_then(|()| fs::write(&temp, text))
+            .and_then(|()| fs::rename(&temp, &path))
+            .with_context(|| format!("could not write {}", path.display()))
     }
 
     /// Whether a save left `name` disconnected; see `held`.

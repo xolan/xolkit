@@ -415,9 +415,18 @@ impl Daemon {
         // Nothing changes while the library can't be read: the save couldn't take
         // effect, and the server's connection is left as it is.
         Library::load(&self.env).context("the library can't be read; fix it first")?;
-        // No connection may read the new secrets with the old settings, or the reverse.
+        // No connection may read the new secrets with the old settings, or the reverse. Held
+        // on disk before anything changes, so not even a crash mid-save lets it connect; a save
+        // that can't record that doesn't start.
         let was_held = self.gateway().is_held(&name);
-        let held = self.gateway().hold(&name);
+        let stopped_by_hand = !was_held
+            && self
+                .gateway()
+                .status()
+                .iter()
+                .any(|s| s.name == name && s.state == crate::protocol::ServerState::Stopped);
+        self.gateway().mark(&name)?;
+        self.gateway().hold(&name);
         let env = self.env.clone();
         for action in &actions {
             self.event("app", action.describe(&env), false);
@@ -434,18 +443,16 @@ impl Daemon {
             Ok(()) => true,
             Err((_, restored)) => *restored && !was_held,
         };
-        // Marked before the reload, so it doesn't connect a new server that may not match.
         let stuck = format!("{name} stays disconnected: save the server again");
-        if !consistent {
-            self.gateway().fail(&name, &stuck);
-        }
         let read = self.reload();
         self.apply();
         // The settings in use are the ones just read; if the library couldn't be read, they're
         // older ones, which mustn't meet the new secrets.
         if consistent && read {
             self.gateway().release(&name);
-            if held {
+            // Connected with the settings just read, unless stopped by hand or no longer on
+            // for any agent.
+            if !stopped_by_hand {
                 let _ = self.gateway().restart(&name);
             }
         } else if consistent {
@@ -453,6 +460,8 @@ impl Daemon {
                 &name,
                 "the library can't be read; save the server again once it is fixed",
             );
+        } else {
+            self.gateway().fail(&name, &stuck);
         }
         match saved {
             Ok(()) if read => Ok(()),
