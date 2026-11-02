@@ -46,6 +46,9 @@ struct Connection {
     latency_ms: Option<u64>,
     /// The current connection attempt; a result of any other is dropped.
     generation: u64,
+    /// Left disconnected by a save that couldn't finish: its settings and secrets may not
+    /// match, so nothing but a save connects it again.
+    held: bool,
 }
 
 #[derive(Clone)]
@@ -113,7 +116,7 @@ impl Gateway {
                     Some(c) if c.server.config == server.config => continue,
                     // A server stopped by hand stays stopped when edited; reconnecting starts
                     // it with the new settings.
-                    Some(c) if c.state == ServerState::Stopped => {
+                    Some(c) if c.state == ServerState::Stopped || c.held => {
                         c.server = server;
                         continue;
                     }
@@ -132,6 +135,7 @@ impl Gateway {
                         calls: 0,
                         latency_ms: None,
                         generation,
+                        held: false,
                     },
                 );
                 start.push((server, generation));
@@ -152,6 +156,7 @@ impl Gateway {
             let mut connections = self.connections.lock().unwrap();
             let connection = connections.get_mut(name).context("no such server")?;
             connection.generation = next_attempt();
+            connection.held = false;
             connection.state = ServerState::Starting;
             connection.tools.clear();
             connection.pid = None;
@@ -196,7 +201,8 @@ impl Gateway {
             let Some(connection) = connections.get_mut(name) else {
                 return false;
             };
-            if connection.state == ServerState::Stopped {
+            // One a save left disconnected is held again, even if stopped since.
+            if connection.state == ServerState::Stopped && !connection.held {
                 return false;
             }
             connection.generation = next_attempt();
@@ -211,15 +217,25 @@ impl Gateway {
         true
     }
 
-    /// Leaves a held server disconnected with `message`. Unlike stopped by hand, the next save
-    /// holds it again and connects it.
+    /// Leaves a held server disconnected with `message` until it is saved again.
+    /// Unlike stopped by hand, the next save holds it again and connects it.
     pub(crate) fn fail(&self, name: &str, message: &str) {
         if let Some(connection) = self.connections.lock().unwrap().get_mut(name) {
+            connection.held = true;
             connection.state = ServerState::Failed {
                 message: message.to_owned(),
             };
         }
         (self.notify)(Notice::ToolsChanged);
+    }
+
+    /// Whether `name` was left disconnected by a save; see `fail`.
+    pub(crate) fn is_held(&self, name: &str) -> bool {
+        self.connections
+            .lock()
+            .unwrap()
+            .get(name)
+            .is_some_and(|c| c.held)
     }
 
     /// Whether attempt `generation` is still the one wanted for `name`.
@@ -552,4 +568,43 @@ fn with_secrets(name: &str, config: &ServerConfig) -> Result<ServerConfig> {
         }
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xolkit_core::ServerConfig;
+
+    fn state(gateway: &Gateway) -> ServerState {
+        gateway.status().remove(0).state
+    }
+
+    #[tokio::test]
+    async fn a_server_a_save_left_disconnected_waits_for_a_save() {
+        let home = tempfile::tempdir().unwrap();
+        let gateway = Gateway::new(Env::at(home.path()), Arc::new(|_| {}));
+        let server = |arg: &str| Server {
+            name: "a".into(),
+            config: ServerConfig {
+                command: Some("xolkit-test-missing-command".into()),
+                args: vec![arg.into()],
+                ..ServerConfig::default()
+            },
+            plugin: None,
+        };
+        gateway.sync(vec![server("1")]);
+        assert!(gateway.hold("a"));
+        gateway.fail("a", "save again");
+        assert!(gateway.is_held("a"));
+        // New settings alone don't connect it, nor does stopping it let it go.
+        gateway.sync(vec![server("2")]);
+        assert!(matches!(state(&gateway), ServerState::Failed { .. }));
+        gateway.stop("a").unwrap();
+        assert!(gateway.is_held("a"));
+        assert!(gateway.hold("a"));
+        // Released by the save's restart, with the settings synced last.
+        gateway.restart("a").unwrap();
+        assert!(!gateway.is_held("a"));
+        assert_eq!(gateway.connections.lock().unwrap()["a"].server, server("2"));
+    }
 }

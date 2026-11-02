@@ -329,13 +329,15 @@ impl Daemon {
                     .context("the keyring stopped unexpectedly")
                     .and_then(|r| r);
                 // Servers using the secret connect again with it, whether they waited for it,
-                // failed with an old one or run with one that just changed. Stopped ones stay so.
+                // failed with an old one or run with one that just changed. Stopped ones stay so,
+                // and so do ones a save left disconnected.
                 let using: Vec<String> = self
                     .gateway()
                     .status()
                     .into_iter()
                     .filter(|s| saved.starts_with(&format!("server/{}/", s.name)))
                     .filter(|s| s.state != crate::protocol::ServerState::Stopped)
+                    .filter(|s| !self.gateway().is_held(&s.name))
                     .map(|s| s.name)
                     .collect();
                 if done.is_ok() && reconnect {
@@ -348,7 +350,17 @@ impl Daemon {
             // Under the lock, so a server held while it is saved isn't started halfway.
             Request::RestartServer { name } => {
                 let _running = self.executing.lock().await;
-                self.gateway().restart(&name)
+                // Its settings may be older than its secrets until the library is read again.
+                if self.broken.load(Ordering::SeqCst) {
+                    Err(anyhow::anyhow!("the library can't be read; fix it first"))
+                } else if self.gateway().is_held(&name) {
+                    // Only a save puts its settings and secrets back in step.
+                    Err(anyhow::anyhow!(
+                        "{name} was left disconnected by a save; save it again"
+                    ))
+                } else {
+                    self.gateway().restart(&name)
+                }
             }
             Request::SaveServer {
                 name,
@@ -429,7 +441,7 @@ impl Daemon {
             Ok(()) => {
                 let message = format!(
                     "saved, but the library can't be read; {name} stays disconnected until it \
-                     is fixed and the server is restarted"
+                     is fixed and the server is saved again"
                 );
                 if held {
                     self.gateway().fail(&name, &message);
@@ -441,8 +453,10 @@ impl Daemon {
                 if release {
                     let _ = self.gateway().restart(&name);
                 } else if held {
-                    self.gateway()
-                        .fail(&name, "the library can't be read; restart once it is fixed");
+                    self.gateway().fail(
+                        &name,
+                        "the library can't be read; save the server again once it is fixed",
+                    );
                 }
                 Err(error)
             }
