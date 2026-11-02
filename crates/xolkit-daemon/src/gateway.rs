@@ -270,10 +270,20 @@ impl Gateway {
                 (handler.serve(transport).await?, None)
             }
             None => {
-                // Found the way a shell finds it, so `npx` (npx.cmd on Windows) works.
-                let program = self.env.find(config.command.as_deref().unwrap_or_default());
-                let mut command = tokio::process::Command::new(program);
-                if let Some(path) = &self.env.path {
+                // Found the way a shell finds it, so `npx` (npx.cmd on Windows) works; with the
+                // PATH as it is now when the daemon's own misses it, for a launcher installed
+                // since the daemon started.
+                let name = config.command.as_deref().unwrap_or_default();
+                let env = match self.env.has_tool(name) {
+                    true => self.env.clone(),
+                    false => self
+                        .env
+                        .with_fresh_path()
+                        .filter(|fresh| fresh.has_tool(name))
+                        .unwrap_or_else(|| self.env.clone()),
+                };
+                let mut command = tokio::process::Command::new(env.find(name));
+                if let Some(path) = &env.path {
                     command.env("PATH", path);
                 }
                 command.args(&config.args).envs(&config.env);

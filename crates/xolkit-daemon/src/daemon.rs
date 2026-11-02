@@ -313,7 +313,11 @@ impl Daemon {
                     Err(e) => Err(e.context("saved, but the library can't be read")),
                 })
             }
-            Request::SetSecret { key, value } => {
+            Request::SetSecret {
+                key,
+                value,
+                reconnect,
+            } => {
                 let saved = key.clone();
                 let done = tokio::task::spawn_blocking(move || set_secret(&key, value.as_deref()))
                     .await
@@ -329,7 +333,7 @@ impl Daemon {
                     .filter(|s| s.state != crate::protocol::ServerState::Stopped)
                     .map(|s| s.name)
                     .collect();
-                if done.is_ok() {
+                if done.is_ok() && reconnect {
                     for name in using {
                         let _ = self.gateway().restart(&name);
                     }
@@ -337,6 +341,17 @@ impl Daemon {
                 done
             }
             Request::RestartServer { name } => self.gateway().restart(&name),
+            Request::RefreshServer { name } => {
+                let stopped =
+                    self.gateway().status().iter().any(|s| {
+                        s.name == name && s.state == crate::protocol::ServerState::Stopped
+                    });
+                let connected = self.gateway().status().iter().any(|s| s.name == name);
+                if connected && !stopped {
+                    let _ = self.gateway().restart(&name);
+                }
+                Ok(())
+            }
             Request::StopServer { name } => self.gateway().stop(&name),
             Request::Disconnect { session } => {
                 let removed = self.sessions.lock().unwrap().remove(&session);

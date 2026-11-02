@@ -575,16 +575,25 @@ impl Shelf {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
+                    // Secrets first without reconnecting, then the settings, then one
+                    // reconnect: a new token never goes to the old address, or the reverse.
+                    let mut changed = false;
                     for (key, value) in secrets.iter().filter(|(_, v)| !v.is_empty()) {
                         settings::call(
                             &client,
                             Request::SetSecret {
                                 key: secret_key(&name, key),
                                 value: Some(value.clone()),
+                                reconnect: false,
                             },
                         )?;
+                        changed = true;
                     }
-                    settings::execute(&client, steps)
+                    settings::execute(&client, steps)?;
+                    if changed {
+                        settings::call(&client, Request::RefreshServer { name })?;
+                    }
+                    anyhow::Ok(())
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
@@ -656,7 +665,14 @@ impl Shelf {
                 .background_spawn(async move {
                     settings::execute(&client, steps)?;
                     for key in secrets {
-                        settings::call(&client, Request::SetSecret { key, value: None })?;
+                        settings::call(
+                            &client,
+                            Request::SetSecret {
+                                key,
+                                value: None,
+                                reconnect: false,
+                            },
+                        )?;
                     }
                     anyhow::Ok(())
                 })
@@ -790,11 +806,13 @@ impl Shelf {
             let result = cx
                 .background_spawn(async move {
                     for (key, value) in secrets {
+                        // The servers don't exist yet; nothing to reconnect.
                         settings::call(
                             &client,
                             Request::SetSecret {
                                 key,
                                 value: Some(value),
+                                reconnect: false,
                             },
                         )?;
                     }

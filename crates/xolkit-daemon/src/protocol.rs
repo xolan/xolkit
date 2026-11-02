@@ -30,10 +30,19 @@ pub enum Request {
     Execute {
         actions: Vec<Action>,
     },
-    /// Saves a secret in the OS keyring, or deletes it.
+    /// Saves a secret in the OS keyring, or deletes it. With `reconnect`, servers using it
+    /// connect again at once; without, the caller sends `RefreshServer` once the server's
+    /// settings are saved too, so a new secret never goes to an old address.
     SetSecret {
         key: String,
         value: Option<String>,
+        #[serde(default = "yes")]
+        reconnect: bool,
+    },
+    /// Connects to a server again with its current settings and secrets, unless it was
+    /// stopped by hand.
+    RefreshServer {
+        name: String,
     },
     /// Reconnects to an MCP server, or connects to one that failed or was stopped.
     RestartServer {
@@ -128,6 +137,10 @@ pub struct Event {
     pub source: String,
     pub message: String,
     pub error: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 pub(crate) fn now() -> u64 {

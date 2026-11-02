@@ -96,6 +96,7 @@ impl Shelf {
             Request::SetSecret {
                 key: GITHUB_TOKEN.to_owned(),
                 value: Some(token),
+                reconnect: true,
             },
             Some("Token saved in the keyring".into()),
             window,
@@ -110,6 +111,7 @@ impl Shelf {
             Request::SetSecret {
                 key: GITHUB_TOKEN.to_owned(),
                 value: None,
+                reconnect: true,
             },
             Some("Token removed".into()),
             window,

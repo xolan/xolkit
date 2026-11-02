@@ -198,7 +198,7 @@ impl Env {
     }
 
     /// This environment with the `PATH` as it is now, merged with this process's own.
-    fn with_fresh_path(&self) -> Option<Env> {
+    pub fn with_fresh_path(&self) -> Option<Env> {
         let path = merge_paths(std::env::var_os("PATH"), Some(fresh_path()?))?;
         Some(Env {
             path: Some(path),
