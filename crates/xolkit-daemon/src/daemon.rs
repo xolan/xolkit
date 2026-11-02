@@ -203,7 +203,8 @@ impl Daemon {
     }
 
     /// Reads `~/.xolkit` again, and brings everything that follows from it up to date.
-    fn reload(&self) {
+    /// Returns whether it could be read.
+    fn reload(&self) -> bool {
         match Library::load(&self.env) {
             Ok(library) => {
                 let was_broken = self.broken.swap(false, Ordering::SeqCst);
@@ -212,12 +213,14 @@ impl Daemon {
                 if !same {
                     self.apply();
                 }
+                true
             }
             Err(e) => {
                 // Once per breakage, not every time the watcher looks.
                 if !self.broken.swap(true, Ordering::SeqCst) {
                     self.event("daemon", format!("could not read the library: {e:#}"), true);
                 }
+                false
             }
         }
     }
@@ -318,6 +321,8 @@ impl Daemon {
                 value,
                 reconnect,
             } => {
+                // Not while a server's settings and secrets change together.
+                let _running = self.executing.lock().await;
                 let saved = key.clone();
                 let done = tokio::task::spawn_blocking(move || set_secret(&key, value.as_deref()))
                     .await
@@ -340,13 +345,20 @@ impl Daemon {
                 }
                 done
             }
-            Request::RestartServer { name } => self.gateway().restart(&name),
+            // Under the lock, so a server held while it is saved isn't started halfway.
+            Request::RestartServer { name } => {
+                let _running = self.executing.lock().await;
+                self.gateway().restart(&name)
+            }
             Request::SaveServer {
                 name,
                 secrets,
                 actions,
             } => self.save_server(name, secrets, actions).await,
-            Request::StopServer { name } => self.gateway().stop(&name),
+            Request::StopServer { name } => {
+                let _running = self.executing.lock().await;
+                self.gateway().stop(&name)
+            }
             Request::Disconnect { session } => {
                 let removed = self.sessions.lock().unwrap().remove(&session);
                 match removed {
@@ -402,29 +414,49 @@ impl Daemon {
                 .await
                 .unwrap_or_else(|e| Err((anyhow::anyhow!("the change stopped: {e}"), false)))
         };
-        self.reload();
+        let read = self.reload();
         self.apply();
+        // The settings in use are the ones just read; if the library couldn't be read, they're
+        // older ones, which mustn't meet the new secrets.
+        let release = held && read;
         match saved {
-            Ok(()) => {
-                if held {
+            Ok(()) if read => {
+                if release {
                     let _ = self.gateway().restart(&name);
                 }
-                Library::load(&self.env)
-                    .map(drop)
-                    .context("saved, but the library can't be read")
+                Ok(())
+            }
+            Ok(()) => {
+                let message = format!(
+                    "saved, but the library can't be read; {name} stays disconnected until it \
+                     is fixed and the server is restarted"
+                );
+                if held {
+                    self.gateway().fail(&name, &message);
+                }
+                Err(anyhow::anyhow!(message))
             }
             // Put back as it was: connect again as before.
             Err((error, true)) => {
-                if held {
+                if release {
                     let _ = self.gateway().restart(&name);
+                } else if held {
+                    self.gateway()
+                        .fail(&name, "the library can't be read; restart once it is fixed");
                 }
                 Err(error)
             }
             // Settings and secrets may not match: stay disconnected until saved again.
-            Err((error, false)) => Err(error.context(format!(
-                "{name} stays disconnected: its secrets couldn't be put back as they \
-                 were; save the server again"
-            ))),
+            Err((error, false)) => {
+                let message = format!(
+                    "{name} stays disconnected: its secrets couldn't be put back as they \
+                     were; save the server again"
+                );
+                if held {
+                    self.gateway().fail(&name, &message);
+                }
+                Err(error.context(message))
+            }
         }
     }
 

@@ -211,6 +211,17 @@ impl Gateway {
         true
     }
 
+    /// Leaves a held server disconnected with `message`. Unlike stopped by hand, the next save
+    /// holds it again and connects it.
+    pub(crate) fn fail(&self, name: &str, message: &str) {
+        if let Some(connection) = self.connections.lock().unwrap().get_mut(name) {
+            connection.state = ServerState::Failed {
+                message: message.to_owned(),
+            };
+        }
+        (self.notify)(Notice::ToolsChanged);
+    }
+
     /// Whether attempt `generation` is still the one wanted for `name`.
     fn current(&self, name: &str, generation: u64) -> bool {
         self.connections
