@@ -411,6 +411,10 @@ impl Daemon {
         secrets: Vec<(String, Option<String>)>,
         actions: Vec<xolkit_core::Action>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            xolkit_core::valid_server_name(&name),
+            "{name:?} isn't a valid server name"
+        );
         let _running = self.executing.lock().await;
         // Nothing changes while the library can't be read: the save couldn't take
         // effect, and the server's connection is left as it is.
@@ -470,7 +474,12 @@ impl Daemon {
             self.gateway().fail(&name, &stuck);
         }
         if let Err(e) = released {
-            return Err(e.context(format!("{name} stays disconnected")));
+            let e = e.context(format!("{name} stays disconnected"));
+            // A save that failed says so first.
+            return Err(match saved {
+                Err((error, _)) => error.context(format!("{e:#}")),
+                Ok(()) => e,
+            });
         }
         match saved {
             Ok(()) if read => Ok(()),
