@@ -84,29 +84,14 @@ impl Shelf {
     }
 
     /// Makes another profile the active one. What xolkit serves changes at once; plugins
-    /// installed natively are turned on and off in the agents, after a confirmation. Choosing
-    /// the profile in use sets every native plugin as it has them, which also sets right what a
-    /// switch that failed halfway left behind.
+    /// installed natively are turned on and off in the agents, after a confirmation.
     pub(super) fn switch_profile(
         &mut self,
         ix: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy {
-            return;
-        }
-        if ix == self.settings().active_index() {
-            let steps = native_steps(
-                &self.library.lock,
-                &self.library.plugins,
-                self.settings().active(),
-            );
-            let done = format!(
-                "Set plugins as “{}” has them",
-                self.settings().active().name
-            );
-            self.run(steps, Some(done.into()), window, cx);
+        if ix == self.settings().active_index() || self.busy {
             return;
         }
         let mut settings = self.settings().clone();
@@ -174,6 +159,18 @@ impl Shelf {
                     true
                 })
         });
+    }
+
+    /// Sets every native plugin as the profile in use has them, which sets right what a switch
+    /// that failed halfway left behind.
+    fn reapply_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let profile = self.settings().active();
+        let steps = native_steps(&self.library.lock, &self.library.plugins, profile);
+        let done = format!("Set plugins as “{}” has them", profile.name);
+        self.run(steps, Some(done.into()), window, cx);
     }
 
     /// Asks for a name, then adds a profile (`renaming` is `None`) or renames one.
@@ -821,7 +818,13 @@ impl Shelf {
                 (true, false) => "In use",
             })
             .disabled((active && !has_native) || self.busy)
-            .on_click(cx.listener(move |this, _, window, cx| this.switch_profile(ix, window, cx)));
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if active {
+                    this.reapply_profile(window, cx);
+                } else {
+                    this.switch_profile(ix, window, cx);
+                }
+            }));
         let note = if ix == 0 {
             "The default profile can't be renamed or removed."
         } else if active {

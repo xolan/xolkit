@@ -180,14 +180,11 @@ impl Env {
         PathBuf::from(program)
     }
 
-    /// Whether `program` is missing from the user's whole `PATH`, asked of the login shell now.
-    /// `false` when that can't be told: the shell doesn't answer, or on Windows, where a running
-    /// program can't learn of `PATH` changes made since it started.
+    /// Whether `program` is missing from the user's whole `PATH` as it is now: from the login
+    /// shell, or on Windows from the registry, as a newly started program would get it. `false`
+    /// when that can't be told.
     pub fn tool_gone(&self, program: &str) -> bool {
-        if cfg!(windows) {
-            return false;
-        }
-        let Some(login) = login_shell_path() else {
+        let Some(login) = fresh_path() else {
             return false;
         };
         let fresh = Env {
@@ -379,6 +376,71 @@ fn login_shell_path() -> Option<OsString> {
     None
 }
 
+/// The `PATH` a program started now would get.
+#[cfg(unix)]
+fn fresh_path() -> Option<OsString> {
+    login_shell_path()
+}
+
+/// The `PATH` a program started now would get: the system's and the user's from the registry,
+/// with `%VARIABLES%` expanded. A running program's own `PATH` misses changes made since.
+#[cfg(windows)]
+fn fresh_path() -> Option<OsString> {
+    use std::os::windows::process::CommandExt;
+    let read = |key: &str| -> Option<String> {
+        let output = Command::new("reg")
+            .args(["query", key, "/v", "Path"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        // `    Path    REG_EXPAND_SZ    C:\x;%USERPROFILE%\y`
+        text.lines().find_map(|line| {
+            let rest = line.trim_start().strip_prefix("Path")?.trim_start();
+            let (_kind, value) = rest.split_once(char::is_whitespace)?;
+            Some(value.trim().to_owned())
+        })
+    };
+    let system = read(r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment");
+    let user = read(r"HKCU\Environment");
+    if system.is_none() && user.is_none() {
+        return None;
+    }
+    let joined = [system, user]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(";");
+    Some(OsString::from(expand_variables(&joined)))
+}
+
+/// `text` with each `%NAME%` replaced by that environment variable, or kept when it isn't set.
+#[cfg(any(windows, test))]
+fn expand_variables(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('%') {
+            Some(end) => {
+                let name = &after[..end];
+                match std::env::var(name) {
+                    Ok(value) if !name.is_empty() => out.push_str(&value),
+                    _ => out.push_str(&rest[start..start + end + 2]),
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +461,22 @@ mod tests {
             assert_eq!(shown, "~/.xolkit/skills/s");
         }
         assert_eq!(env.tilde(Path::new("../x")), "../x");
+    }
+
+    #[test]
+    fn expands_variables_in_registry_paths() {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap();
+        let key = if std::env::var("HOME").is_ok() {
+            "HOME"
+        } else {
+            "USERPROFILE"
+        };
+        assert_eq!(
+            expand_variables(&format!("%{key}%\\bin;%NOT_SET_XK%;50%")),
+            format!("{home}\\bin;%NOT_SET_XK%;50%")
+        );
     }
 
     #[test]

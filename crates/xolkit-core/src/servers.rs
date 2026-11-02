@@ -157,6 +157,14 @@ pub fn agent_servers(env: &Env, provider: Provider) -> Result<BTreeMap<String, S
             let doc = read_toml(&env.codex_config())?;
             let json: Value = toml::from_str(&doc.to_string()).unwrap_or_default();
             for (name, entry) in json["mcp_servers"].as_object().into_iter().flatten() {
+                // Codex keeps a remote server's headers under `http_headers`.
+                let mut entry = entry.clone();
+                if entry.get("headers").is_none()
+                    && let Some(headers) = entry.get("http_headers").cloned()
+                {
+                    entry["headers"] = headers;
+                }
+                let entry = &entry;
                 let mut config = from_json(entry, None);
                 if let Some(config) = &mut config
                     && config.url.is_none()
@@ -294,13 +302,14 @@ mod tests {
         fs::create_dir_all(&env.codex_dir).unwrap();
         fs::write(
             env.codex_config(),
-            "[mcp_servers.docs]\nurl = \"https://x/mcp\"\n[mcp_servers.xolkit]\ncommand = \"x\"\n",
+            "[mcp_servers.docs]\nurl = \"https://x/mcp\"\nhttp_headers = { Authorization = \"Bearer t\" }\n[mcp_servers.xolkit]\ncommand = \"x\"\n",
         )
         .unwrap();
         let claude = agent_servers(&env, Provider::Claude).unwrap();
         assert_eq!(claude.keys().collect::<Vec<_>>(), ["fs"]);
         let codex = agent_servers(&env, Provider::Codex).unwrap();
         assert_eq!(codex["docs"].url.as_deref(), Some("https://x/mcp"));
+        assert_eq!(codex["docs"].headers["Authorization"], "Bearer t");
         assert_eq!(codex.len(), 1);
     }
 }

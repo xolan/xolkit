@@ -314,20 +314,25 @@ impl Daemon {
                 })
             }
             Request::SetSecret { key, value } => {
+                let saved = key.clone();
                 let done = tokio::task::spawn_blocking(move || set_secret(&key, value.as_deref()))
                     .await
                     .context("the keyring stopped unexpectedly")
                     .and_then(|r| r);
-                // A server waiting for the secret can try again now.
-                let waiting: Vec<String> = self
+                // Servers using the secret connect again with it, whether they waited for it,
+                // failed with an old one or run with one that just changed. Stopped ones stay so.
+                let using: Vec<String> = self
                     .gateway()
                     .status()
                     .into_iter()
-                    .filter(|s| matches!(s.state, crate::protocol::ServerState::NeedsSecret { .. }))
+                    .filter(|s| saved.starts_with(&format!("server/{}/", s.name)))
+                    .filter(|s| s.state != crate::protocol::ServerState::Stopped)
                     .map(|s| s.name)
                     .collect();
-                for name in waiting {
-                    let _ = self.gateway().restart(&name);
+                if done.is_ok() {
+                    for name in using {
+                        let _ = self.gateway().restart(&name);
+                    }
                 }
                 done
             }
