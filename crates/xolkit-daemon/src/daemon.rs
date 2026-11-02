@@ -340,7 +340,8 @@ impl Daemon {
                     .filter(|s| !self.gateway().is_held(&s.name))
                     .map(|s| s.name)
                     .collect();
-                if done.is_ok() && reconnect {
+                // Not with settings older than the library on disk, while it can't be read.
+                if done.is_ok() && reconnect && !self.broken.load(Ordering::SeqCst) {
                     for name in using {
                         let _ = self.gateway().restart(&name);
                     }
@@ -415,6 +416,7 @@ impl Daemon {
         // effect, and the server's connection is left as it is.
         Library::load(&self.env).context("the library can't be read; fix it first")?;
         // No connection may read the new secrets with the old settings, or the reverse.
+        let was_held = self.gateway().is_held(&name);
         let held = self.gateway().hold(&name);
         let env = self.env.clone();
         for action in &actions {
@@ -426,51 +428,40 @@ impl Daemon {
                 .await
                 .unwrap_or_else(|e| Err((anyhow::anyhow!("the change stopped: {e}"), false)))
         };
+        // Whether the files now hold settings and secrets that belong together: saved, or put
+        // back as they were when they did.
+        let consistent = match &saved {
+            Ok(()) => true,
+            Err((_, restored)) => *restored && !was_held,
+        };
+        // Marked before the reload, so it doesn't connect a new server that may not match.
+        let stuck = format!("{name} stays disconnected: save the server again");
+        if !consistent {
+            self.gateway().fail(&name, &stuck);
+        }
         let read = self.reload();
         self.apply();
         // The settings in use are the ones just read; if the library couldn't be read, they're
         // older ones, which mustn't meet the new secrets.
-        let release = held && read;
+        if consistent && read {
+            self.gateway().release(&name);
+            if held {
+                let _ = self.gateway().restart(&name);
+            }
+        } else if consistent {
+            self.gateway().fail(
+                &name,
+                "the library can't be read; save the server again once it is fixed",
+            );
+        }
         match saved {
-            Ok(()) if read => {
-                if release {
-                    let _ = self.gateway().restart(&name);
-                }
-                Ok(())
-            }
-            Ok(()) => {
-                let message = format!(
-                    "saved, but the library can't be read; {name} stays disconnected until it \
-                     is fixed and the server is saved again"
-                );
-                if held {
-                    self.gateway().fail(&name, &message);
-                }
-                Err(anyhow::anyhow!(message))
-            }
-            // Put back as it was: connect again as before.
-            Err((error, true)) => {
-                if release {
-                    let _ = self.gateway().restart(&name);
-                } else if held {
-                    self.gateway().fail(
-                        &name,
-                        "the library can't be read; save the server again once it is fixed",
-                    );
-                }
-                Err(error)
-            }
-            // Settings and secrets may not match: stay disconnected until saved again.
-            Err((error, false)) => {
-                let message = format!(
-                    "{name} stays disconnected: its secrets couldn't be put back as they \
-                     were; save the server again"
-                );
-                if held {
-                    self.gateway().fail(&name, &message);
-                }
-                Err(error.context(message))
-            }
+            Ok(()) if read => Ok(()),
+            Ok(()) => Err(anyhow::anyhow!(
+                "saved, but the library can't be read; {name} stays disconnected until it is \
+                 fixed and the server is saved again"
+            )),
+            Err((error, _)) if consistent => Err(error),
+            Err((error, _)) => Err(error.context(stuck)),
         }
     }
 
