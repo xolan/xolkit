@@ -4239,6 +4239,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "oauth2"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "getrandom 0.2.17",
+ "http",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
 name = "objc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5592,6 +5611,7 @@ version = "3.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8be15815186873ea063bf005011d16c356804973489e40c39116ae3a2878d1f"
 dependencies = [
+ "async-trait",
  "base64 0.23.1",
  "bytes",
  "chrono",
@@ -5599,6 +5619,7 @@ dependencies = [
  "http",
  "indexmap",
  "libc",
+ "oauth2",
  "pastey 0.2.3",
  "pin-project-lite",
  "process-wrap",
@@ -5612,6 +5633,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -6105,6 +6127,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -7215,6 +7248,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]
@@ -8608,7 +8642,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xolkit"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -8625,7 +8659,7 @@ dependencies = [
 
 [[package]]
 name = "xolkit-core"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8650,17 +8684,20 @@ dependencies = [
 
 [[package]]
 name = "xolkit-daemon"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "http",
  "interprocess",
  "libc",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "url",
  "widestring",
  "xolkit-core",
 ]

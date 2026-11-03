@@ -481,7 +481,8 @@ impl Shelf {
             self.hits.clear();
             self.search_error = None;
         }
-        if page == Page::Connections {
+        // Servers shows their state too: a sign-in finishes in the browser, not here.
+        if page == Page::Connections || page == Page::Servers {
             self.watch_status(cx);
         } else {
             self.status_task = None;

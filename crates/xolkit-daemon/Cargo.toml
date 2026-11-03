@@ -6,9 +6,11 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 http = "1"
 interprocess = { version = "2", features = ["tokio"] }
 rmcp = { version = "3.8", default-features = false, features = [
+  "auth",
   "server",
   "client",
   "reqwest",
@@ -17,9 +19,12 @@ rmcp = { version = "3.8", default-features = false, features = [
   "transport-io",
   "transport-streamable-http-client-reqwest",
 ] }
+# The client rmcp uses, for its OAuth transport.
+reqwest = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "net", "rt-multi-thread", "sync", "time"] }
+url = "2"
 xolkit-core = { path = "../xolkit-core" }
 
 [target.'cfg(windows)'.dependencies]

@@ -100,6 +100,12 @@ pub fn secret_key(name: &str, key: &str) -> String {
     format!("server/{name}/{key}")
 }
 
+/// The keyring entry holding the OAuth tokens of server `name`, from signing in to it. Apart from
+/// `secret_key`'s entries, so no header or variable can be taken for it.
+pub fn oauth_key(name: &str) -> String {
+    format!("oauth/{name}")
+}
+
 /// Letters, digits, `-` and `_`, up to 32 characters: it goes into tool names, which agents
 /// limit to 64 characters.
 pub fn valid_server_name(name: &str) -> bool {

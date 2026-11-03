@@ -29,6 +29,7 @@ fn state_label(state: &ServerState) -> String {
         ServerState::Starting => "connecting".to_owned(),
         ServerState::Running => "connected".to_owned(),
         ServerState::NeedsSecret { key } => format!("needs {key}"),
+        ServerState::NeedsSignIn => "needs sign-in".to_owned(),
         ServerState::Failed { .. } => "failed".to_owned(),
         ServerState::Stopped => "stopped".to_owned(),
     }
@@ -65,7 +66,7 @@ impl Shelf {
         .detach();
     }
 
-    /// Keeps the status fresh while the Connections page is open.
+    /// Keeps the status fresh while the Connections or MCP servers page is open.
     pub(super) fn watch_status(&mut self, cx: &mut Context<Self>) {
         self.status_task = Some(cx.spawn(async move |this, cx| {
             loop {

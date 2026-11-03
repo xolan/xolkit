@@ -117,6 +117,23 @@ impl Client {
         }
     }
 
+    /// Starts signing in to server `name`; returns the page to open in a browser.
+    pub fn sign_in(&mut self, name: &str) -> Result<String> {
+        let request = Request::SignIn {
+            name: name.to_owned(),
+        };
+        match self.request(&request)? {
+            Response::SignIn { page } => Ok(page),
+            // A daemon from before sign-ins, still running for agent sessions.
+            Response::Error { message } if message.contains("unknown variant `signIn`") => bail!(
+                "the xolkit daemon running is older than the app; restart it under \
+                 Connections, then sign in again"
+            ),
+            Response::Error { message } => bail!(message),
+            other => bail!("unexpected answer: {other:?}"),
+        }
+    }
+
     /// Drops the connection, so the daemon can count the app as gone.
     pub fn disconnect(&mut self) {
         self.connection = None;

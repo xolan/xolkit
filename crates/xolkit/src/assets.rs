@@ -18,7 +18,7 @@ pub const FONTS: &[&[u8]] = &[
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
-        Puzzle, Store, Trash, Download, Lock, Layers, Pencil, Server, Activity
+        Puzzle, Store, Trash, Download, Lock, Layers, Pencil, Server, Activity, LogOut
     ]
 );
 

@@ -103,8 +103,12 @@ as `<server>__<tool>`; in Claude Code that reads `mcp__xolkit__github__create_is
 you already set up in Claude Code or Codex stay there; **Copy from agents** adds copies to xolkit,
 moving their values into the OS keyring.
 
-Remote servers take headers, such as `Authorization: Bearer …`. Sign-in in a browser (OAuth)
-isn't supported yet.
+Remote servers take headers, such as `Authorization: Bearer …`, or a sign-in in a browser
+(OAuth). A remote server without secrets that asks for a sign-in shows **needs sign-in**;
+**Sign in** on its page opens your browser, and xolkit keeps the tokens in the OS keyring,
+renews them, and sends them only to the URL they were given for. **Sign out** forgets them.
+xolkit registers itself with the server's sign-in on its own, so servers that need a client ID
+set up by hand aren't supported yet.
 
 ### Profiles
 
@@ -152,7 +156,7 @@ Download `xolkit-<version>-<arch>-unknown-linux-gnu.tar.gz` and its `.sha256` fr
 you picked and run:
 
 ```bash
-version=3.1.0
+version=3.2.0
 name=xolkit-$version-$(uname -m)-unknown-linux-gnu
 sha256sum -c "$name.tar.gz.sha256" &&
   tar -xzf "$name.tar.gz" &&

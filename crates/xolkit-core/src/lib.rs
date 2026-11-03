@@ -41,7 +41,8 @@ pub use registration::{
 };
 pub use secrets::{GITHUB_TOKEN, get_secret, set_secret};
 pub use servers::{
-    Server, ServerConfig, XOLKIT, agent_servers, read_servers, secret_key, valid_server_name,
+    Server, ServerConfig, XOLKIT, agent_servers, oauth_key, read_servers, secret_key,
+    valid_server_name,
 };
 pub use settings::{DEFAULT_PROFILE, GitHubAccess, Settings};
 pub use share::{

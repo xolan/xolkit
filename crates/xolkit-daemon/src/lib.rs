@@ -2,8 +2,11 @@
 
 mod client;
 mod daemon;
+#[cfg(test)]
+mod fake_oauth;
 mod gateway;
 mod ipc;
+mod oauth;
 mod protocol;
 mod session;
 mod shim;
