@@ -16,7 +16,6 @@ use crate::{Action, Env};
 const USER_AGENT: &str = concat!("xolkit/", env!("CARGO_PKG_VERSION"));
 /// A GET request to GitHub, and its answer.
 pub(crate) type Request = ureq::RequestBuilder<ureq::typestate::WithoutBody>;
-pub(crate) type Response = ureq::http::Response<ureq::Body>;
 /// How long a request to GitHub may take.
 const WAIT: Duration = Duration::from_secs(60);
 /// How long a repository's archive may take to download.
@@ -687,6 +686,9 @@ pub(crate) fn github(token: Option<&str>, url: &str) -> Request {
         .header("User-Agent", USER_AGENT)
         .config()
         .timeout_global(Some(WAIT))
+        // A renamed repository's API answers redirect within the API, where the token is still
+        // needed; the archive's redirect to codeload goes elsewhere and drops it.
+        .redirect_auth_headers(ureq::config::RedirectAuthHeaders::SameHost)
         .build();
     // Only the API needs the token; never send it anywhere else.
     match token {
@@ -698,44 +700,48 @@ pub(crate) fn github(token: Option<&str>, url: &str) -> Request {
 }
 
 /// Sends `request` to GitHub; `token` says whether it carries one. A failure says what it means.
-pub(crate) fn call(request: Request, token: Option<&str>) -> Result<Response> {
+pub(crate) fn call(
+    request: Request,
+    token: Option<&str>,
+) -> Result<ureq::http::Response<ureq::Body>> {
     request.call().map_err(|e| refused(e, token.is_some()))
 }
 
 /// What GitHub refusing a request means, in words; `token` says whether it carried one.
 fn refused(error: ureq::Error, token: bool) -> anyhow::Error {
-    match (error, token) {
-        (ureq::Error::StatusCode(401), true) => {
-            anyhow!("GitHub rejected the token: it is invalid or has expired")
+    let said = match error {
+        ureq::Error::StatusCode(401) if token => {
+            "GitHub rejected the token: it is invalid or has expired"
         }
-        (ureq::Error::StatusCode(403 | 429), true) => anyhow!(
-            "GitHub refused the request: the token can't read the repository, or its rate limit \
-             is used up"
-        ),
-        (ureq::Error::StatusCode(403 | 429), false) => anyhow!(
+        ureq::Error::StatusCode(403 | 429) if token => {
+            "GitHub refused the request: the token can't read the repository, or its rate limit is \
+             used up"
+        }
+        ureq::Error::StatusCode(403 | 429) => {
             "GitHub refused the request: without a token it allows 60 requests an hour, which may \
              be used up; add one in Settings"
-        ),
-        (ureq::Error::StatusCode(404), true) => {
-            anyhow!("GitHub found nothing there, or the token can't read the repository")
         }
-        (ureq::Error::StatusCode(404), false) => anyhow!(
+        ureq::Error::StatusCode(404) if token => {
+            "GitHub found nothing there, or the token can't read the repository"
+        }
+        ureq::Error::StatusCode(404) => {
             "GitHub found nothing there, or the repository is private and needs a token (add one \
              in Settings)"
-        ),
-        (error, _) => error.into(),
-    }
+        }
+        error => return error.into(),
+    };
+    anyhow!(said)
 }
 
 /// The file `path` of the GitHub repository `source` at `rev` (a commit, or `HEAD`): from the
-/// raw host, or with a token from the API, which serves private repositories too.
+/// raw host, or with a token from the API, which serves private repositories too. Callers have
+/// checked `source`.
 pub(crate) fn read_file(
     source: &str,
     rev: &str,
     path: &str,
     token: Option<&str>,
 ) -> Result<String> {
-    check_source(source)?;
     let url = match token {
         Some(_) => format!("https://api.github.com/repos/{source}/contents/{path}?ref={rev}"),
         None => format!("https://raw.githubusercontent.com/{source}/{rev}/{path}"),
@@ -849,17 +855,14 @@ mod tests {
             if *kind == tar::EntryType::Symlink {
                 header.set_link_name("../../etc/passwd").unwrap();
             }
-            // The name as given, without the builder's checks.
-            let name = &mut header.as_old_mut().name;
-            name[..path.len()].copy_from_slice(path.as_bytes());
-            header.set_cksum();
-            builder.append(&header, *data).unwrap();
+            builder.append_data(&mut header, path, *data).unwrap();
         }
         builder.into_inner().unwrap().finish().unwrap()
     }
 
     /// Only the wanted folder is unpacked, so the rest of the repository can't get in the way:
-    /// here a file and a folder of one name, and a link Windows would refuse to make.
+    /// here a file and a folder of one name, and a link Windows would refuse to make. A name
+    /// beyond ASCII comes out as it went in.
     #[test]
     fn extracts_only_the_skill_folder() {
         let home = tempfile::tempdir().unwrap();
@@ -874,6 +877,11 @@ mod tests {
                 b"---\nname: a\n---\n",
             ),
             (
+                "repo-abc/skills/a/références.md",
+                tar::EntryType::Regular,
+                b"x",
+            ),
+            (
                 "repo-abc/skills/a/scripts/run.sh",
                 tar::EntryType::Regular,
                 b"echo",
@@ -885,8 +893,8 @@ mod tests {
             ),
         ]);
         let files = extract(&archive[..], Some("skills/a"), &dest, MAX_SKILL).unwrap();
-        assert_eq!(files, ["SKILL.md", "scripts/run.sh"]);
-        assert!(dest.join("scripts/run.sh").is_file());
+        assert_eq!(files, ["SKILL.md", "références.md", "scripts/run.sh"]);
+        assert!(dest.join("références.md").is_file());
         assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
         // A skill at the top of its repository.
         let root = tarball(&[("repo-abc/SKILL.md", tar::EntryType::Regular, b"x")]);
