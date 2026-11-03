@@ -3,8 +3,9 @@
 //! app only opens the page. Tokens go to the OS keyring, bound to the server's URL, and rmcp
 //! refreshes them as they run out.
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -53,27 +54,62 @@ struct Saved {
     credentials: StoredCredentials,
 }
 
+/// The longest piece of tokens kept in one keyring entry: Windows holds 2560 bytes in one, and
+/// keeps text as UTF-16.
+const CHUNK: usize = 1000;
+
+/// Counts sign-outs per server, so a token write begun before one (a sign-in coming back, a
+/// refresh) can't put the tokens back after it. Every read and write of tokens holds its lock.
+#[derive(Clone, Default)]
+pub(crate) struct Epochs(Arc<Mutex<HashMap<String, u64>>>);
+
+impl Epochs {
+    fn current(&self, name: &str) -> u64 {
+        self.0.lock().unwrap().get(name).copied().unwrap_or(0)
+    }
+}
+
 /// A server's tokens in the vault, bound to its URL: tokens saved for one address are never sent
-/// to another, even when a server keeps its name and changes its URL.
+/// to another, even when a server keeps its name and changes its URL. They are kept in pieces
+/// under `oauth/<name>` and `oauth/<name>/<n>`; the first says how many there are.
 #[derive(Clone)]
 pub(crate) struct Tokens {
     vault: Arc<dyn Vault>,
-    key: String,
+    epochs: Epochs,
+    name: String,
     url: String,
+    /// The sign-outs there had been when these were made; after another, they can't write.
+    epoch: u64,
 }
 
 impl Tokens {
-    pub(crate) fn new(vault: Arc<dyn Vault>, name: &str, url: &str) -> Tokens {
+    pub(crate) fn new(vault: Arc<dyn Vault>, epochs: Epochs, name: &str, url: &str) -> Tokens {
+        let epoch = epochs.current(name);
         Tokens {
             vault,
-            key: oauth_key(name),
+            epochs,
+            name: name.to_owned(),
             url: url.to_owned(),
+            epoch,
         }
+    }
+
+    /// Forgets server `name`'s tokens, and stops any write under way from putting them back.
+    /// Blocks.
+    pub(crate) fn forget(vault: &dyn Vault, epochs: &Epochs, name: &str) -> Result<()> {
+        let mut epochs = epochs.0.lock().unwrap();
+        *epochs.entry(name.to_owned()).or_default() += 1;
+        delete(vault, &oauth_key(name))
     }
 
     /// The saved credentials, if they are for this URL. Blocks.
     fn read(&self) -> Result<Option<StoredCredentials>> {
-        let Some(text) = self.vault.get(&self.key)? else {
+        let _lock = self.epochs.0.lock().unwrap();
+        self.read_locked()
+    }
+
+    fn read_locked(&self) -> Result<Option<StoredCredentials>> {
+        let Some(text) = read(self.vault.as_ref(), &oauth_key(&self.name))? else {
             return Ok(None);
         };
         // Something unreadable is as good as nothing: signing in again replaces it.
@@ -83,14 +119,20 @@ impl Tokens {
             .map(|saved| saved.credentials))
     }
 
+    /// Runs `write` unless the server has been signed out of since these were made. Blocks.
+    fn write(&self, write: impl FnOnce(&Tokens) -> Result<()>) -> Result<()> {
+        let epochs = self.epochs.0.lock().unwrap();
+        anyhow::ensure!(
+            epochs.get(&self.name).copied().unwrap_or(0) == self.epoch,
+            "signed out of {} meanwhile",
+            self.name
+        );
+        write(self)
+    }
+
     /// Whether there is a token to connect with. Blocks.
     pub(crate) fn signed_in(&self) -> Result<bool> {
         Ok(self.read()?.is_some_and(|c| c.token_response.is_some()))
-    }
-
-    /// Forgets the tokens. Blocks.
-    pub(crate) fn clear_now(&self) -> Result<()> {
-        self.vault.set(&self.key, None)
     }
 
     async fn blocking<T: Send + 'static>(
@@ -105,6 +147,60 @@ impl Tokens {
     }
 }
 
+/// The text kept in pieces under `key`, if it is all there.
+fn read(vault: &dyn Vault, key: &str) -> Result<Option<String>> {
+    let Some(head) = vault.get(key)? else {
+        return Ok(None);
+    };
+    let Some((count, mut text)) = head
+        .split_once('\n')
+        .and_then(|(n, first)| Some((n.parse::<usize>().ok()?, first.to_owned())))
+    else {
+        return Ok(None);
+    };
+    for i in 1..count {
+        match vault.get(&format!("{key}/{i}"))? {
+            Some(piece) => text.push_str(&piece),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(text))
+}
+
+/// Keeps `text` in pieces under `key`, replacing what was there.
+fn write(vault: &dyn Vault, key: &str, text: &str) -> Result<()> {
+    let chars: Vec<char> = text.chars().collect();
+    let pieces: Vec<String> = chars.chunks(CHUNK).map(|c| c.iter().collect()).collect();
+    let old = count(vault, key)?;
+    // The rest first, then the first piece, which says how many to read.
+    for (i, piece) in pieces.iter().enumerate().skip(1) {
+        vault.set(&format!("{key}/{i}"), Some(piece))?;
+    }
+    let first = pieces.first().map(String::as_str).unwrap_or_default();
+    vault.set(key, Some(&format!("{}\n{first}", pieces.len().max(1))))?;
+    for i in pieces.len().max(1)..old {
+        vault.set(&format!("{key}/{i}"), None)?;
+    }
+    Ok(())
+}
+
+fn delete(vault: &dyn Vault, key: &str) -> Result<()> {
+    let old = count(vault, key)?;
+    vault.set(key, None)?;
+    for i in 1..old {
+        vault.set(&format!("{key}/{i}"), None)?;
+    }
+    Ok(())
+}
+
+/// How many pieces are kept under `key`.
+fn count(vault: &dyn Vault, key: &str) -> Result<usize> {
+    Ok(vault
+        .get(key)?
+        .and_then(|head| head.split_once('\n')?.0.parse().ok())
+        .unwrap_or(1))
+}
+
 #[async_trait]
 impl CredentialStore for Tokens {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
@@ -117,12 +213,13 @@ impl CredentialStore for Tokens {
             credentials,
         })
         .map_err(|e| AuthError::CredentialStoreError(e.to_string()))?;
-        self.blocking(move |t| t.vault.set(&t.key, Some(&text)))
+        self.blocking(move |t| t.write(|t| write(t.vault.as_ref(), &oauth_key(&t.name), &text)))
             .await
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
-        self.blocking(Tokens::clear_now).await
+        self.blocking(|t| t.write(|t| delete(t.vault.as_ref(), &oauth_key(&t.name))))
+            .await
     }
 
     /// The authorization server won't refresh them any more: forget them, unless a sign-in has
@@ -133,10 +230,12 @@ impl CredentialStore for Tokens {
     ) -> Result<(), AuthError> {
         let rejected = serde_json::to_value(rejected).ok();
         self.blocking(move |t| {
-            if t.read()?.and_then(|c| serde_json::to_value(c).ok()) == rejected {
-                t.clear_now()?;
-            }
-            Ok(())
+            t.write(|t| {
+                if t.read_locked()?.and_then(|c| serde_json::to_value(c).ok()) == rejected {
+                    delete(t.vault.as_ref(), &oauth_key(&t.name))?;
+                }
+                Ok(())
+            })
         })
         .await
     }
@@ -173,6 +272,8 @@ pub(crate) struct SignIn {
     pub(crate) page: String,
     listener: TcpListener,
     state: OAuthState,
+    /// The `state` the page carries, which the browser brings back.
+    csrf: String,
 }
 
 /// Finds the authorization server of the MCP server at `url`, registers xolkit with it, and
@@ -215,10 +316,18 @@ pub(crate) async fn start(url: &str, challenge: Option<&str>, tokens: Tokens) ->
         .get_authorization_url()
         .await
         .context("could not start the sign-in")?;
+    // The app hands the page to the OS to open: a web page, nothing else a server may name.
+    let parsed = url::Url::parse(&page).context("the server's sign-in page isn't a URL")?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "https" | "http"),
+        "the server's sign-in page isn't a web page: {page}"
+    );
+    let csrf = query(&page, "state").context("the sign-in page carries no state")?;
     Ok(SignIn {
         page,
         listener,
         state,
+        csrf,
     })
 }
 
@@ -236,6 +345,17 @@ impl SignIn {
                     continue;
                 };
                 let url = format!("http://127.0.0.1{target}");
+                // Only the browser coming back from this sign-in's page ends it: anything else
+                // on the machine could reach the port.
+                if query(&url, "state").as_deref() != Some(self.csrf.as_str()) {
+                    let _ = respond(
+                        &mut stream,
+                        "400 Bad Request",
+                        "This isn't the sign-in xolkit is waiting for.",
+                    )
+                    .await;
+                    continue;
+                }
                 let result = match query(&url, "error") {
                     Some(error) => Err(anyhow::anyhow!(
                         "{}",
@@ -318,4 +438,88 @@ fn escape(text: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fake_oauth::MemoryVault;
+    use rmcp::transport::auth::OAuthTokenResponse;
+
+    fn credentials(token: &str) -> StoredCredentials {
+        let response: OAuthTokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": token,
+            "token_type": "Bearer",
+            "refresh_token": "r",
+        }))
+        .unwrap();
+        StoredCredentials::new("client".into(), Some(response), vec![], Some(1))
+    }
+
+    fn token(credentials: Option<StoredCredentials>) -> Option<String> {
+        let value = serde_json::to_value(credentials?).unwrap();
+        Some(value["token_response"]["access_token"].as_str()?.to_owned())
+    }
+
+    #[tokio::test]
+    async fn long_tokens_are_kept_in_pieces_each_a_keyring_entry_holds() {
+        let vault = Arc::new(MemoryVault::default());
+        let tokens = Tokens::new(vault.clone(), Epochs::default(), "s", "https://x/mcp");
+        // A JWT-sized token, past what one Windows credential holds.
+        let long = "é".repeat(2600);
+        tokens.save(credentials(&long)).await.unwrap();
+        let entries = vault.0.lock().unwrap().clone();
+        assert!(entries.len() >= 3, "{:?}", entries.keys());
+        assert!(
+            entries
+                .values()
+                .all(|v| v.encode_utf16().count() * 2 <= 2560)
+        );
+        assert_eq!(token(tokens.load().await.unwrap()), Some(long));
+
+        // A shorter one takes the place of all of it.
+        tokens.save(credentials("short")).await.unwrap();
+        assert_eq!(vault.0.lock().unwrap().len(), 1);
+        assert_eq!(
+            token(tokens.load().await.unwrap()).as_deref(),
+            Some("short")
+        );
+
+        // Not for another URL.
+        let moved = Tokens::new(vault.clone(), Epochs::default(), "s", "https://y/mcp");
+        assert!(moved.load().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_save_under_way_cant_undo_a_sign_out() {
+        let vault = Arc::new(MemoryVault::default());
+        let epochs = Epochs::default();
+        let tokens = Tokens::new(vault.clone(), epochs.clone(), "s", "https://x/mcp");
+        tokens.save(credentials(&"t".repeat(2500))).await.unwrap();
+        Tokens::forget(vault.as_ref(), &epochs, "s").unwrap();
+        assert!(vault.0.lock().unwrap().is_empty());
+        // A sign-in coming back, or a refresh, after the sign-out.
+        assert!(tokens.save(credentials("late")).await.is_err());
+        assert!(vault.0.lock().unwrap().is_empty());
+        // A sign-in started after it saves.
+        let fresh = Tokens::new(vault.clone(), epochs, "s", "https://x/mcp");
+        fresh.save(credentials("new")).await.unwrap();
+        assert_eq!(token(fresh.load().await.unwrap()).as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn opens_nothing_but_a_web_page() {
+        let fake = crate::fake_oauth::start_with(Some("file:///etc/passwd")).await;
+        let tokens = Tokens::new(
+            Arc::new(MemoryVault::default()),
+            Epochs::default(),
+            "fake",
+            &fake.url,
+        );
+        let refused = start(&fake.url, None, tokens).await.err().unwrap();
+        assert!(
+            format!("{refused:#}").contains("isn't a web page"),
+            "{refused:#}"
+        );
+    }
 }

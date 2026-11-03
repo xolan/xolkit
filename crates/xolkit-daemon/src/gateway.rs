@@ -17,7 +17,7 @@ use rmcp::{ClientHandler, RoleClient, ServiceExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use xolkit_core::{Env, Server, ServerConfig, get_secret, secret_key};
 
-use crate::oauth::{self, Keyring, Tokens, Vault};
+use crate::oauth::{self, Epochs, Keyring, Tokens, Vault};
 use crate::protocol::{ServerState, ServerStatus};
 
 /// How long a server gets to start and list its tools.
@@ -89,6 +89,8 @@ pub(crate) struct Gateway {
     env: Env,
     /// Holds remote servers' OAuth tokens.
     vault: Arc<dyn Vault>,
+    /// Sign-outs, so a token write begun before one can't undo it.
+    epochs: Epochs,
 }
 
 /// Hears a server's notifications.
@@ -124,6 +126,7 @@ impl Gateway {
             notify,
             env,
             vault: Arc::new(Keyring),
+            epochs: Epochs::default(),
         }
     }
 
@@ -426,7 +429,8 @@ impl Gateway {
                 // to connect without, as it did before it was signed in to.
                 let tokens = match &config.url {
                     Some(url) if signs_in(&config) => {
-                        let tokens = Tokens::new(gateway.vault.clone(), &name, url);
+                        let tokens =
+                            Tokens::new(gateway.vault.clone(), gateway.epochs.clone(), &name, url);
                         match tokens.signed_in() {
                             Ok(signed_in) => signed_in.then_some(tokens),
                             Err(e) => {
@@ -695,15 +699,15 @@ impl Gateway {
         Ok((
             url.clone(),
             connection.challenge.clone(),
-            Tokens::new(self.vault.clone(), name, url),
+            Tokens::new(self.vault.clone(), self.epochs.clone(), name, url),
         ))
     }
 
-    /// Forgets the OAuth tokens of `name`.
+    /// Forgets the OAuth tokens of `name`, and stops a sign-in or refresh under way from saving
+    /// any again.
     pub(crate) async fn sign_out(&self, name: &str) -> Result<()> {
-        let vault = self.vault.clone();
-        let key = xolkit_core::oauth_key(name);
-        tokio::task::spawn_blocking(move || vault.set(&key, None))
+        let (vault, epochs, server) = (self.vault.clone(), self.epochs.clone(), name.to_owned());
+        tokio::task::spawn_blocking(move || Tokens::forget(vault.as_ref(), &epochs, &server))
             .await
             .context("the keyring stopped unexpectedly")??;
         if let Some(c) = self.connections.lock().unwrap().get_mut(name) {
@@ -779,6 +783,7 @@ fn with_secrets(name: &str, config: &ServerConfig) -> Result<ServerConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fake_oauth::MemoryVault;
     use xolkit_core::ServerConfig;
 
     fn state(gateway: &Gateway) -> ServerState {
@@ -821,24 +826,6 @@ mod tests {
         assert!(!gateway.is_held("a"));
         assert_eq!(state(&gateway), ServerState::Starting);
         assert_eq!(gateway.connections.lock().unwrap()["a"].server, server("3"));
-    }
-
-    #[derive(Default)]
-    struct MemoryVault(Mutex<HashMap<String, String>>);
-
-    impl Vault for MemoryVault {
-        fn get(&self, key: &str) -> Result<Option<String>> {
-            Ok(self.0.lock().unwrap().get(key).cloned())
-        }
-
-        fn set(&self, key: &str, value: Option<&str>) -> Result<()> {
-            let mut entries = self.0.lock().unwrap();
-            match value {
-                Some(value) => entries.insert(key.to_owned(), value.to_owned()),
-                None => entries.remove(key),
-            };
-            Ok(())
-        }
     }
 
     async fn settle(gateway: &Gateway) -> ServerState {
@@ -885,6 +872,23 @@ mod tests {
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .unwrap();
+        // Something else on the machine finds the port: turned away, and the sign-in waits on.
+        let redirect = url::Url::parse(&page).unwrap();
+        let callback = redirect
+            .query_pairs()
+            .find(|(k, _)| k == "redirect_uri")
+            .unwrap()
+            .1
+            .into_owned();
+        for stray in ["?error=access_denied", "?code=x&state=forged"] {
+            let answer = browser
+                .get(format!("{callback}{stray}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(answer.status(), 400);
+        }
+        assert!(!finished.is_finished());
         let back = browser.get(&page).send().await.unwrap();
         assert_eq!(back.status(), 200);
         assert!(back.text().await.unwrap().contains("Signed in"));

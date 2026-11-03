@@ -124,6 +124,11 @@ impl Client {
         };
         match self.request(&request)? {
             Response::SignIn { page } => Ok(page),
+            // A daemon from before sign-ins, still running for agent sessions.
+            Response::Error { message } if message.contains("unknown variant `signIn`") => bail!(
+                "the xolkit daemon running is older than the app; restart it under \
+                 Connections, then sign in again"
+            ),
             Response::Error { message } => bail!(message),
             other => bail!("unexpected answer: {other:?}"),
         }

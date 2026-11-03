@@ -17,7 +17,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use xolkit_core::{
-    Action as Step, Kind, Provider, Server, ServerConfig, agent_servers, oauth_key, secret_key,
+    Action as Step, Kind, Provider, Server, ServerConfig, agent_servers, secret_key,
     valid_server_name,
 };
 use xolkit_daemon::{Request, ServerState, ServerStatus};
@@ -724,11 +724,11 @@ impl Shelf {
                 settings: Box::new(settings),
             },
         ];
-        let mut secrets: Vec<String> = config.secrets.iter().map(|k| secret_key(name, k)).collect();
-        // And its tokens, if it was signed in to.
-        if config.is_remote() {
-            secrets.push(oauth_key(name));
-        }
+        let secrets: Vec<String> = config.secrets.iter().map(|k| secret_key(name, k)).collect();
+        // And its tokens, if it was signed in to, along with any sign-in still waiting.
+        let sign_out = config.is_remote().then(|| Request::SignOut {
+            name: name.to_owned(),
+        });
         let client = settings::client(cx);
         self.busy = true;
         let done = format!("Removed {name}");
@@ -745,6 +745,9 @@ impl Shelf {
                                 reconnect: false,
                             },
                         )?;
+                    }
+                    if let Some(sign_out) = sign_out {
+                        settings::call(&client, sign_out)?;
                     }
                     anyhow::Ok(())
                 })

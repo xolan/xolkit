@@ -4,9 +4,30 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use anyhow::Result;
+
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+/// Tokens in memory, for tests, not the OS keyring.
+#[derive(Default)]
+pub(crate) struct MemoryVault(pub(crate) Mutex<HashMap<String, String>>);
+
+impl crate::oauth::Vault for MemoryVault {
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.0.lock().unwrap().get(key).cloned())
+    }
+
+    fn set(&self, key: &str, value: Option<&str>) -> Result<()> {
+        let mut entries = self.0.lock().unwrap();
+        match value {
+            Some(value) => entries.insert(key.to_owned(), value.to_owned()),
+            None => entries.remove(key),
+        };
+        Ok(())
+    }
+}
 
 /// The access token it hands out, and the only one its MCP endpoint takes.
 pub(crate) const TOKEN: &str = "fake-access-token";
@@ -27,6 +48,12 @@ struct HttpRequest {
 }
 
 pub(crate) async fn start() -> FakeServer {
+    start_with(None).await
+}
+
+/// A fake whose metadata names `authorize` as its sign-in page, when given.
+pub(crate) async fn start_with(authorize: Option<&str>) -> FakeServer {
+    let authorize = authorize.map(str::to_owned);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let registrations = Arc::new(Mutex::new(0));
@@ -39,18 +66,24 @@ pub(crate) async fn start() -> FakeServer {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let (base, registrations) = (base.clone(), registrations.clone());
+            let (base, registrations, authorize) =
+                (base.clone(), registrations.clone(), authorize.clone());
             tokio::spawn(async move {
-                let _ = serve(stream, &base, &registrations).await;
+                let _ = serve(stream, &base, &registrations, authorize.as_deref()).await;
             });
         }
     });
     fake
 }
 
-async fn serve(mut stream: TcpStream, base: &str, registrations: &Mutex<usize>) -> Option<()> {
+async fn serve(
+    mut stream: TcpStream,
+    base: &str,
+    registrations: &Mutex<usize>,
+    authorize: Option<&str>,
+) -> Option<()> {
     let request = read(&mut stream).await?;
-    let (status, headers, body) = answer(&request, base, registrations);
+    let (status, headers, body) = answer(&request, base, registrations, authorize);
     let mut head = format!(
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
@@ -68,6 +101,7 @@ fn answer(
     request: &HttpRequest,
     base: &str,
     registrations: &Mutex<usize>,
+    authorize: Option<&str>,
 ) -> (&'static str, Vec<(&'static str, String)>, String) {
     let json_headers = vec![("Content-Type", "application/json".to_owned())];
     let ok = |body: Value| ("200 OK", json_headers.clone(), body.to_string());
@@ -78,7 +112,9 @@ fn answer(
         })),
         ("GET", path) if path.starts_with("/.well-known/oauth-authorization-server") => ok(json!({
             "issuer": base,
-            "authorization_endpoint": format!("{base}/authorize"),
+            "authorization_endpoint": authorize
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{base}/authorize")),
             "token_endpoint": format!("{base}/token"),
             "registration_endpoint": format!("{base}/register"),
             "response_types_supported": ["code"],

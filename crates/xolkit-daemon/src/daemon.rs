@@ -392,16 +392,8 @@ impl Daemon {
                 match self.gateway().sign_out(&name).await {
                     Ok(()) => {
                         self.event(&name, "signed out", false);
-                        // Off the tokens it was connected with. One stopped by hand stays so,
-                        // and one no agent has on has nothing to reconnect.
-                        let connected = self.gateway().status().iter().any(|s| {
-                            s.name == name && s.state != crate::protocol::ServerState::Stopped
-                        });
-                        if connected {
-                            self.restart_server(&name).await
-                        } else {
-                            Ok(())
-                        }
+                        // Off the tokens it was connected with.
+                        self.reconnect_if_on(&name).await
                     }
                     Err(e) => Err(e),
                 }
@@ -465,6 +457,21 @@ impl Daemon {
         }
     }
 
+    /// Reconnects to server `name` after its tokens changed. One stopped by hand stays so, and
+    /// one no agent has on has nothing to reconnect.
+    async fn reconnect_if_on(&self, name: &str) -> Result<()> {
+        let on = self
+            .gateway()
+            .status()
+            .iter()
+            .any(|s| s.name == name && s.state != crate::protocol::ServerState::Stopped);
+        if on {
+            self.restart_server(name).await
+        } else {
+            Ok(())
+        }
+    }
+
     /// Starts signing in to server `name` and returns the page to open; see `Request::SignIn`.
     async fn sign_in(self: &Arc<Self>, name: String) -> Result<String> {
         let (url, challenge, tokens) = self.gateway().sign_in_target(&name)?;
@@ -478,7 +485,7 @@ impl Daemon {
             match sign_in.finish().await {
                 Ok(()) => {
                     daemon.event(&server, "signed in", false);
-                    if let Err(e) = daemon.restart_server(&server).await {
+                    if let Err(e) = daemon.reconnect_if_on(&server).await {
                         daemon.event(&server, format!("{e:#}"), true);
                     }
                 }
