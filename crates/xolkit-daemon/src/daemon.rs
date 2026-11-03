@@ -35,6 +35,8 @@ const MAX_EVENTS: usize = 500;
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 /// Longest line a control connection may send: a plan of actions with a profile's settings.
 const MAX_CONTROL_LINE: usize = 16 * 1024 * 1024;
+/// Longest a stopping daemon waits for a refused app connection's request.
+const REFUSED_READ: Duration = Duration::from_secs(5);
 /// How long the daemon waits after a session ends before it asks whether the shim still runs:
 /// one that ends because its agent did takes a moment to exit.
 const SHIM_EXIT: Duration = Duration::from_secs(1);
@@ -529,8 +531,18 @@ impl Daemon {
                     stopping
                 };
                 if refused {
-                    // Said, so the app knows nothing ran and connects to the next daemon.
-                    let mut send = send;
+                    // Said, so the app knows nothing ran and connects to the next daemon; said in
+                    // answer to its request, once that is read, as the app writes its request
+                    // first and would find the connection gone.
+                    let (mut reader, mut send) = (reader, send);
+                    let mut request = String::new();
+                    let _ = tokio::time::timeout(
+                        REFUSED_READ,
+                        (&mut reader)
+                            .take(MAX_CONTROL_LINE as u64)
+                            .read_line(&mut request),
+                    )
+                    .await;
                     let line = serde_json::to_string(&Response::Stopping)? + "\n";
                     send.write_all(line.as_bytes()).await?;
                     send.flush().await?;
