@@ -122,7 +122,7 @@ pub(crate) async fn connect_or_start(env: &Env, exe: &Path) -> Result<AsyncStrea
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
         tick += 1;
-        if tick % RESTART_EVERY == 0 {
+        if tick.is_multiple_of(RESTART_EVERY) {
             start(exe)?;
         }
         match connect_async(env).await {
@@ -148,7 +148,7 @@ pub(crate) fn connect_or_start_blocking(env: &Env, exe: &Path) -> Result<Stream>
     loop {
         std::thread::sleep(Duration::from_millis(100));
         tick += 1;
-        if tick % RESTART_EVERY == 0 {
+        if tick.is_multiple_of(RESTART_EVERY) {
             start(exe)?;
         }
         match connect() {
