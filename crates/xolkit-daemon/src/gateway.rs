@@ -374,6 +374,7 @@ impl Gateway {
                 Ok((service, tools, pid)) => {
                     gateway.log(&name, format!("connected, {} tools", tools.len()), false);
                     connection.state = ServerState::Running;
+                    connection.challenge = None;
                     connection.service = Some(Arc::new(service));
                     connection.tools = tools;
                     connection.pid = pid;
