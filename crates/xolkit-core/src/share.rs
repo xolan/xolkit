@@ -278,11 +278,10 @@ pub fn read_export(env: &Env, path: &Path) -> Result<(Shared, PathBuf)> {
         "the file is larger than {} MB",
         MAX_FILE >> 20
     );
-    // `extract` drops the archive's first folder, as GitHub wraps everything in one.
-    let wrapped = wrap_in_folder(path)?;
+    let file =
+        fs::File::open(path).with_context(|| format!("could not read {}", path.display()))?;
     let dest = env.staging_dir().join(unique());
-    fs::create_dir_all(&dest)?;
-    let result = extract(&wrapped[..], "", &dest, MAX_FILE).and_then(|_| {
+    let result = extract(file, None, &dest, MAX_FILE).and_then(|_| {
         let json = fs::read(dest.join("profile.json")).context("the file has no profile")?;
         let shared: Shared = serde_json::from_slice(&json).context("the profile is damaged")?;
         shared.check()?;
@@ -301,40 +300,6 @@ pub fn read_export(env: &Env, path: &Path) -> Result<(Shared, PathBuf)> {
             Err(e)
         }
     }
-}
-
-/// Most entries a `.xolkit` file may hold.
-const MAX_ENTRIES: usize = 10_000;
-
-/// The `.xolkit` archive re-packed under one top folder, the shape `extract` reads. Stops at
-/// `MAX_FILE` unpacked bytes in all, so a small file can't unpack into gigabytes.
-fn wrap_in_folder(path: &Path) -> Result<Vec<u8>> {
-    let file = fs::File::open(path)?;
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
-    let mut out = tar::Builder::new(flate2::write::GzEncoder::new(
-        Vec::new(),
-        flate2::Compression::fast(),
-    ));
-    let mut total = 0;
-    for (count, entry) in archive.entries().context("not a .xolkit file")?.enumerate() {
-        ensure!(count < MAX_ENTRIES, "the file holds too many entries");
-        let mut entry = entry?;
-        let mut header = entry.header().clone();
-        let name = format!("x/{}", entry.path()?.display());
-        let mut data = Vec::new();
-        entry
-            .by_ref()
-            .take(MAX_FILE - total + 1)
-            .read_to_end(&mut data)?;
-        total += data.len() as u64;
-        ensure!(
-            total <= MAX_FILE,
-            "the file unpacks to more than {} MB",
-            MAX_FILE >> 20
-        );
-        out.append_data(&mut header, name, &data[..])?;
-    }
-    Ok(out.into_inner()?.finish()?)
 }
 
 /// What importing a shared profile downloads.
@@ -390,6 +355,7 @@ pub fn fetch_import(
                     marketplace: item.marketplace.clone(),
                     ..PluginPin::default()
                 },
+                token,
             )?);
         }
         Ok(())
@@ -407,15 +373,15 @@ fn full_commit(source: &str, commit: &str, token: Option<&str>) -> Result<String
     if commit.len() == 40 {
         return Ok(commit.to_owned());
     }
-    let full = crate::discover::github(
+    let request = crate::discover::github(
         token,
         &format!("https://api.github.com/repos/{source}/commits/{commit}"),
     )
-    .header("Accept", "application/vnd.github.sha")
-    .call()
-    .with_context(|| format!("could not find commit {commit} in github.com/{source}"))?
-    .body_mut()
-    .read_to_string()?;
+    .header("Accept", "application/vnd.github.sha");
+    let full = crate::discover::call(request, token)
+        .with_context(|| format!("could not find commit {commit} in github.com/{source}"))?
+        .body_mut()
+        .read_to_string()?;
     let full = full.trim().to_owned();
     ensure!(
         full.len() == 40 && full.starts_with(commit),

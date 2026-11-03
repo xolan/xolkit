@@ -9,7 +9,7 @@ use crate::Provider;
 /// Windows `CREATE_NO_WINDOW`: a console program started from a GUI app runs without opening a
 /// console window of its own.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Where xolkit and the providers keep their files, and how to run the providers' tools.
 #[derive(Clone, Debug)]

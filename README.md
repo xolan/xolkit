@@ -30,6 +30,10 @@ and plugins that only work as native installs.
 - **Connections:** see every agent session, every MCP server and the processes behind them.
 - Updates itself from [GitHub releases](https://github.com/xolan/xolkit/releases).
 
+> **Install only what you trust.** Skills and plugins are instructions and code your agents
+> follow and run. xolkit downloads, unpacks and installs them as they are, as with any software
+> you install, so take them only from repositories and people you trust.
+
 Runs on Linux and Windows. There is no macOS build.
 
 <picture>
@@ -121,7 +125,10 @@ where, before anything is downloaded, and adds it as a new profile.
   register with. xolkit runs them to register itself and for native plugins.
 - Optional: the [GitHub CLI](https://cli.github.com) (`gh`), signed in with `gh auth login`.
   xolkit asks it for a token when it downloads from GitHub. Without it, pick anonymous access
-  (60 requests an hour) or save a token under Settings → GitHub access.
+  (60 requests an hour) or save a token under Settings → GitHub access. Private repositories,
+  such as a private marketplace, need a token that can read them.
+- `tar` on your `PATH`, which xolkit unpacks downloads with. Linux has it, and so do Windows 10
+  and 11.
 
 xolkit talks to `skills.sh`, `api.github.com`, `codeload.github.com` and
 `raw.githubusercontent.com`, to the MCP servers you add, and downloads its own updates from
@@ -140,7 +147,7 @@ Download `xolkit-<version>-<arch>-unknown-linux-gnu.tar.gz` and its `.sha256` fr
 you picked and run:
 
 ```bash
-version=3.0.0
+version=3.0.1
 name=xolkit-$version-$(uname -m)-unknown-linux-gnu
 sha256sum -c "$name.tar.gz.sha256" &&
   tar -xzf "$name.tar.gz" &&
