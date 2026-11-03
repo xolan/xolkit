@@ -22,6 +22,9 @@ use crate::protocol::{ServerState, ServerStatus};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long one tool call may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Longest a call waits for its server to finish connecting: the first call of a session that
+/// was idle often comes just as a fresh daemon starts its servers.
+const START_WAIT: Duration = Duration::from_secs(30);
 /// Why a server in `Gateway::held` stays disconnected.
 const HELD: &str = "a save didn't finish; save the server again";
 
@@ -543,16 +546,21 @@ impl Gateway {
         tool: &str,
         arguments: Option<rmcp::model::JsonObject>,
     ) -> Result<CallToolResult> {
-        let service = {
-            let connections = self.connections.lock().unwrap();
-            let connection = connections.get(name).context("no such server")?;
-            match (&connection.service, &connection.state) {
-                (Some(service), _) => service.clone(),
-                (None, ServerState::NeedsSecret { key }) => {
-                    bail!("the server {name} needs {key}; save it in xolkit")
+        let deadline = Instant::now() + START_WAIT;
+        let service = loop {
+            {
+                let connections = self.connections.lock().unwrap();
+                let connection = connections.get(name).context("no such server")?;
+                match (&connection.service, &connection.state) {
+                    (Some(service), _) => break service.clone(),
+                    (None, ServerState::NeedsSecret { key }) => {
+                        bail!("the server {name} needs {key}; save it in xolkit")
+                    }
+                    (None, ServerState::Starting) if Instant::now() < deadline => {}
+                    (None, state) => bail!("the server {name} is not connected ({state:?})"),
                 }
-                (None, state) => bail!("the server {name} is not connected ({state:?})"),
             }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         };
         let mut params = CallToolRequestParams::new(tool.to_owned());
         if let Some(arguments) = arguments {

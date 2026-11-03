@@ -15,6 +15,9 @@ use xolkit_core::Env;
 
 /// How long a shim or the app waits for a daemon it started to listen.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a daemon is started again while waiting for one: one started while the last daemon
+/// still closes exits at once on its lock.
+const RESTART_EVERY: u32 = 10;
 
 /// The socket's name for the xolkit folder `env` uses, so a test home gets a daemon of its own.
 #[cfg(unix)]
@@ -115,8 +118,14 @@ pub(crate) async fn connect_or_start(env: &Env, exe: &Path) -> Result<AsyncStrea
     }
     start(exe)?;
     let deadline = Instant::now() + START_TIMEOUT;
+    let mut tick = 0u32;
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
+        tick += 1;
+        // A start that fails now is no reason to stop waiting for the one already started.
+        if tick.is_multiple_of(RESTART_EVERY) {
+            let _ = start(exe);
+        }
         match connect_async(env).await {
             Ok(stream) => return Ok(stream),
             Err(e) if Instant::now() > deadline => {
@@ -136,8 +145,14 @@ pub(crate) fn connect_or_start_blocking(env: &Env, exe: &Path) -> Result<Stream>
     }
     start(exe)?;
     let deadline = Instant::now() + START_TIMEOUT;
+    let mut tick = 0u32;
     loop {
         std::thread::sleep(Duration::from_millis(100));
+        tick += 1;
+        // A start that fails now is no reason to stop waiting for the one already started.
+        if tick.is_multiple_of(RESTART_EVERY) {
+            let _ = start(exe);
+        }
         match connect() {
             Ok(stream) => return Ok(stream),
             Err(e) if Instant::now() > deadline => {

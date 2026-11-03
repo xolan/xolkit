@@ -17,7 +17,9 @@ pub const FONTS: &[&[u8]] = &[
 
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
-    [Puzzle, Store, Trash, Download, Lock, Layers, Pencil]
+    [
+        Puzzle, Store, Trash, Download, Lock, Layers, Pencil, Server, Activity
+    ]
 );
 
 /// The title bar's logo for dark themes: the case alone, drawn at 16 px.

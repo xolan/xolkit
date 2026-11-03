@@ -16,7 +16,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use xolkit_daemon::{Event, Request, ServerState, ServerStatus, SessionStatus, Status};
 
-use super::{Selection, Shelf, ago, divider, empty_state, fact, matches, section};
+use super::{Selection, Shelf, ago, count, divider, empty_state, fact, matches, section};
 use crate::settings;
 
 /// How often the page asks the daemon how things are.
@@ -32,6 +32,20 @@ fn state_label(state: &ServerState) -> String {
         ServerState::Failed { .. } => "failed".to_owned(),
         ServerState::Stopped => "stopped".to_owned(),
     }
+}
+
+/// "codex, pid 3994117": the process that started a session's shim.
+fn parent_label(session: &SessionStatus) -> Option<String> {
+    let parent = session.parent.as_ref()?;
+    Some(match &parent.name {
+        Some(name) => format!("{name}, pid {}", parent.pid),
+        None => format!("pid {}", parent.pid),
+    })
+}
+
+/// When the session last did something: its last call, or else when it connected.
+fn last_active(session: &SessionStatus) -> u64 {
+    session.last_call.unwrap_or(session.connected)
 }
 
 impl Shelf {
@@ -85,10 +99,17 @@ impl Shelf {
                                 s.agent.name(),
                                 s.client.as_deref().unwrap_or_default(),
                                 &cwd,
+                                &parent_label(s).unwrap_or_default(),
+                                if s.idle { "idle" } else { "connected" },
                             ],
                         )
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
+            })
+            .map(|mut sessions| {
+                // Connected sessions first, the most recently active at the top of each group.
+                sessions.sort_by_key(|s| (s.idle, std::cmp::Reverse(last_active(s))));
+                sessions
             })
             .unwrap_or_default()
     }
@@ -171,16 +192,33 @@ impl Shelf {
     fn render_status(&self, status: &Status, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let theme = cx.theme().clone();
-        let heading = |title: &str, n: usize| {
+        // Each section opens with a shaded band, so the lists read as separate even when they
+        // run long.
+        let heading = |icon: Lucide, title: &str, n: usize, note: Option<String>| {
             h_flex()
                 .px_4()
-                .pt_4()
-                .pb_1()
+                .py_2()
                 .gap_2()
+                .bg(theme.muted)
                 .border_b_1()
                 .border_color(theme.border)
+                .child(Icon::new(icon).small().text_color(muted))
                 .child(section(title))
-                .child(div().text_sm().text_color(muted).child(n.to_string()))
+                .child(
+                    div()
+                        .px_1p5()
+                        .rounded(theme.radius)
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_xs()
+                        .text_color(muted)
+                        .child(n.to_string()),
+                )
+                .child(div().flex_1())
+                .when_some(note, |this, note| {
+                    this.child(div().text_xs().text_color(muted).child(note))
+                })
         };
         let sessions = self.visible_sessions(cx);
         let servers = self.visible_connections(cx);
@@ -205,7 +243,16 @@ impl Shelf {
                         "Started {}; exits {} minutes after the last session and the app are gone",
                         ago(status.started),
                         status.idle_minutes
-                    ))),
+                    )))
+                    .when_some(status.session_idle_minutes, |this, minutes| {
+                        this.child(div().text_sm().text_color(muted).child(match minutes {
+                            0 => "Quiet sessions stay connected".to_owned(),
+                            minutes => format!(
+                                "Sessions quiet for {} go idle until their agent's next message",
+                                count(minutes as usize, "minute")
+                            ),
+                        }))
+                    }),
             )
             .child(
                 Button::new("restart-daemon")
@@ -217,7 +264,16 @@ impl Shelf {
             );
         rows.push(daemon.into_any_element());
 
-        rows.push(heading("Agent sessions", sessions.len()).into_any_element());
+        let idle = sessions.iter().filter(|s| s.idle).count();
+        rows.push(
+            heading(
+                Lucide::Bot,
+                "Agent sessions",
+                sessions.len(),
+                (idle > 0).then(|| format!("{} connected · {idle} idle", sessions.len() - idle)),
+            )
+            .into_any_element(),
+        );
         if sessions.is_empty() {
             rows.push(
                 div()
@@ -237,29 +293,32 @@ impl Shelf {
                 .as_ref()
                 .map(|c| self.env.tilde(c))
                 .unwrap_or_else(|| "unknown folder".to_owned());
-            let description = format!(
-                "{place} · connected {} · {} calls{}",
-                ago(session.connected),
-                session.calls,
+            let mut parts = vec![place, format!("active {}", ago(last_active(session)))];
+            if let Some(parent) = parent_label(session) {
+                parts.push(parent);
+            }
+            parts.push(format!(
+                "{}{}",
+                count(session.calls as usize, "call"),
                 if session.errors > 0 {
                     format!(", {} failed", session.errors)
                 } else {
                     String::new()
                 }
-            );
+            ));
             rows.push(self.row(
                 format!("session-{}", session.id),
                 selected,
                 session.agent.name().to_owned(),
                 session.client.as_deref(),
-                description,
-                Vec::new(),
+                parts.join(" · "),
+                vec![self.state_pill(session.idle, cx)],
                 cx.listener(move |this, _, _, cx| this.select(Some(selection.clone()), cx)),
                 cx,
             ));
         }
 
-        rows.push(heading("MCP servers", servers.len()).into_any_element());
+        rows.push(heading(Lucide::Server, "MCP servers", servers.len(), None).into_any_element());
         if servers.is_empty() {
             rows.push(
                 div()
@@ -297,7 +356,9 @@ impl Shelf {
             ));
         }
 
-        rows.push(heading("Recent events", events.len()).into_any_element());
+        rows.push(
+            heading(Lucide::Activity, "Recent events", events.len(), None).into_any_element(),
+        );
         for event in events {
             rows.push(
                 h_flex()
@@ -358,10 +419,19 @@ impl Shelf {
             .filter(|e| e.source == source)
             .take(40)
             .collect();
-        // The agent's shim reconnects at once, so this starts the session over.
+        // A connected shim reconnects at once, so this starts the session over; an idle one is
+        // forgotten until its agent's next message.
         let disconnect = Button::new("restart-session")
-            .label("Restart session")
-            .tooltip("End the session; the agent reconnects with a fresh one")
+            .label(if session.idle {
+                "Forget session"
+            } else {
+                "Restart session"
+            })
+            .tooltip(if session.idle {
+                "Drop the idle session from the list; its agent's next message reconnects it"
+            } else {
+                "End the session; the agent reconnects with a fresh one"
+            })
             .disabled(self.busy)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.request(
@@ -373,10 +443,26 @@ impl Shelf {
             }));
         let mut facts = vec![
             fact("Agent", session.agent.name().to_owned(), cx),
+            fact(
+                "State",
+                if session.idle {
+                    format!(
+                        "idle since {}; reconnects with the agent's next message",
+                        ago(session.since)
+                    )
+                } else {
+                    "connected".to_owned()
+                },
+                cx,
+            ),
             fact("Process", format!("xolkit mcp, pid {}", session.pid), cx),
             fact("Connected", ago(session.connected), cx),
+            fact("Active", ago(last_active(session)), cx),
             fact("Calls", session.calls.to_string(), cx),
         ];
+        if let Some(parent) = parent_label(session) {
+            facts.insert(3, fact("Started by", parent, cx));
+        }
         if let Some(client) = &session.client {
             facts.insert(1, fact("Client", client.clone(), cx));
         }
@@ -474,6 +560,23 @@ impl Shelf {
             .child(h_flex().p_4().child(reconnect))
             .into_any_element();
         Some(detail)
+    }
+
+    /// "connected" or "idle", at the end of a session's row.
+    fn state_pill(&self, idle: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let color = if idle {
+            theme.muted_foreground
+        } else {
+            theme.success
+        };
+        h_flex()
+            .gap_1()
+            .text_xs()
+            .text_color(color)
+            .child(div().size(px(6.)).rounded_full().bg(color))
+            .child(if idle { "idle" } else { "connected" })
+            .into_any_element()
     }
 
     fn event_detail(

@@ -22,7 +22,7 @@ use xolkit_core::{
 
 use crate::gateway::{Gateway, Notice};
 use crate::ipc;
-use crate::protocol::{Event, Hello, Request, Response, SessionStatus, Status, now};
+use crate::protocol::{Event, Hello, Parent, Request, Response, SessionStatus, Status, now};
 use crate::session::{SEPARATOR, Session};
 
 /// Most files of one plugin the watcher looks at.
@@ -35,6 +35,21 @@ const MAX_EVENTS: usize = 500;
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 /// Longest line a control connection may send: a plan of actions with a profile's settings.
 const MAX_CONTROL_LINE: usize = 16 * 1024 * 1024;
+/// Longest a stopping daemon waits for a refused app connection's request.
+const REFUSED_READ: Duration = Duration::from_secs(5);
+/// How long the daemon waits after a session ends before it asks whether the shim still runs:
+/// one that ends because its agent did takes a moment to exit.
+const SHIM_EXIT: Duration = Duration::from_secs(1);
+
+/// A connection the daemon has accepted and not yet taken on or turned away. A stopping daemon
+/// waits for these, so none is cut off before it hears it should go to the next daemon.
+struct Handshake(Arc<Daemon>);
+
+impl Drop for Handshake {
+    fn drop(&mut self) {
+        self.0.handshaking.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 pub(crate) struct Daemon {
     env: Env,
@@ -42,6 +57,7 @@ pub(crate) struct Daemon {
     /// Bumped whenever what agents get may have changed.
     changes: watch::Sender<u64>,
     gateway: OnceLock<Gateway>,
+    /// Connected sessions, and idle ones whose shim still runs (`idle`, with no task).
     sessions: Mutex<BTreeMap<u64, (SessionStatus, Option<tokio::task::AbortHandle>)>>,
     next_session: AtomicU64,
     events: Mutex<VecDeque<Event>>,
@@ -50,6 +66,10 @@ pub(crate) struct Daemon {
     last_active: Mutex<Instant>,
     started: u64,
     shutdown: tokio::sync::Notify,
+    /// Set once the daemon has decided to exit; it takes no more sessions.
+    stopping: std::sync::atomic::AtomicBool,
+    /// Connections accepted and not yet taken on or turned away.
+    handshaking: AtomicUsize,
     log: Mutex<Option<std::fs::File>>,
     /// Serializes changes, so two plans never run at once.
     executing: tokio::sync::Mutex<()>,
@@ -84,6 +104,8 @@ impl Daemon {
             last_active: Mutex::new(Instant::now()),
             started: now(),
             shutdown: tokio::sync::Notify::new(),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            handshaking: AtomicUsize::new(0),
             log: Mutex::new(log),
             executing: tokio::sync::Mutex::new(()),
             broken: std::sync::atomic::AtomicBool::new(problem.is_some()),
@@ -284,6 +306,7 @@ impl Daemon {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             started: self.started,
             idle_minutes: self.library().settings.idle_minutes,
+            session_idle_minutes: Some(self.library().settings.session_idle_minutes),
             sessions: self
                 .sessions
                 .lock()
@@ -390,6 +413,7 @@ impl Daemon {
                 }
             }
             Request::Shutdown => {
+                self.stopping.store(true, Ordering::SeqCst);
                 self.shutdown.notify_one();
                 Ok(())
             }
@@ -492,21 +516,58 @@ impl Daemon {
         }
     }
 
-    async fn serve_connection(self: Arc<Self>, stream: Stream) -> Result<()> {
+    async fn serve_connection(self: Arc<Self>, stream: Stream, handshake: Handshake) -> Result<()> {
         let (recv, send) = tokio::io::split(stream);
         let mut reader = BufReader::new(recv);
         let mut line = String::new();
         reader.read_line(&mut line).await?;
         let hello: Hello = serde_json::from_str(&line).context("a connection said no hello")?;
         match hello {
-            Hello::Session { agent, pid, cwd } => {
-                self.serve_session(reader, send, agent, pid, cwd).await
+            Hello::Session {
+                agent,
+                pid,
+                cwd,
+                parent,
+            } => {
+                self.serve_session((reader, send), agent, pid, cwd, parent, handshake)
+                    .await
             }
             Hello::Control => {
-                self.controls.fetch_add(1, Ordering::SeqCst);
+                // Counted under the sessions' lock, as sessions register, so a daemon that has
+                // decided to stop starts no more work for the app either.
+                let refused = {
+                    let _sessions = self.sessions.lock().unwrap();
+                    let stopping = self.stopping.load(Ordering::SeqCst);
+                    if !stopping {
+                        self.controls.fetch_add(1, Ordering::SeqCst);
+                    }
+                    stopping
+                };
+                if !refused {
+                    drop(handshake);
+                }
+                if refused {
+                    // Said, so the app knows nothing ran and connects to the next daemon; said in
+                    // answer to its request, once that is read, as the app writes its request
+                    // first and would find the connection gone.
+                    let (mut reader, mut send) = (reader, send);
+                    let mut request = String::new();
+                    let _ = tokio::time::timeout(
+                        REFUSED_READ,
+                        (&mut reader)
+                            .take(MAX_CONTROL_LINE as u64)
+                            .read_line(&mut request),
+                    )
+                    .await;
+                    let line = serde_json::to_string(&Response::Stopping)? + "\n";
+                    send.write_all(line.as_bytes()).await?;
+                    send.flush().await?;
+                    return Ok(());
+                }
                 let result = self.serve_control(reader, send).await;
-                self.controls.fetch_sub(1, Ordering::SeqCst);
+                // Active until the last moment the app was there, before it stops counting.
                 *self.last_active.lock().unwrap() = Instant::now();
+                self.controls.fetch_sub(1, Ordering::SeqCst);
                 result
             }
         }
@@ -514,31 +575,66 @@ impl Daemon {
 
     async fn serve_session(
         self: Arc<Self>,
-        reader: BufReader<ReadHalf<Stream>>,
-        writer: WriteHalf<Stream>,
+        (reader, writer): (BufReader<ReadHalf<Stream>>, WriteHalf<Stream>),
         agent: Option<Agent>,
         pid: u32,
         cwd: Option<PathBuf>,
+        parent: Option<Parent>,
+        handshake: Handshake,
     ) -> Result<()> {
-        let id = self.next_session.fetch_add(1, Ordering::SeqCst);
         let agent = agent.unwrap_or(Agent::Other);
-        let status = SessionStatus {
-            id,
-            agent,
-            client: None,
-            pid,
-            cwd: cwd.clone(),
-            connected: now(),
-            last_call: None,
-            calls: 0,
-            errors: 0,
+        let registered = {
+            let mut sessions = self.sessions.lock().unwrap();
+            // A daemon on its way out takes no more sessions: the shim starts the next one.
+            if self.stopping.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            // A shim back from idle picks up its session where it left it.
+            let idle = sessions
+                .values_mut()
+                .find(|(s, _)| s.idle && s.pid == pid)
+                .map(|(s, _)| s);
+            match idle {
+                Some(status) => {
+                    status.idle = false;
+                    status.since = now();
+                    status.agent = agent;
+                    status.cwd = cwd.clone();
+                    status.parent = parent.clone();
+                    (status.id, true)
+                }
+                None => {
+                    let id = self.next_session.fetch_add(1, Ordering::SeqCst);
+                    let status = SessionStatus {
+                        id,
+                        agent,
+                        client: None,
+                        pid,
+                        cwd: cwd.clone(),
+                        parent,
+                        connected: now(),
+                        last_call: None,
+                        calls: 0,
+                        errors: 0,
+                        idle: false,
+                        since: now(),
+                    };
+                    sessions.insert(id, (status, None));
+                    (id, false)
+                }
+            }
         };
-        self.sessions.lock().unwrap().insert(id, (status, None));
+        let (id, resumed) = registered;
+        drop(handshake);
         let source = format!("session {id}");
-        let place = cwd
-            .map(|c| format!(" in {}", self.env.tilde(&c)))
-            .unwrap_or_default();
-        self.event(&source, format!("{} connected{place}", agent.name()), false);
+        if resumed {
+            self.event(&source, "back from idle", false);
+        } else {
+            let place = cwd
+                .map(|c| format!(" in {}", self.env.tilde(&c)))
+                .unwrap_or_default();
+            self.event(&source, format!("{} connected{place}", agent.name()), false);
+        }
         let session = Session {
             daemon: self.clone(),
             id,
@@ -557,13 +653,79 @@ impl Daemon {
             *abort = Some(task.abort_handle());
         }
         let result = task.await;
-        self.sessions.lock().unwrap().remove(&id);
         *self.last_active.lock().unwrap() = Instant::now();
-        match result {
-            Ok(Err(e)) => self.event(&source, format!("ended: {e:#}"), true),
-            _ => self.event(&source, "disconnected", false),
+        if let Ok(Err(e)) = &result {
+            self.sessions.lock().unwrap().remove(&id);
+            self.event(&source, format!("ended: {e:#}"), true);
+            return Ok(());
         }
+        // The session ended: its agent went away, or its shim let go after a quiet spell and runs
+        // on. It is idle at once, so a shim that comes straight back picks it up again. The app's
+        // Disconnect has already removed it.
+        let kept = {
+            let mut sessions = self.sessions.lock().unwrap();
+            // A shim that reconnected before this connection was done is a session of its own.
+            let back = sessions.values().any(|(s, _)| s.id != id && s.pid == pid);
+            match sessions.get_mut(&id) {
+                Some((status, abort)) if !back => {
+                    status.idle = true;
+                    status.since = now();
+                    *abort = None;
+                    true
+                }
+                Some(_) => {
+                    sessions.remove(&id);
+                    false
+                }
+                None => false,
+            }
+        };
+        if !kept {
+            self.event(&source, "disconnected", false);
+            return Ok(());
+        }
+        tokio::time::sleep(SHIM_EXIT).await;
+        let runs = {
+            let mut sessions = self.sessions.lock().unwrap();
+            // Back already, or forgotten: nothing to say.
+            if !sessions.get(&id).is_some_and(|(s, _)| s.idle) {
+                return Ok(());
+            }
+            let runs = shim_runs(pid);
+            if !runs {
+                sessions.remove(&id);
+            }
+            runs
+        };
+        self.event(
+            &source,
+            if runs {
+                "idle; its shim reconnects with the agent's next message"
+            } else {
+                "disconnected"
+            },
+            false,
+        );
         Ok(())
+    }
+
+    /// Forgets idle sessions whose shim has exited.
+    fn forget_gone(&self) {
+        let gone: Vec<u64> = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let gone: Vec<u64> = sessions
+                .values()
+                .filter(|(s, _)| s.idle && !shim_runs(s.pid))
+                .map(|(s, _)| s.id)
+                .collect();
+            for id in &gone {
+                sessions.remove(id);
+            }
+            gone
+        };
+        for id in gone {
+            self.event(&format!("session {id}"), "ended while idle", false);
+        }
     }
 
     async fn serve_control(
@@ -594,11 +756,46 @@ impl Daemon {
         }
     }
 
-    fn idle(&self) -> bool {
+    /// Decides to stop when nothing has used the daemon for long enough. It is decided under the
+    /// sessions' lock, so no session registers in between and is then cut off.
+    fn stop_if_idle(&self) -> bool {
         let minutes = self.library().settings.idle_minutes;
-        self.sessions.lock().unwrap().is_empty()
+        let sessions = self.sessions.lock().unwrap();
+        let idle = sessions.values().all(|(s, _)| s.idle)
             && self.controls.load(Ordering::SeqCst) == 0
-            && self.last_active.lock().unwrap().elapsed() > Duration::from_secs(minutes * 60)
+            && self.last_active.lock().unwrap().elapsed() > Duration::from_secs(minutes * 60);
+        if idle {
+            self.stopping.store(true, Ordering::SeqCst);
+        }
+        idle
+    }
+}
+
+/// Whether the process `pid` still runs, and isn't a zombie. Elsewhere than on Unix the daemon
+/// can't tell, and idle sessions drop from the list.
+fn shim_runs(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 only checks that the process exists.
+        let exists = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        // A shim that has exited stays a zombie until its agent reaps it.
+        #[cfg(target_os = "linux")]
+        if exists
+            && let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && let Some((_, rest)) = stat.rsplit_once(')')
+        {
+            return !rest.trim_start().starts_with('Z');
+        }
+        exists
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -652,8 +849,9 @@ fn rotate_log(env: &Env) -> Option<std::fs::File> {
         .ok()
 }
 
-/// The modification times of everything the library is read from.
-fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
+/// The modification times of everything the library is read from. An idle shim watches them
+/// too, to tell its agent when its lists may have changed.
+pub(crate) fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
     let mtime = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
     let mut times = vec![
         mtime(&env.settings_file()),
@@ -729,6 +927,7 @@ pub async fn run(env: Env) -> Result<()> {
             loop {
                 tokio::time::sleep(WATCH_INTERVAL).await;
                 daemon.gateway().reap();
+                daemon.forget_gone();
                 // Mid-plan, the files are half changed; the plan reloads when it ends.
                 let Ok(_idle) = daemon.executing.try_lock() else {
                     continue;
@@ -738,7 +937,7 @@ pub async fn run(env: Env) -> Result<()> {
                     last = now;
                     daemon.reload();
                 }
-                if daemon.idle() {
+                if daemon.stop_if_idle() {
                     daemon.event("daemon", "idle; exiting", false);
                     daemon.shutdown.notify_one();
                 }
@@ -752,8 +951,10 @@ pub async fn run(env: Env) -> Result<()> {
             accepted = listener.accept() => match accepted {
                 Ok(stream) => {
                     let daemon = daemon.clone();
+                    daemon.handshaking.fetch_add(1, Ordering::SeqCst);
+                    let handshake = Handshake(daemon.clone());
                     tokio::spawn(async move {
-                        if let Err(e) = daemon.clone().serve_connection(stream).await {
+                        if let Err(e) = daemon.clone().serve_connection(stream, handshake).await {
                             daemon.event("daemon", format!("connection: {e:#}"), true);
                         }
                     });
@@ -763,9 +964,20 @@ pub async fn run(env: Env) -> Result<()> {
         }
     }
     watcher.abort();
-    daemon.event("daemon", "stopped", false);
-    daemon.gateway().close_all().await;
+    // No more connections while the servers close, which can take a while: a shim coming back
+    // from idle meanwhile starts the next daemon instead of losing its request to this one.
+    drop(listener);
     ipc::remove_socket(&env, &instance);
+    daemon.event("daemon", "stopped", false);
+    // Connections already accepted hear that the daemon is stopping before it goes, while the
+    // servers close, so the two waits don't add up.
+    let handshakes = async {
+        let deadline = Instant::now() + REFUSED_READ + Duration::from_secs(1);
+        while daemon.handshaking.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::join!(handshakes, daemon.gateway().close_all());
     let _ = std::fs::remove_file(env.run_dir().join("daemon.pid"));
     Ok(())
 }
