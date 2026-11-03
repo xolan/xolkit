@@ -156,7 +156,7 @@ Download `xolkit-<version>-<arch>-unknown-linux-gnu.tar.gz` and its `.sha256` fr
 you picked and run:
 
 ```bash
-version=3.1.0
+version=3.2.0
 name=xolkit-$version-$(uname -m)-unknown-linux-gnu
 sha256sum -c "$name.tar.gz.sha256" &&
   tar -xzf "$name.tar.gz" &&
