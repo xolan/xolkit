@@ -20,7 +20,7 @@ use xolkit_core::{
     Action as Step, Kind, Provider, Server, ServerConfig, agent_servers, secret_key,
     valid_server_name,
 };
-use xolkit_daemon::{Request, ServerState, ServerStatus};
+use xolkit_daemon::{Client, Request, ServerState, ServerStatus};
 
 use super::{Selection, Shelf, cell, divider, fact, list_body, matches, section};
 use crate::settings;
@@ -231,11 +231,14 @@ impl Shelf {
     fn sign_in(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         self.busy = true;
         cx.notify();
-        let client = settings::client(cx);
+        // Its own connection: setting up a sign-in can take a while, and the app's other calls to
+        // the daemon shouldn't wait for it.
+        let store = settings::store(cx);
+        let mut client = Client::new(store.env.clone(), &store.exe);
         cx.spawn_in(window, async move |this, cx| {
             let server = name.clone();
             let page = cx
-                .background_spawn(async move { client.lock().unwrap().sign_in(&server) })
+                .background_spawn(async move { client.sign_in(&server) })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.busy = false;

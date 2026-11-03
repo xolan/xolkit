@@ -104,7 +104,7 @@ you already set up in Claude Code or Codex stay there; **Copy from agents** adds
 moving their values into the OS keyring.
 
 Remote servers take headers, such as `Authorization: Bearer …`, or a sign-in in a browser
-(OAuth). A server that asks for a sign-in shows **needs sign-in**; **Sign in** on its page opens
+(OAuth). A remote server without secrets that asks for a sign-in shows **needs sign-in**; **Sign in** on its page opens
 your browser, and xolkit keeps the tokens in the OS keyring, renews them, and sends them only to
 the URL they were given for. **Sign out** forgets them. xolkit registers itself with the server's
 sign-in on its own, so servers that need a client ID set up by hand aren't supported yet.

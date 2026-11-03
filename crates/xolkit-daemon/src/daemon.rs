@@ -51,6 +51,9 @@ impl Drop for Handshake {
     }
 }
 
+/// How long finding a server's sign-in and registering with it may take.
+const SIGN_IN_SETUP: Duration = Duration::from_secs(60);
+
 pub(crate) struct Daemon {
     env: Env,
     library: RwLock<Arc<Library>>,
@@ -457,15 +460,16 @@ impl Daemon {
         }
     }
 
-    /// Reconnects to server `name` after its tokens changed. One stopped by hand stays so, and
-    /// one no agent has on has nothing to reconnect.
+    /// Reconnects to server `name` after its tokens changed. One stopped by hand stays so, one
+    /// no agent has on has nothing to reconnect, and one a save holds, or any while the library
+    /// can't be read, connects once that is put right.
     async fn reconnect_if_on(&self, name: &str) -> Result<()> {
         let on = self
             .gateway()
             .status()
             .iter()
             .any(|s| s.name == name && s.state != crate::protocol::ServerState::Stopped);
-        if on {
+        if on && !self.gateway().is_held(name) && !self.broken.load(Ordering::SeqCst) {
             self.restart_server(name).await
         } else {
             Ok(())
@@ -475,7 +479,14 @@ impl Daemon {
     /// Starts signing in to server `name` and returns the page to open; see `Request::SignIn`.
     async fn sign_in(self: &Arc<Self>, name: String) -> Result<String> {
         let (url, challenge, tokens) = self.gateway().sign_in_target(&name)?;
-        let sign_in = crate::oauth::start(&url, challenge.as_deref(), tokens).await?;
+        // Finding and registering with the authorization server takes several requests; a slow
+        // one shouldn't keep the app waiting without end.
+        let sign_in = tokio::time::timeout(
+            SIGN_IN_SETUP,
+            crate::oauth::start(&url, challenge.as_deref(), tokens),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the server's sign-in didn't answer within a minute"))??;
         let page = sign_in.page.clone();
         self.event(&name, "signing in: waiting for the browser", false);
         let daemon = self.clone();

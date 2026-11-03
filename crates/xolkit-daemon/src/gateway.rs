@@ -392,7 +392,7 @@ impl Gateway {
                         },
                     };
                     if challenge.is_some() {
-                        gateway.log(&name, "needs a sign-in: sign in to it in xolkit", false);
+                        gateway.log(&name, format!("needs a sign-in ({message})"), false);
                     } else {
                         gateway.log(&name, format!("could not connect: {message}"), true);
                     }
@@ -479,7 +479,7 @@ impl Gateway {
                         manager
                             .initialize_from_store()
                             .await
-                            .context("could not read its sign-in")?;
+                            .context("could not reach its authorization server")?;
                         let client = AuthClient::new(reqwest::Client::default(), manager);
                         handler
                             .serve(StreamableHttpClientTransport::with_client(client, http))
@@ -694,7 +694,7 @@ impl Gateway {
         };
         anyhow::ensure!(
             signs_in(config),
-            "{name} sends its own Authorization header; remove it to sign in instead"
+            "{name} signs in with its own secrets or Authorization header, not in a browser"
         );
         Ok((
             url.clone(),
@@ -754,14 +754,15 @@ impl std::fmt::Display for MissingSecret {
 
 impl std::error::Error for MissingSecret {}
 
-/// Whether a server with `config` can sign in with OAuth: a remote one that doesn't send its own
-/// `Authorization` header.
+/// Whether a server with `config` can sign in with OAuth: a remote one with no secrets and no
+/// `Authorization` header of its own. One with an API key that answers 401 has a wrong key, not
+/// a missing sign-in.
 fn signs_in(config: &ServerConfig) -> bool {
     config.is_remote()
+        && config.secrets.is_empty()
         && !config
             .headers
             .keys()
-            .chain(&config.secrets)
             .any(|k| k.eq_ignore_ascii_case("authorization"))
 }
 
@@ -934,6 +935,8 @@ mod tests {
         assert!(signs_in(&remote(&[("X-Team", "core")], &[])));
         assert!(!signs_in(&remote(&[("authorization", "Bearer t")], &[])));
         assert!(!signs_in(&remote(&[], &["Authorization"])));
+        // An API key that is wrong is a wrong key, not a missing sign-in.
+        assert!(!signs_in(&remote(&[], &["X-API-Key"])));
         assert!(!signs_in(&ServerConfig {
             command: Some("x".into()),
             ..ServerConfig::default()
