@@ -17,10 +17,10 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use xolkit_core::{
-    Action as Step, Kind, Provider, Server, ServerConfig, agent_servers, secret_key,
+    Action as Step, Kind, Provider, Server, ServerConfig, agent_servers, oauth_key, secret_key,
     valid_server_name,
 };
-use xolkit_daemon::{Request, ServerState};
+use xolkit_daemon::{Request, ServerState, ServerStatus};
 
 use super::{Selection, Shelf, cell, divider, fact, list_body, matches, section};
 use crate::settings;
@@ -216,15 +216,46 @@ impl Shelf {
             .filter(move |s| matches(&filter, &[&s.name, &s.config.summary()]))
     }
 
-    fn server_state(&self, name: &str) -> Option<ServerState> {
+    fn server_status(&self, name: &str) -> Option<&ServerStatus> {
         let Some(Ok(status)) = &self.status else {
             return None;
         };
-        status
-            .servers
-            .iter()
-            .find(|s| s.name == name)
-            .map(|s| s.state.clone())
+        status.servers.iter().find(|s| s.name == name)
+    }
+
+    fn server_state(&self, name: &str) -> Option<ServerState> {
+        self.server_status(name).map(|s| s.state.clone())
+    }
+
+    /// Starts signing in to server `name`: the daemon gets ready, the browser does the rest.
+    fn sign_in(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.busy = true;
+        cx.notify();
+        let client = settings::client(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let server = name.clone();
+            let page = cx
+                .background_spawn(async move { client.lock().unwrap().sign_in(&server) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                match page {
+                    Ok(page) => {
+                        cx.open_url(&page);
+                        window.push_notification(
+                            Notification::info(format!(
+                                "Finish signing in to {name} in your browser"
+                            )),
+                            cx,
+                        );
+                    }
+                    Err(e) => window.push_notification(Notification::error(format!("{e:#}")), cx),
+                }
+                this.refresh_status(cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(super) fn render_servers(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -301,6 +332,7 @@ impl Shelf {
         };
         let tag = match self.server_state(&name) {
             Some(ServerState::NeedsSecret { key }) => format!("{tag} · needs {key}"),
+            Some(ServerState::NeedsSignIn) => format!("{tag} · needs sign-in"),
             Some(ServerState::Failed { .. }) => format!("{tag} · failed"),
             _ => tag,
         };
@@ -349,6 +381,7 @@ impl Shelf {
             Some(ServerState::NeedsSecret { key }) => {
                 format!("Waiting for {key}: edit the server to save it")
             }
+            Some(ServerState::NeedsSignIn) => "Needs a sign-in before agents can use it".to_owned(),
             Some(ServerState::Failed { message }) => format!("Failed: {message}"),
             Some(ServerState::Stopped) => "Stopped".to_owned(),
         };
@@ -360,6 +393,38 @@ impl Shelf {
                 .disabled(self.busy)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open_server_dialog(Some(name.clone()), window, cx)
+                }))
+        });
+        // Sign in when it asks; sign out (or in as someone else) once signed in.
+        let status = self.server_status(name);
+        let signed_in = status.is_some_and(|s| s.signed_in);
+        let needs_sign_in = status.is_some_and(|s| s.state == ServerState::NeedsSignIn);
+        let sign_in = needs_sign_in.then(|| {
+            let name = name.to_owned();
+            Button::new("sign-in-server")
+                .small()
+                .primary()
+                .icon(IconName::ExternalLink)
+                .label("Sign in")
+                .disabled(self.busy)
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.sign_in(name.clone(), window, cx)),
+                )
+        });
+        let sign_out = signed_in.then(|| {
+            let name = name.to_owned();
+            Button::new("sign-out-server")
+                .small()
+                .icon(Lucide::LogOut)
+                .label("Sign out")
+                .disabled(self.busy)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.request(
+                        Request::SignOut { name: name.clone() },
+                        Some(format!("Signed out of {name}").into()),
+                        window,
+                        cx,
+                    )
                 }))
         });
         let restart = {
@@ -401,7 +466,14 @@ impl Shelf {
                                 .p_4()
                                 .gap_3()
                                 .child(v_flex().gap_1().children(facts))
-                                .child(h_flex().gap_2().child(div().text_sm().flex_1().child(state)).child(restart))
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(div().text_sm().flex_1().min_w_0().child(state))
+                                        .children(sign_in)
+                                        .children(sign_out)
+                                        .child(restart),
+                                )
                                 .child(divider(cx))
                                 .child(section("Tools"))
                                 .child(div().text_sm().text_color(cx.theme().muted_foreground).child(format!(
@@ -652,7 +724,11 @@ impl Shelf {
                 settings: Box::new(settings),
             },
         ];
-        let secrets: Vec<String> = config.secrets.iter().map(|k| secret_key(name, k)).collect();
+        let mut secrets: Vec<String> = config.secrets.iter().map(|k| secret_key(name, k)).collect();
+        // And its tokens, if it was signed in to.
+        if config.is_remote() {
+            secrets.push(oauth_key(name));
+        }
         let client = settings::client(cx);
         self.busy = true;
         let done = format!("Removed {name}");

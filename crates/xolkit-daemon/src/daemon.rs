@@ -78,6 +78,8 @@ pub(crate) struct Daemon {
     broken: std::sync::atomic::AtomicBool,
     /// Tools left out for their names, already logged once.
     left_out: Mutex<std::collections::HashSet<String>>,
+    /// Sign-ins waiting for the browser, by server.
+    sign_ins: Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
 }
 
 impl Daemon {
@@ -110,6 +112,7 @@ impl Daemon {
             executing: tokio::sync::Mutex::new(()),
             broken: std::sync::atomic::AtomicBool::new(problem.is_some()),
             left_out: Mutex::new(std::collections::HashSet::new()),
+            sign_ins: Mutex::new(std::collections::HashMap::new()),
         });
         let weak = Arc::downgrade(&daemon);
         let gateway = Gateway::new(
@@ -371,19 +374,36 @@ impl Daemon {
                 }
                 done
             }
-            // Under the lock, so a server held while it is saved isn't started halfway.
-            Request::RestartServer { name } => {
-                let _running = self.executing.lock().await;
-                // Its settings may be older than its secrets until the library is read again.
-                if self.broken.load(Ordering::SeqCst) {
-                    Err(anyhow::anyhow!("the library can't be read; fix it first"))
-                } else if self.gateway().is_held(&name) {
-                    // Only a save puts its settings and secrets back in step.
-                    Err(anyhow::anyhow!(
-                        "{name} was left disconnected by a save; save it again"
-                    ))
-                } else {
-                    self.gateway().restart(&name)
+            Request::RestartServer { name } => self.restart_server(&name).await,
+            Request::SignIn { name } => {
+                return match self.sign_in(name).await {
+                    Ok(page) => Response::SignIn { page },
+                    Err(e) => {
+                        let message = format!("{e:#}");
+                        self.event("daemon", &message, true);
+                        Response::Error { message }
+                    }
+                };
+            }
+            Request::SignOut { name } => {
+                if let Some(waiting) = self.sign_ins.lock().unwrap().remove(&name) {
+                    waiting.abort();
+                }
+                match self.gateway().sign_out(&name).await {
+                    Ok(()) => {
+                        self.event(&name, "signed out", false);
+                        // Off the tokens it was connected with. One stopped by hand stays so,
+                        // and one no agent has on has nothing to reconnect.
+                        let connected = self.gateway().status().iter().any(|s| {
+                            s.name == name && s.state != crate::protocol::ServerState::Stopped
+                        });
+                        if connected {
+                            self.restart_server(&name).await
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    Err(e) => Err(e),
                 }
             }
             Request::SaveServer {
@@ -426,6 +446,55 @@ impl Daemon {
                 Response::Error { message }
             }
         }
+    }
+
+    /// Reconnects to server `name`, unless the library can't be read or a save holds it.
+    async fn restart_server(&self, name: &str) -> Result<()> {
+        // Under the lock, so a server held while it is saved isn't started halfway.
+        let _running = self.executing.lock().await;
+        // Its settings may be older than its secrets until the library is read again.
+        if self.broken.load(Ordering::SeqCst) {
+            Err(anyhow::anyhow!("the library can't be read; fix it first"))
+        } else if self.gateway().is_held(name) {
+            // Only a save puts its settings and secrets back in step.
+            Err(anyhow::anyhow!(
+                "{name} was left disconnected by a save; save it again"
+            ))
+        } else {
+            self.gateway().restart(name)
+        }
+    }
+
+    /// Starts signing in to server `name` and returns the page to open; see `Request::SignIn`.
+    async fn sign_in(self: &Arc<Self>, name: String) -> Result<String> {
+        let (url, challenge, tokens) = self.gateway().sign_in_target(&name)?;
+        let sign_in = crate::oauth::start(&url, challenge.as_deref(), tokens).await?;
+        let page = sign_in.page.clone();
+        self.event(&name, "signing in: waiting for the browser", false);
+        let daemon = self.clone();
+        let server = name.clone();
+        let mut sign_ins = self.sign_ins.lock().unwrap();
+        let task = tokio::spawn(async move {
+            match sign_in.finish().await {
+                Ok(()) => {
+                    daemon.event(&server, "signed in", false);
+                    if let Err(e) = daemon.restart_server(&server).await {
+                        daemon.event(&server, format!("{e:#}"), true);
+                    }
+                }
+                Err(e) => daemon.event(&server, format!("could not sign in: {e:#}"), true),
+            }
+            // Unless a newer sign-in has taken its place.
+            let mut sign_ins = daemon.sign_ins.lock().unwrap();
+            if sign_ins.get(&server).map(|w| w.id()) == Some(tokio::task::id()) {
+                sign_ins.remove(&server);
+            }
+        });
+        // The one it replaces can't save its tokens any more.
+        if let Some(old) = sign_ins.insert(name, task.abort_handle()) {
+            old.abort();
+        }
+        Ok(page)
     }
 
     /// Saves a server's settings and secrets as one change; see `Request::SaveServer`.

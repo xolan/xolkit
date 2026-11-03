@@ -5580,6 +5580,24 @@
    ]
   },
   {
+   "name": "oauth2",
+   "version": "5.0.0",
+   "license": "MIT OR Apache-2.0",
+   "link": "https://github.com/ramosbugs/oauth2-rs",
+   "texts": [
+    {
+     "text": 2,
+     "notices": []
+    },
+    {
+     "text": 1,
+     "notices": [
+      "Copyright (c) 2014 Alex Crichton"
+     ]
+    }
+   ]
+  },
+  {
    "name": "object",
    "version": "0.37.3",
    "license": "Apache-2.0 OR MIT",
@@ -7656,6 +7674,22 @@
    "version": "1.0.154",
    "license": "MIT OR Apache-2.0",
    "link": "https://github.com/serde-rs/json",
+   "texts": [
+    {
+     "text": 2,
+     "notices": []
+    },
+    {
+     "text": 1,
+     "notices": []
+    }
+   ]
+  },
+  {
+   "name": "serde_path_to_error",
+   "version": "0.1.20",
+   "license": "MIT OR Apache-2.0",
+   "link": "https://github.com/dtolnay/path-to-error",
    "texts": [
     {
      "text": 2,

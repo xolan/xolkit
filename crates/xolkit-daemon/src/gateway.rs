@@ -10,12 +10,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig, Implementation, Tool};
 use rmcp::service::{NotificationContext, RunningService};
+use rmcp::transport::auth::{AuthClient, AuthorizationManager};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientHandler, RoleClient, ServiceExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use xolkit_core::{Env, Server, ServerConfig, get_secret, secret_key};
 
+use crate::oauth::{self, Keyring, Tokens, Vault};
 use crate::protocol::{ServerState, ServerStatus};
 
 /// How long a server gets to start and list its tools.
@@ -52,6 +54,27 @@ struct Connection {
     latency_ms: Option<u64>,
     /// The current connection attempt; a result of any other is dropped.
     generation: u64,
+    /// The `WWW-Authenticate` header of its last answer asking for a sign-in.
+    challenge: Option<String>,
+    /// Whether it has OAuth tokens, as of its last connection attempt or sign-in.
+    signed_in: bool,
+}
+
+impl Connection {
+    fn new(server: Server, state: ServerState, generation: u64) -> Connection {
+        Connection {
+            server,
+            state,
+            service: None,
+            tools: Vec::new(),
+            pid: None,
+            calls: 0,
+            latency_ms: None,
+            generation,
+            challenge: None,
+            signed_in: false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -64,6 +87,8 @@ pub(crate) struct Gateway {
     notify: Notify,
     /// Finds local servers' commands, with the user's full `PATH`.
     env: Env,
+    /// Holds remote servers' OAuth tokens.
+    vault: Arc<dyn Vault>,
 }
 
 /// Hears a server's notifications.
@@ -98,7 +123,15 @@ impl Gateway {
             held: Arc::new(Mutex::new(held)),
             notify,
             env,
+            vault: Arc::new(Keyring),
         }
+    }
+
+    /// The gateway with its OAuth tokens in `vault`, not the OS keyring.
+    #[cfg(test)]
+    fn with_vault(mut self, vault: Arc<dyn Vault>) -> Gateway {
+        self.vault = vault;
+        self
     }
 
     fn log(&self, source: &str, message: impl Into<String>, error: bool) {
@@ -138,18 +171,13 @@ impl Gateway {
                     None if self.is_held(&server.name) => {
                         connections.insert(
                             server.name.clone(),
-                            Connection {
+                            Connection::new(
                                 server,
-                                state: ServerState::Failed {
+                                ServerState::Failed {
                                     message: HELD.to_owned(),
                                 },
-                                service: None,
-                                tools: Vec::new(),
-                                pid: None,
-                                calls: 0,
-                                latency_ms: None,
-                                generation: next_attempt(),
-                            },
+                                next_attempt(),
+                            ),
                         );
                         continue;
                     }
@@ -158,16 +186,7 @@ impl Gateway {
                 let generation = next_attempt();
                 connections.insert(
                     server.name.clone(),
-                    Connection {
-                        server: server.clone(),
-                        state: ServerState::Starting,
-                        service: None,
-                        tools: Vec::new(),
-                        pid: None,
-                        calls: 0,
-                        latency_ms: None,
-                        generation,
-                    },
+                    Connection::new(server.clone(), ServerState::Starting, generation),
                 );
                 start.push((server, generation));
             }
@@ -358,13 +377,23 @@ impl Gateway {
                 }
                 Err(e) => {
                     let message = format!("{e:#}");
-                    connection.state = match e.downcast_ref::<MissingSecret>() {
-                        Some(MissingSecret(key)) => ServerState::NeedsSecret { key: key.clone() },
-                        None => ServerState::Failed {
+                    let challenge = oauth::sign_in_challenge(&e)
+                        .filter(|_| signs_in(&connection.server.config));
+                    connection.state = match (e.downcast_ref::<MissingSecret>(), &challenge) {
+                        (Some(MissingSecret(key)), _) => {
+                            ServerState::NeedsSecret { key: key.clone() }
+                        }
+                        (None, Some(_)) => ServerState::NeedsSignIn,
+                        (None, None) => ServerState::Failed {
                             message: message.clone(),
                         },
                     };
-                    gateway.log(&name, format!("could not connect: {message}"), true);
+                    if challenge.is_some() {
+                        gateway.log(&name, "needs a sign-in: sign in to it in xolkit", false);
+                    } else {
+                        gateway.log(&name, format!("could not connect: {message}"), true);
+                    }
+                    connection.challenge = challenge;
                 }
             }
             drop(connections);
@@ -383,16 +412,36 @@ impl Gateway {
         };
         // The keyring can block, waiting for the user to unlock it, and finding a launcher may
         // ask the login shell; keep both off the workers.
-        let (config, env) = {
+        let (config, env, tokens) = {
             let (name, config, env) =
                 (server.name.clone(), server.config.clone(), self.env.clone());
+            let gateway = self.clone();
             tokio::task::spawn_blocking(move || {
                 let config = with_secrets(&name, &config)?;
                 let env = match (&config.url, &config.command) {
                     (None, Some(program)) => launcher_env(&env, program),
                     _ => env,
                 };
-                anyhow::Ok((config, env))
+                // Tokens from a sign-in, if it has any. A keyring that can't be read leaves it
+                // to connect without, as it did before it was signed in to.
+                let tokens = match &config.url {
+                    Some(url) if signs_in(&config) => {
+                        let tokens = Tokens::new(gateway.vault.clone(), &name, url);
+                        match tokens.signed_in() {
+                            Ok(signed_in) => signed_in.then_some(tokens),
+                            Err(e) => {
+                                gateway.log(
+                                    &name,
+                                    format!("could not read its sign-in: {e:#}"),
+                                    true,
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                anyhow::Ok((config, env, tokens))
             })
             .await??
         };
@@ -402,6 +451,7 @@ impl Gateway {
             self.current(&server.name, generation),
             "superseded by a newer connection"
         );
+        self.set_signed_in(&server.name, generation, tokens.is_some());
         let (service, pid) = match &config.url {
             Some(url) => {
                 let mut headers = HashMap::new();
@@ -413,11 +463,31 @@ impl Gateway {
                             .with_context(|| format!("bad value for header {key}"))?,
                     );
                 }
-                let transport = StreamableHttpClientTransport::from_config(
-                    StreamableHttpClientTransportConfig::with_uri(url.as_str())
-                        .custom_headers(headers),
-                );
-                (handler.serve(transport).await?, None)
+                let http = StreamableHttpClientTransportConfig::with_uri(url.as_str())
+                    .custom_headers(headers);
+                let service = match tokens {
+                    // Sends the token, refreshing it as it runs out.
+                    Some(tokens) => {
+                        let mut manager = AuthorizationManager::new(url.as_str())
+                            .await
+                            .context("could not set up its sign-in")?;
+                        manager.set_credential_store(tokens);
+                        manager
+                            .initialize_from_store()
+                            .await
+                            .context("could not read its sign-in")?;
+                        let client = AuthClient::new(reqwest::Client::default(), manager);
+                        handler
+                            .serve(StreamableHttpClientTransport::with_client(client, http))
+                            .await?
+                    }
+                    None => {
+                        handler
+                            .serve(StreamableHttpClientTransport::from_config(http))
+                            .await?
+                    }
+                };
+                (service, None)
             }
             None => {
                 // Found the way a shell finds it, so `npx` (npx.cmd on Windows) works.
@@ -556,6 +626,10 @@ impl Gateway {
                     (None, ServerState::NeedsSecret { key }) => {
                         bail!("the server {name} needs {key}; save it in xolkit")
                     }
+                    (None, ServerState::NeedsSignIn) => bail!(
+                        "the server {name} needs a sign-in: ask the user to sign in to it in \
+                         xolkit (MCP servers, {name}, Sign in), then try again"
+                    ),
                     (None, ServerState::Starting) if Instant::now() < deadline => {}
                     (None, state) => bail!("the server {name} is not connected ({state:?})"),
                 }
@@ -590,8 +664,52 @@ impl Gateway {
                 tools: c.tools.len(),
                 calls: c.calls,
                 latency_ms: c.latency_ms,
+                signed_in: c.signed_in,
             })
             .collect()
+    }
+
+    fn set_signed_in(&self, name: &str, generation: u64, signed_in: bool) {
+        if let Some(c) = self.connections.lock().unwrap().get_mut(name)
+            && c.generation == generation
+        {
+            c.signed_in = signed_in;
+        }
+    }
+
+    /// What signing in to `name` needs: its URL, the challenge it last answered with, and where
+    /// its tokens go.
+    pub(crate) fn sign_in_target(&self, name: &str) -> Result<(String, Option<String>, Tokens)> {
+        let connections = self.connections.lock().unwrap();
+        let connection = connections
+            .get(name)
+            .context("turn the server on for an agent first")?;
+        let config = &connection.server.config;
+        let Some(url) = &config.url else {
+            bail!("only remote servers take a sign-in");
+        };
+        anyhow::ensure!(
+            signs_in(config),
+            "{name} sends its own Authorization header; remove it to sign in instead"
+        );
+        Ok((
+            url.clone(),
+            connection.challenge.clone(),
+            Tokens::new(self.vault.clone(), name, url),
+        ))
+    }
+
+    /// Forgets the OAuth tokens of `name`.
+    pub(crate) async fn sign_out(&self, name: &str) -> Result<()> {
+        let vault = self.vault.clone();
+        let key = xolkit_core::oauth_key(name);
+        tokio::task::spawn_blocking(move || vault.set(&key, None))
+            .await
+            .context("the keyring stopped unexpectedly")??;
+        if let Some(c) = self.connections.lock().unwrap().get_mut(name) {
+            c.signed_in = false;
+        }
+        Ok(())
     }
 }
 
@@ -631,6 +749,17 @@ impl std::fmt::Display for MissingSecret {
 }
 
 impl std::error::Error for MissingSecret {}
+
+/// Whether a server with `config` can sign in with OAuth: a remote one that doesn't send its own
+/// `Authorization` header.
+fn signs_in(config: &ServerConfig) -> bool {
+    config.is_remote()
+        && !config
+            .headers
+            .keys()
+            .chain(&config.secrets)
+            .any(|k| k.eq_ignore_ascii_case("authorization"))
+}
 
 /// `config` with the values of its secrets filled in from the keyring.
 fn with_secrets(name: &str, config: &ServerConfig) -> Result<ServerConfig> {
@@ -692,5 +821,118 @@ mod tests {
         assert!(!gateway.is_held("a"));
         assert_eq!(state(&gateway), ServerState::Starting);
         assert_eq!(gateway.connections.lock().unwrap()["a"].server, server("3"));
+    }
+
+    #[derive(Default)]
+    struct MemoryVault(Mutex<HashMap<String, String>>);
+
+    impl Vault for MemoryVault {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+
+        fn set(&self, key: &str, value: Option<&str>) -> Result<()> {
+            let mut entries = self.0.lock().unwrap();
+            match value {
+                Some(value) => entries.insert(key.to_owned(), value.to_owned()),
+                None => entries.remove(key),
+            };
+            Ok(())
+        }
+    }
+
+    async fn settle(gateway: &Gateway) -> ServerState {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = state(gateway);
+            if state != ServerState::Starting {
+                return state;
+            }
+            assert!(Instant::now() < deadline, "it never stopped connecting");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signs_in_to_a_server_that_asks_and_out_again() {
+        let fake = crate::fake_oauth::start().await;
+        let home = tempfile::tempdir().unwrap();
+        let vault = Arc::new(MemoryVault::default());
+        let gateway =
+            Gateway::new(Env::at(home.path()), Arc::new(|_| {})).with_vault(vault.clone());
+        let server = |url: &str| Server {
+            name: "fake".into(),
+            config: ServerConfig {
+                url: Some(url.to_owned()),
+                ..ServerConfig::default()
+            },
+            plugin: None,
+        };
+        gateway.sync(vec![server(&fake.url)]);
+        assert_eq!(settle(&gateway).await, ServerState::NeedsSignIn);
+        let call = gateway.call("fake", "hello", None).await.unwrap_err();
+        assert!(format!("{call:#}").contains("needs a sign-in"), "{call:#}");
+
+        // The app opens the page; a browser that is signed in already comes straight back.
+        let (url, challenge, tokens) = gateway.sign_in_target("fake").unwrap();
+        assert!(challenge.as_deref().unwrap().contains("resource_metadata"));
+        let sign_in = crate::oauth::start(&url, challenge.as_deref(), tokens)
+            .await
+            .unwrap();
+        let page = sign_in.page.clone();
+        let finished = tokio::spawn(sign_in.finish());
+        let browser = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .unwrap();
+        let back = browser.get(&page).send().await.unwrap();
+        assert_eq!(back.status(), 200);
+        assert!(back.text().await.unwrap().contains("Signed in"));
+        finished.await.unwrap().unwrap();
+        assert_eq!(*fake.registrations.lock().unwrap(), 1);
+        let saved = vault.get(&xolkit_core::oauth_key("fake")).unwrap().unwrap();
+        assert!(saved.contains(crate::fake_oauth::TOKEN));
+
+        gateway.restart("fake").unwrap();
+        assert_eq!(settle(&gateway).await, ServerState::Running);
+        assert_eq!(gateway.tools("fake").len(), 1);
+        assert!(gateway.status()[0].signed_in);
+
+        // Tokens are for the URL they were got for, not for one the server moves to.
+        gateway.sync(vec![server(&format!("{}?moved", fake.url))]);
+        assert_eq!(settle(&gateway).await, ServerState::NeedsSignIn);
+        assert!(!gateway.status()[0].signed_in);
+        gateway.sync(vec![server(&fake.url)]);
+        assert_eq!(settle(&gateway).await, ServerState::Running);
+
+        gateway.sign_out("fake").await.unwrap();
+        assert!(
+            vault
+                .get(&xolkit_core::oauth_key("fake"))
+                .unwrap()
+                .is_none()
+        );
+        gateway.restart("fake").unwrap();
+        assert_eq!(settle(&gateway).await, ServerState::NeedsSignIn);
+    }
+
+    #[test]
+    fn a_server_with_its_own_authorization_header_doesnt_sign_in() {
+        let remote = |headers: &[(&str, &str)], secrets: &[&str]| ServerConfig {
+            url: Some("https://x/mcp".into()),
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            secrets: secrets.iter().map(|s| (*s).to_owned()).collect(),
+            ..ServerConfig::default()
+        };
+        assert!(signs_in(&remote(&[("X-Team", "core")], &[])));
+        assert!(!signs_in(&remote(&[("authorization", "Bearer t")], &[])));
+        assert!(!signs_in(&remote(&[], &["Authorization"])));
+        assert!(!signs_in(&ServerConfig {
+            command: Some("x".into()),
+            ..ServerConfig::default()
+        }));
     }
 }

@@ -65,6 +65,16 @@ pub enum Request {
     StopServer {
         name: String,
     },
+    /// Starts signing in to a remote server with OAuth. Answered with [`Response::SignIn`]: the
+    /// page to open in a browser. The daemon saves the tokens when the browser comes back, then
+    /// connects again. A new sign-in to the same server replaces one still waiting.
+    SignIn {
+        name: String,
+    },
+    /// Forgets a server's OAuth tokens, and connects again without them.
+    SignOut {
+        name: String,
+    },
     /// Ends an agent session; its shim connects again at once, as a new session. An idle one is
     /// forgotten until its agent's next message.
     Disconnect {
@@ -81,6 +91,10 @@ pub enum Response {
     /// The daemon is on its way out and took nothing from this connection: connect again.
     Stopping,
     Status(Box<Status>),
+    /// The page to open in a browser to sign in.
+    SignIn {
+        page: String,
+    },
     Error {
         message: String,
     },
@@ -143,6 +157,9 @@ pub struct ServerStatus {
     pub calls: u64,
     /// How long the last call took.
     pub latency_ms: Option<u64>,
+    /// Whether xolkit holds OAuth tokens for it.
+    #[serde(default)]
+    pub signed_in: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -154,6 +171,8 @@ pub enum ServerState {
     NeedsSecret {
         key: String,
     },
+    /// A remote server that wants an OAuth sign-in.
+    NeedsSignIn,
     Failed {
         message: String,
     },
