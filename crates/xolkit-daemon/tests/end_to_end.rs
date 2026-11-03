@@ -313,12 +313,27 @@ async fn serves_an_agent_session() {
         .unwrap()
         .into_inner()
         .unwrap();
+    // A connection the daemon took just before it was told to stop, whose hello and request
+    // come after: it hears `stopping`, so the app knows to go to the next daemon, and isn't cut
+    // off as the daemon exits.
+    let mut late = xolkit_daemon::connect(&env).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
     tokio::task::spawn_blocking(move || {
         let mut app = app;
         app.call(&xolkit_daemon::Request::Shutdown).unwrap();
     })
     .await
     .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let control = serde_json::to_string(&Hello::Control).unwrap();
+    late.write_all(format!("{control}\n{{\"request\":\"status\"}}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut answer = String::new();
+    tokio::io::AsyncBufReadExt::read_line(&mut tokio::io::BufReader::new(late), &mut answer)
+        .await
+        .unwrap();
+    assert_eq!(answer.trim(), r#"{"response":"stopping"}"#);
     daemon.join().unwrap().unwrap();
     assert!(!env.run_dir().join("daemon.pid").exists());
 }

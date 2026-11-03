@@ -41,6 +41,16 @@ const REFUSED_READ: Duration = Duration::from_secs(5);
 /// one that ends because its agent did takes a moment to exit.
 const SHIM_EXIT: Duration = Duration::from_secs(1);
 
+/// A connection the daemon has accepted and not yet taken on or turned away. A stopping daemon
+/// waits for these, so none is cut off before it hears it should go to the next daemon.
+struct Handshake(Arc<Daemon>);
+
+impl Drop for Handshake {
+    fn drop(&mut self) {
+        self.0.handshaking.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub(crate) struct Daemon {
     env: Env,
     library: RwLock<Arc<Library>>,
@@ -58,6 +68,8 @@ pub(crate) struct Daemon {
     shutdown: tokio::sync::Notify,
     /// Set once the daemon has decided to exit; it takes no more sessions.
     stopping: std::sync::atomic::AtomicBool,
+    /// Connections accepted and not yet taken on or turned away.
+    handshaking: AtomicUsize,
     log: Mutex<Option<std::fs::File>>,
     /// Serializes changes, so two plans never run at once.
     executing: tokio::sync::Mutex<()>,
@@ -93,6 +105,7 @@ impl Daemon {
             started: now(),
             shutdown: tokio::sync::Notify::new(),
             stopping: std::sync::atomic::AtomicBool::new(false),
+            handshaking: AtomicUsize::new(0),
             log: Mutex::new(log),
             executing: tokio::sync::Mutex::new(()),
             broken: std::sync::atomic::AtomicBool::new(problem.is_some()),
@@ -503,7 +516,7 @@ impl Daemon {
         }
     }
 
-    async fn serve_connection(self: Arc<Self>, stream: Stream) -> Result<()> {
+    async fn serve_connection(self: Arc<Self>, stream: Stream, handshake: Handshake) -> Result<()> {
         let (recv, send) = tokio::io::split(stream);
         let mut reader = BufReader::new(recv);
         let mut line = String::new();
@@ -516,7 +529,7 @@ impl Daemon {
                 cwd,
                 parent,
             } => {
-                self.serve_session(reader, send, agent, pid, cwd, parent)
+                self.serve_session((reader, send), agent, pid, cwd, parent, handshake)
                     .await
             }
             Hello::Control => {
@@ -530,6 +543,9 @@ impl Daemon {
                     }
                     stopping
                 };
+                if !refused {
+                    drop(handshake);
+                }
                 if refused {
                     // Said, so the app knows nothing ran and connects to the next daemon; said in
                     // answer to its request, once that is read, as the app writes its request
@@ -559,12 +575,12 @@ impl Daemon {
 
     async fn serve_session(
         self: Arc<Self>,
-        reader: BufReader<ReadHalf<Stream>>,
-        writer: WriteHalf<Stream>,
+        (reader, writer): (BufReader<ReadHalf<Stream>>, WriteHalf<Stream>),
         agent: Option<Agent>,
         pid: u32,
         cwd: Option<PathBuf>,
         parent: Option<Parent>,
+        handshake: Handshake,
     ) -> Result<()> {
         let agent = agent.unwrap_or(Agent::Other);
         let registered = {
@@ -609,6 +625,7 @@ impl Daemon {
             }
         };
         let (id, resumed) = registered;
+        drop(handshake);
         let source = format!("session {id}");
         if resumed {
             self.event(&source, "back from idle", false);
@@ -934,8 +951,10 @@ pub async fn run(env: Env) -> Result<()> {
             accepted = listener.accept() => match accepted {
                 Ok(stream) => {
                     let daemon = daemon.clone();
+                    daemon.handshaking.fetch_add(1, Ordering::SeqCst);
+                    let handshake = Handshake(daemon.clone());
                     tokio::spawn(async move {
-                        if let Err(e) = daemon.clone().serve_connection(stream).await {
+                        if let Err(e) = daemon.clone().serve_connection(stream, handshake).await {
                             daemon.event("daemon", format!("connection: {e:#}"), true);
                         }
                     });
@@ -949,6 +968,11 @@ pub async fn run(env: Env) -> Result<()> {
     // from idle meanwhile starts the next daemon instead of losing its request to this one.
     drop(listener);
     ipc::remove_socket(&env, &instance);
+    // Connections already accepted hear that the daemon is stopping before it goes.
+    let deadline = Instant::now() + REFUSED_READ + Duration::from_secs(1);
+    while daemon.handshaking.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     daemon.event("daemon", "stopped", false);
     daemon.gateway().close_all().await;
     let _ = std::fs::remove_file(env.run_dir().join("daemon.pid"));
