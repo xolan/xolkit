@@ -4,8 +4,9 @@
 //! error, connects again and replays the session's opening, so the agent keeps working.
 //!
 //! A session that stays quiet lets go of the daemon, so the daemon can exit and stop its MCP
-//! servers; the agent's next message opens it again the same way. The shim exits when the agent
-//! closes its end, or when the agent's process is gone.
+//! servers; the agent's next message opens it again the same way. Meanwhile the shim watches the
+//! library and tells the agent when its lists may have changed. It exits when the agent closes
+//! its end, or when the agent's process is gone.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, Stdin};
 use tokio::time::Instant;
 use xolkit_core::{Agent, Env, Settings};
 
+use crate::daemon::library_stamp;
 use crate::ipc;
 use crate::protocol::{Hello, Parent};
 
@@ -24,6 +26,13 @@ use crate::protocol::{Hello, Parent};
 const RECONNECTS: u32 = 5;
 /// How often the shim checks that the agent that started it still runs.
 const PARENT_CHECK: Duration = Duration::from_secs(5);
+/// The longest idle time the shim takes from the settings: a day.
+const MAX_IDLE_MINUTES: u64 = 24 * 60;
+/// What tells the agent its lists may have changed.
+const LIST_CHANGED: [&str; 2] = [
+    "notifications/tools/list_changed",
+    "notifications/prompts/list_changed",
+];
 
 /// What ended a connection to the daemon.
 enum Ended {
@@ -43,6 +52,11 @@ struct Session {
     pending: HashMap<String, Value>,
     /// The id of a replayed `initialize`, whose answer the agent must not see.
     swallow: Option<String>,
+    /// Replays so far, for ids of their own.
+    replays: u32,
+    /// Whether the daemon has answered anything: a session of the current protocol, which has
+    /// no `initialize`, is open from then on.
+    answered: bool,
 }
 
 impl Session {
@@ -54,6 +68,11 @@ impl Session {
         match message["method"].as_str() {
             Some("initialize") => self.initialize = Some(line.to_owned()),
             Some("notifications/initialized") => self.initialized = Some(line.to_owned()),
+            // A cancelled request may never be answered.
+            Some("notifications/cancelled") => {
+                self.pending
+                    .remove(&message["params"]["requestId"].to_string());
+            }
             _ => {}
         }
         if message.get("method").is_some()
@@ -79,6 +98,7 @@ impl Session {
             return false;
         }
         self.pending.remove(&id);
+        self.answered = true;
         true
     }
 
@@ -99,17 +119,27 @@ impl Session {
 
     /// Whether the session can let go of the daemon: it has opened and waits on nothing.
     fn can_idle(&self) -> bool {
-        self.initialized.is_some() && self.pending.is_empty()
+        let open = match self.initialize {
+            Some(_) => self.initialized.is_some(),
+            None => self.answered,
+        };
+        open && self.pending.is_empty()
     }
 
     /// The lines that open the session again on a new daemon.
     fn replay(&mut self) -> Vec<String> {
         let mut lines = Vec::new();
-        if let Some(initialize) = &self.initialize {
-            self.swallow = serde_json::from_str::<Value>(initialize)
-                .ok()
-                .and_then(|m| m.get("id").map(Value::to_string));
-            lines.push(initialize.clone());
+        // Under an id of its own, which no request of the agent's can have.
+        if let Some(mut initialize) = self
+            .initialize
+            .as_deref()
+            .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        {
+            self.replays += 1;
+            let id = Value::String(format!("xolkit-replay-{}", self.replays));
+            self.swallow = Some(id.to_string());
+            initialize["id"] = id;
+            lines.push(initialize.to_string());
         }
         lines.extend(self.initialized.clone());
         lines
@@ -160,22 +190,8 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(500 * u64::from(failures))).await;
             continue;
         }
-        if waiting.take().is_some() {
-            // The agent missed what changed while the shim was away: have it list again.
-            for method in [
-                "notifications/tools/list_changed",
-                "notifications/prompts/list_changed",
-            ] {
-                let line = json!({"jsonrpc": "2.0", "method": method}).to_string();
-                stdout.write_all(format!("{line}\n").as_bytes()).await?;
-            }
-            stdout.flush().await?;
-        }
-        // Read again on each connection, so a change in the app applies from the next one.
-        let idle_after = Settings::load(&env.settings_file())
-            .map(|s| s.session_idle_minutes)
-            .unwrap_or(0);
-        let idle_after = (idle_after > 0).then(|| Duration::from_secs(idle_after * 60));
+        waiting = None;
+        let mut idle_after = idle_time(&env);
         let connected = std::time::Instant::now();
         let mut daemon_lines = BufReader::new(recv).lines();
         let mut last_heard = Instant::now();
@@ -219,12 +235,14 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
                     if parent_gone(parent) {
                         return Ok(());
                     }
+                    // A change in the app applies to connected sessions too.
+                    idle_after = idle_time(&env);
                 }
             }
         };
         if let Ended::Idle = ended {
             drop((send, daemon_lines));
-            match wait_idle(&mut agent_lines, parent).await {
+            match wait_idle(&env, &mut agent_lines, &mut stdout, parent).await? {
                 Some(line) => {
                     session.heard_from_agent(&line);
                     waiting = Some(line);
@@ -252,20 +270,55 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
     }
 }
 
-/// Waits, connected to nothing, for the agent's next line; `None` once the agent is gone.
+/// How long a session may stay quiet, from the settings; `None` for always.
+fn idle_time(env: &Env) -> Option<Duration> {
+    let minutes = Settings::load(&env.settings_file())
+        .map(|s| s.session_idle_minutes)
+        .unwrap_or(0);
+    (minutes > 0).then(|| Duration::from_secs(minutes.min(MAX_IDLE_MINUTES) * 60))
+}
+
+/// Waits, connected to nothing, for the agent's next line; `None` once the agent is gone. When
+/// the library changes meanwhile, the agent hears that its lists may have, as it would from the
+/// daemon.
 async fn wait_idle(
+    env: &Env,
     agent_lines: &mut Lines<BufReader<Stdin>>,
+    stdout: &mut tokio::io::Stdout,
     parent: Option<u32>,
-) -> Option<String> {
+) -> Result<Option<String>> {
+    let stamp = || {
+        let env = env.clone();
+        async move {
+            tokio::task::spawn_blocking(move || library_stamp(&env))
+                .await
+                .unwrap_or_default()
+        }
+    };
+    let mut last = stamp().await;
     let mut parent_check = tokio::time::interval(PARENT_CHECK);
     loop {
-        tokio::select! {
-            line = agent_lines.next_line() => return line.ok().flatten(),
+        let line = tokio::select! {
+            line = agent_lines.next_line() => Some(line.ok().flatten()),
             _ = parent_check.tick() => {
                 if parent_gone(parent) {
-                    return None;
+                    return Ok(None);
                 }
+                None
             }
+        };
+        // Looked at once more as the agent comes back, for a change since the last tick.
+        let now = stamp().await;
+        if now != last {
+            last = now;
+            for method in LIST_CHANGED {
+                let line = json!({"jsonrpc": "2.0", "method": method}).to_string();
+                stdout.write_all(format!("{line}\n").as_bytes()).await?;
+            }
+            stdout.flush().await?;
+        }
+        if let Some(line) = line {
+            return Ok(line);
         }
     }
 }
@@ -320,10 +373,19 @@ mod tests {
         let lost = session.abandon();
         assert_eq!(lost.len(), 1);
         assert!(lost[0].contains(r#""id":"a""#), "{}", lost[0]);
-        assert_eq!(session.replay().len(), 2);
-        // The new daemon's answer to the replayed opening isn't passed on; later ones are.
-        assert!(!session.heard_from_daemon(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#));
+        let replay = session.replay();
+        assert_eq!(replay.len(), 2);
+        // The replayed opening has an id of its own, and its answer isn't passed on; an answer
+        // to a request of the agent's under the old id is.
+        assert!(
+            replay[0].contains(r#""id":"xolkit-replay-1""#),
+            "{}",
+            replay[0]
+        );
         assert!(session.heard_from_daemon(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#));
+        assert!(
+            !session.heard_from_daemon(r#"{"jsonrpc":"2.0","id":"xolkit-replay-1","result":{}}"#)
+        );
         assert!(
             session.heard_from_daemon(
                 r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#
@@ -343,5 +405,21 @@ mod tests {
         assert!(!session.can_idle());
         session.heard_from_daemon(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
         assert!(session.can_idle());
+        // A cancelled request no longer holds it.
+        session.heard_from_agent(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call"}"#);
+        session.heard_from_agent(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#,
+        );
+        assert!(session.can_idle());
+    }
+
+    #[test]
+    fn current_protocol_sessions_idle_once_answered() {
+        let mut session = Session::default();
+        session.heard_from_agent(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        assert!(!session.can_idle());
+        session.heard_from_daemon(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+        assert!(session.can_idle());
+        assert!(session.replay().is_empty());
     }
 }

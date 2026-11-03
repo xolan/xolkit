@@ -244,15 +244,15 @@ impl Shelf {
                         ago(status.started),
                         status.idle_minutes
                     )))
-                    .child(div().text_sm().text_color(muted).child(
-                        match status.session_idle_minutes {
+                    .when_some(status.session_idle_minutes, |this, minutes| {
+                        this.child(div().text_sm().text_color(muted).child(match minutes {
                             0 => "Quiet sessions stay connected".to_owned(),
                             minutes => format!(
                                 "Sessions quiet for {} go idle until their agent's next message",
                                 count(minutes as usize, "minute")
                             ),
-                        },
-                    )),
+                        }))
+                    }),
             )
             .child(
                 Button::new("restart-daemon")

@@ -65,8 +65,8 @@ pub enum Request {
     StopServer {
         name: String,
     },
-    /// Ends an agent session; its shim connects again with the agent's next message. An idle
-    /// session is forgotten until then.
+    /// Ends an agent session; its shim connects again at once, as a new session. An idle one is
+    /// forgotten until its agent's next message.
     Disconnect {
         session: u64,
     },
@@ -91,9 +91,10 @@ pub struct Status {
     /// Seconds since the Unix epoch.
     pub started: u64,
     pub idle_minutes: u64,
-    /// Minutes a session may stay quiet before its shim lets go; `0` for never.
+    /// Minutes a session may stay quiet before its shim lets go; `0` for never. `None` from a
+    /// daemon older than 3.1.
     #[serde(default)]
-    pub session_idle_minutes: u64,
+    pub session_idle_minutes: Option<u64>,
     pub sessions: Vec<SessionStatus>,
     pub servers: Vec<ServerStatus>,
     /// Newest last.

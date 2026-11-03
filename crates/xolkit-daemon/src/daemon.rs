@@ -288,7 +288,7 @@ impl Daemon {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             started: self.started,
             idle_minutes: self.library().settings.idle_minutes,
-            session_idle_minutes: self.library().settings.session_idle_minutes,
+            session_idle_minutes: Some(self.library().settings.session_idle_minutes),
             sessions: self
                 .sessions
                 .lock()
@@ -543,6 +543,8 @@ impl Daemon {
             idle.map(|status| {
                 status.idle = false;
                 status.since = now();
+                status.agent = agent;
+                status.cwd = cwd.clone();
                 status.parent = parent.clone();
                 status.id
             })
@@ -602,36 +604,44 @@ impl Daemon {
             self.event(&source, format!("ended: {e:#}"), true);
             return Ok(());
         }
-        // The session ended cleanly: its agent went away, or its shim let go after a quiet
-        // spell and runs on. The app's Disconnect has already removed it.
-        if result.is_ok() {
-            tokio::time::sleep(SHIM_EXIT).await;
-        }
-        let mut sessions = self.sessions.lock().unwrap();
-        // A shim that has connected again in the meantime is a session of its own already.
-        let back = sessions.values().any(|(s, _)| s.id != id && s.pid == pid);
-        let idle = match sessions.get_mut(&id) {
-            Some((status, abort)) if !back && shim_runs(pid) => {
+        // The session ended: its agent went away, or its shim let go after a quiet spell and runs
+        // on. It is idle at once, so a shim that comes straight back picks it up again. The app's
+        // Disconnect has already removed it.
+        let kept = match self.sessions.lock().unwrap().get_mut(&id) {
+            Some((status, abort)) => {
                 status.idle = true;
                 status.since = now();
                 *abort = None;
                 true
             }
-            _ => {
-                sessions.remove(&id);
-                false
-            }
+            None => false,
         };
-        drop(sessions);
-        if idle {
-            self.event(
-                &source,
-                "idle; its shim reconnects with the agent's next message",
-                false,
-            );
-        } else {
+        if !kept {
             self.event(&source, "disconnected", false);
+            return Ok(());
         }
+        tokio::time::sleep(SHIM_EXIT).await;
+        let runs = {
+            let mut sessions = self.sessions.lock().unwrap();
+            // Back already, or forgotten: nothing to say.
+            if !sessions.get(&id).is_some_and(|(s, _)| s.idle) {
+                return Ok(());
+            }
+            let runs = shim_runs(pid);
+            if !runs {
+                sessions.remove(&id);
+            }
+            runs
+        };
+        self.event(
+            &source,
+            if runs {
+                "idle; its shim reconnects with the agent's next message"
+            } else {
+                "disconnected"
+            },
+            false,
+        );
         Ok(())
     }
 
@@ -768,8 +778,9 @@ fn rotate_log(env: &Env) -> Option<std::fs::File> {
         .ok()
 }
 
-/// The modification times of everything the library is read from.
-fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
+/// The modification times of the library's settings and skills, without plugins' files: what
+/// an idle shim watches to tell its agent that its lists may have changed.
+pub(crate) fn library_stamp(env: &Env) -> Vec<Option<SystemTime>> {
     let mtime = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
     let mut times = vec![
         mtime(&env.settings_file()),
@@ -791,6 +802,23 @@ fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
     for skill in folders(&env.skills_dir()) {
         times.extend([mtime(&skill), mtime(&skill.join("SKILL.md"))]);
     }
+    times
+}
+
+/// The modification times of everything the library is read from.
+fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
+    let mtime = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut times = library_stamp(env);
+    let folders = |dir: &Path| -> Vec<PathBuf> {
+        let mut inner: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        inner.sort();
+        inner
+    };
     // Every file of every plugin, as its manifest may point anywhere inside it. Each plugin gets
     // its own share of the cap, so one big plugin can't leave the others unwatched, and
     // dependency, build and Git folders are skipped.
