@@ -520,16 +520,26 @@ impl Daemon {
             Hello::Control => {
                 // Counted under the sessions' lock, as sessions register, so a daemon that has
                 // decided to stop starts no more work for the app either.
-                {
+                let refused = {
                     let _sessions = self.sessions.lock().unwrap();
-                    if self.stopping.load(Ordering::SeqCst) {
-                        return Ok(());
+                    let stopping = self.stopping.load(Ordering::SeqCst);
+                    if !stopping {
+                        self.controls.fetch_add(1, Ordering::SeqCst);
                     }
-                    self.controls.fetch_add(1, Ordering::SeqCst);
+                    stopping
+                };
+                if refused {
+                    // Said, so the app knows nothing ran and connects to the next daemon.
+                    let mut send = send;
+                    let line = serde_json::to_string(&Response::Stopping)? + "\n";
+                    send.write_all(line.as_bytes()).await?;
+                    send.flush().await?;
+                    return Ok(());
                 }
                 let result = self.serve_control(reader, send).await;
-                self.controls.fetch_sub(1, Ordering::SeqCst);
+                // Active until the last moment the app was there, before it stops counting.
                 *self.last_active.lock().unwrap() = Instant::now();
+                self.controls.fetch_sub(1, Ordering::SeqCst);
                 result
             }
         }

@@ -2,6 +2,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use interprocess::local_socket::Stream;
@@ -9,6 +10,9 @@ use xolkit_core::{Action, Env};
 
 use crate::ipc;
 use crate::protocol::{Hello, Request, Response, Status};
+
+/// How many times a request goes to a daemon that says it is stopping before giving up.
+const STOPPING_RETRIES: usize = 5;
 
 pub struct Client {
     env: Env,
@@ -37,7 +41,22 @@ impl Client {
         Ok(self.connection.as_ref().expect("just connected"))
     }
 
+    /// Sends a request, connecting again while the daemon says it is stopping: it took nothing
+    /// from that connection, so even a change is safe to send to the next daemon.
     fn send(&mut self, request: &Request) -> Result<Response> {
+        for _ in 0..STOPPING_RETRIES {
+            match self.send_once(request)? {
+                Response::Stopping => {
+                    self.connection = None;
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                response => return Ok(response),
+            }
+        }
+        bail!("the daemon keeps stopping")
+    }
+
+    fn send_once(&mut self, request: &Request) -> Result<Response> {
         let line = serde_json::to_string(request)? + "\n";
         let mut stream = self.connect()?;
         stream.write_all(line.as_bytes())?;

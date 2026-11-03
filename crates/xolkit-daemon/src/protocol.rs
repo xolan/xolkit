@@ -78,8 +78,12 @@ pub enum Request {
 #[serde(tag = "response", rename_all = "camelCase")]
 pub enum Response {
     Ok,
+    /// The daemon is on its way out and took nothing from this connection: connect again.
+    Stopping,
     Status(Box<Status>),
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Everything the Connections page shows.
@@ -213,5 +217,9 @@ mod tests {
         };
         let line = serde_json::to_string(&error).unwrap();
         assert_eq!(serde_json::from_str::<Response>(&line).unwrap(), error);
+        assert_eq!(
+            serde_json::to_string(&Response::Stopping).unwrap(),
+            r#"{"response":"stopping"}"#
+        );
     }
 }
