@@ -219,7 +219,11 @@ fn write(vault: &dyn Vault, key: &str, text: &str) -> Result<()> {
             )
         });
     if let Err(e) = written {
-        let _ = sweep(vault, key, generation, 1);
+        // Unless the first piece was saved after all, and points at what was written.
+        let landed = matches!(head(vault, key), Ok(Some(h)) if h.generation == generation);
+        if !landed {
+            let _ = sweep(vault, key, generation, 1);
+        }
         return Err(e);
     }
     // The old generation is no longer read; delete finds anything an error leaves of it.
@@ -659,5 +663,32 @@ mod tests {
         );
         delete(&vault, &key).unwrap();
         assert!(vault.0.lock().unwrap().is_empty());
+    }
+
+    /// Saves everything, but reports the first piece's save as failing.
+    struct LyingVault(MemoryVault);
+
+    impl Vault for LyingVault {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.0.get(key)
+        }
+
+        fn set(&self, key: &str, value: Option<&str>) -> Result<()> {
+            self.0.set(key, value)?;
+            anyhow::ensure!(
+                key != oauth_key("s") || value.is_none(),
+                "no answer from the keyring"
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_first_piece_saved_despite_an_error_keeps_its_pieces() {
+        let vault = LyingVault(MemoryVault::default());
+        let key = oauth_key("s");
+        let text = "x".repeat(2500);
+        assert!(write(&vault, &key, &text).is_err());
+        assert_eq!(read(&vault, &key).unwrap(), Some(text));
     }
 }
