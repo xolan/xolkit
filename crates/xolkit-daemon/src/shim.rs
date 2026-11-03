@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, Stdin};
 use tokio::time::Instant;
 use xolkit_core::{Agent, Env, Settings};
 
-use crate::daemon::library_stamp;
+use crate::daemon::fingerprint;
 use crate::ipc;
 use crate::protocol::{Hello, Parent};
 
@@ -52,8 +52,9 @@ struct Session {
     pending: HashMap<String, Value>,
     /// The id of a replayed `initialize`, whose answer the agent must not see.
     swallow: Option<String>,
-    /// Replays so far, for ids of their own.
+    /// Replays so far, and what sets this shim's apart, for ids of their own.
     replays: u32,
+    nonce: String,
     /// Whether the daemon has answered anything: a session of the current protocol, which has
     /// no `initialize`, is open from then on.
     answered: bool,
@@ -136,7 +137,7 @@ impl Session {
             .and_then(|line| serde_json::from_str::<Value>(line).ok())
         {
             self.replays += 1;
-            let id = Value::String(format!("xolkit-replay-{}", self.replays));
+            let id = Value::String(format!("xolkit-replay-{}{}", self.nonce, self.replays));
             self.swallow = Some(id.to_string());
             initialize["id"] = id;
             lines.push(initialize.to_string());
@@ -150,7 +151,16 @@ impl Session {
 pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
     let mut agent_lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
-    let mut session = Session::default();
+    let mut session = Session {
+        nonce: format!(
+            "{}-{}-",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ),
+        ..Session::default()
+    };
     let parent = parent();
     let hello = serde_json::to_string(&Hello::Session {
         agent,
@@ -191,6 +201,9 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
             continue;
         }
         waiting = None;
+        // What the library looked like as this connection opened: a change the daemon hasn't
+        // told the agent of by the time the shim goes idle still reaches it.
+        let opened = library(&env).await;
         let mut idle_after = idle_time(&env);
         let connected = std::time::Instant::now();
         let mut daemon_lines = BufReader::new(recv).lines();
@@ -242,7 +255,7 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
         };
         if let Ended::Idle = ended {
             drop((send, daemon_lines));
-            match wait_idle(&env, &mut agent_lines, &mut stdout, parent).await? {
+            match wait_idle(&env, opened, &mut agent_lines, &mut stdout, parent).await? {
                 Some(line) => {
                     session.heard_from_agent(&line);
                     waiting = Some(line);
@@ -283,19 +296,11 @@ fn idle_time(env: &Env) -> Option<Duration> {
 /// daemon.
 async fn wait_idle(
     env: &Env,
+    mut last: Vec<Option<std::time::SystemTime>>,
     agent_lines: &mut Lines<BufReader<Stdin>>,
     stdout: &mut tokio::io::Stdout,
     parent: Option<u32>,
 ) -> Result<Option<String>> {
-    let stamp = || {
-        let env = env.clone();
-        async move {
-            tokio::task::spawn_blocking(move || library_stamp(&env))
-                .await
-                .unwrap_or_default()
-        }
-    };
-    let mut last = stamp().await;
     let mut parent_check = tokio::time::interval(PARENT_CHECK);
     loop {
         let line = tokio::select! {
@@ -308,7 +313,7 @@ async fn wait_idle(
             }
         };
         // Looked at once more as the agent comes back, for a change since the last tick.
-        let now = stamp().await;
+        let now = library(env).await;
         if now != last {
             last = now;
             for method in LIST_CHANGED {
@@ -321,6 +326,14 @@ async fn wait_idle(
             return Ok(line);
         }
     }
+}
+
+/// The modification times of the library's files, read off the async workers.
+async fn library(env: &Env) -> Vec<Option<std::time::SystemTime>> {
+    let env = env.clone();
+    tokio::task::spawn_blocking(move || fingerprint(&env))
+        .await
+        .unwrap_or_default()
 }
 
 /// The process that started the shim.

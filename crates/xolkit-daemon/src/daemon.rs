@@ -607,14 +607,23 @@ impl Daemon {
         // The session ended: its agent went away, or its shim let go after a quiet spell and runs
         // on. It is idle at once, so a shim that comes straight back picks it up again. The app's
         // Disconnect has already removed it.
-        let kept = match self.sessions.lock().unwrap().get_mut(&id) {
-            Some((status, abort)) => {
-                status.idle = true;
-                status.since = now();
-                *abort = None;
-                true
+        let kept = {
+            let mut sessions = self.sessions.lock().unwrap();
+            // A shim that reconnected before this connection was done is a session of its own.
+            let back = sessions.values().any(|(s, _)| s.id != id && s.pid == pid);
+            match sessions.get_mut(&id) {
+                Some((status, abort)) if !back => {
+                    status.idle = true;
+                    status.since = now();
+                    *abort = None;
+                    true
+                }
+                Some(_) => {
+                    sessions.remove(&id);
+                    false
+                }
+                None => false,
             }
-            None => false,
         };
         if !kept {
             self.event(&source, "disconnected", false);
@@ -778,9 +787,9 @@ fn rotate_log(env: &Env) -> Option<std::fs::File> {
         .ok()
 }
 
-/// The modification times of the library's settings and skills, without plugins' files: what
-/// an idle shim watches to tell its agent that its lists may have changed.
-pub(crate) fn library_stamp(env: &Env) -> Vec<Option<SystemTime>> {
+/// The modification times of everything the library is read from. An idle shim watches them
+/// too, to tell its agent when its lists may have changed.
+pub(crate) fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
     let mtime = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
     let mut times = vec![
         mtime(&env.settings_file()),
@@ -802,23 +811,6 @@ pub(crate) fn library_stamp(env: &Env) -> Vec<Option<SystemTime>> {
     for skill in folders(&env.skills_dir()) {
         times.extend([mtime(&skill), mtime(&skill.join("SKILL.md"))]);
     }
-    times
-}
-
-/// The modification times of everything the library is read from.
-fn fingerprint(env: &Env) -> Vec<Option<SystemTime>> {
-    let mtime = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
-    let mut times = library_stamp(env);
-    let folders = |dir: &Path| -> Vec<PathBuf> {
-        let mut inner: Vec<PathBuf> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        inner.sort();
-        inner
-    };
     // Every file of every plugin, as its manifest may point anywhere inside it. Each plugin gets
     // its own share of the cap, so one big plugin can't leave the others unwatched, and
     // dependency, build and Git folders are skipped.
@@ -908,9 +900,12 @@ pub async fn run(env: Env) -> Result<()> {
         }
     }
     watcher.abort();
+    // No more connections while the servers close, which can take a while: a shim coming back
+    // from idle meanwhile starts the next daemon instead of losing its request to this one.
+    drop(listener);
+    ipc::remove_socket(&env, &instance);
     daemon.event("daemon", "stopped", false);
     daemon.gateway().close_all().await;
-    ipc::remove_socket(&env, &instance);
     let _ = std::fs::remove_file(env.run_dir().join("daemon.pid"));
     Ok(())
 }
