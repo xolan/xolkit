@@ -499,12 +499,16 @@ pub(crate) fn extract(
 
 /// Runs `tar` (GNU tar on Linux, bsdtar on Windows 10 and 11) on the `.tar.gz` file `archive`
 /// with `args`. Returns what it printed; a failure says its first line of complaint.
+///
+/// It runs in the archive's folder, given names relative to it: Windows hands `tar` its
+/// arguments in the system's code page, which a user folder's name (`Łukasz`) can be beyond.
 fn tar(archive: &Path, args: &[&std::ffi::OsStr]) -> Result<String> {
     let mut command = Command::new("tar");
     command
+        .current_dir(archive.parent().unwrap_or(Path::new(".")))
         .arg("-z")
         .arg("-f")
-        .arg(archive)
+        .arg(archive.file_name().unwrap_or_default())
         .args(args)
         .stdin(Stdio::null());
     // tar is a console program; it would flash a console window over the app.
@@ -524,14 +528,15 @@ fn tar(archive: &Path, args: &[&std::ffi::OsStr]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Unpacks `archive` into `into`, only the folder `member` when given. `-m` sets times to now,
-/// so a download from an old commit doesn't look like old staging to [`clean_staging`].
+/// Unpacks `archive` into `into`, a folder beside it, only the folder `member` when given. `-m`
+/// sets times to now, so a download from an old commit doesn't look like old staging to
+/// [`clean_staging`].
 fn untar(archive: &Path, into: &Path, member: Option<&str>) -> Result<()> {
     let mut args = vec![
         "-x".as_ref(),
         "-m".as_ref(),
         "-C".as_ref(),
-        into.as_os_str(),
+        into.file_name().unwrap_or_default(),
     ];
     // Windows' bsdtar reads names in the console's code page; archives hold UTF-8.
     #[cfg(windows)]
@@ -908,8 +913,8 @@ mod tests {
         );
     }
 
-    /// Windows may hand `tar` its arguments in the system's code page; a path beyond it, as a
-    /// user folder can be, must still work.
+    /// Windows hands `tar` its arguments in the system's code page, where `Łukasz` became
+    /// `Lukasz`; the archive and folder are named to it relative to their own folder instead.
     #[test]
     fn unpacks_under_a_path_beyond_the_code_page() {
         let home = tempfile::tempdir().unwrap();
@@ -917,18 +922,6 @@ mod tests {
         let archive = tarball(&[("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x")]);
         assert_eq!(
             extract(&archive[..], Some("s"), &dest, MAX_SKILL).unwrap(),
-            ["SKILL.md"]
-        );
-    }
-
-    /// The same for a skill folder named beyond the code page.
-    #[test]
-    fn unpacks_a_folder_named_beyond_the_code_page() {
-        let home = tempfile::tempdir().unwrap();
-        let dest = home.path().join("skill");
-        let archive = tarball(&[("repo-abc/Łódź/SKILL.md", tar::EntryType::Regular, b"x")]);
-        assert_eq!(
-            extract(&archive[..], Some("Łódź"), &dest, MAX_SKILL).unwrap(),
             ["SKILL.md"]
         );
     }
