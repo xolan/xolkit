@@ -54,6 +54,8 @@ pub(crate) struct Daemon {
     last_active: Mutex<Instant>,
     started: u64,
     shutdown: tokio::sync::Notify,
+    /// Set once the daemon has decided to exit; it takes no more sessions.
+    stopping: std::sync::atomic::AtomicBool,
     log: Mutex<Option<std::fs::File>>,
     /// Serializes changes, so two plans never run at once.
     executing: tokio::sync::Mutex<()>,
@@ -88,6 +90,7 @@ impl Daemon {
             last_active: Mutex::new(Instant::now()),
             started: now(),
             shutdown: tokio::sync::Notify::new(),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             log: Mutex::new(log),
             executing: tokio::sync::Mutex::new(()),
             broken: std::sync::atomic::AtomicBool::new(problem.is_some()),
@@ -395,6 +398,7 @@ impl Daemon {
                 }
             }
             Request::Shutdown => {
+                self.stopping.store(true, Ordering::SeqCst);
                 self.shutdown.notify_one();
                 Ok(())
             }
@@ -533,46 +537,50 @@ impl Daemon {
         parent: Option<Parent>,
     ) -> Result<()> {
         let agent = agent.unwrap_or(Agent::Other);
-        // A shim back from idle picks up its session where it left it.
-        let resumed = {
+        let registered = {
             let mut sessions = self.sessions.lock().unwrap();
+            // A daemon on its way out takes no more sessions: the shim starts the next one.
+            if self.stopping.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            // A shim back from idle picks up its session where it left it.
             let idle = sessions
                 .values_mut()
                 .find(|(s, _)| s.idle && s.pid == pid)
                 .map(|(s, _)| s);
-            idle.map(|status| {
-                status.idle = false;
-                status.since = now();
-                status.agent = agent;
-                status.cwd = cwd.clone();
-                status.parent = parent.clone();
-                status.id
-            })
-        };
-        let id = match resumed {
-            Some(id) => id,
-            None => {
-                let id = self.next_session.fetch_add(1, Ordering::SeqCst);
-                let status = SessionStatus {
-                    id,
-                    agent,
-                    client: None,
-                    pid,
-                    cwd: cwd.clone(),
-                    parent,
-                    connected: now(),
-                    last_call: None,
-                    calls: 0,
-                    errors: 0,
-                    idle: false,
-                    since: now(),
-                };
-                self.sessions.lock().unwrap().insert(id, (status, None));
-                id
+            match idle {
+                Some(status) => {
+                    status.idle = false;
+                    status.since = now();
+                    status.agent = agent;
+                    status.cwd = cwd.clone();
+                    status.parent = parent.clone();
+                    (status.id, true)
+                }
+                None => {
+                    let id = self.next_session.fetch_add(1, Ordering::SeqCst);
+                    let status = SessionStatus {
+                        id,
+                        agent,
+                        client: None,
+                        pid,
+                        cwd: cwd.clone(),
+                        parent,
+                        connected: now(),
+                        last_call: None,
+                        calls: 0,
+                        errors: 0,
+                        idle: false,
+                        since: now(),
+                    };
+                    sessions.insert(id, (status, None));
+                    (id, false)
+                }
             }
         };
+        let (id, resumed) = registered;
         let source = format!("session {id}");
-        if resumed.is_some() {
+        if resumed {
             self.event(&source, "back from idle", false);
         } else {
             let place = cwd
@@ -701,11 +709,18 @@ impl Daemon {
         }
     }
 
-    fn idle(&self) -> bool {
+    /// Decides to stop when nothing has used the daemon for long enough. It is decided under the
+    /// sessions' lock, so no session registers in between and is then cut off.
+    fn stop_if_idle(&self) -> bool {
         let minutes = self.library().settings.idle_minutes;
-        self.sessions.lock().unwrap().values().all(|(s, _)| s.idle)
+        let sessions = self.sessions.lock().unwrap();
+        let idle = sessions.values().all(|(s, _)| s.idle)
             && self.controls.load(Ordering::SeqCst) == 0
-            && self.last_active.lock().unwrap().elapsed() > Duration::from_secs(minutes * 60)
+            && self.last_active.lock().unwrap().elapsed() > Duration::from_secs(minutes * 60);
+        if idle {
+            self.stopping.store(true, Ordering::SeqCst);
+        }
+        idle
     }
 }
 
@@ -875,7 +890,7 @@ pub async fn run(env: Env) -> Result<()> {
                     last = now;
                     daemon.reload();
                 }
-                if daemon.idle() {
+                if daemon.stop_if_idle() {
                     daemon.event("daemon", "idle; exiting", false);
                     daemon.shutdown.notify_one();
                 }

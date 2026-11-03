@@ -200,7 +200,10 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(500 * u64::from(failures))).await;
             continue;
         }
-        waiting = None;
+        // Until the daemon says anything, the replayed opening hasn't been answered, so the
+        // agent's line behind it can't have run: if the connection ends now (the daemon was on
+        // its way out), it is sent again rather than answered with an error.
+        let mut resend = waiting.take().filter(|_| session.initialize.is_some());
         // What the library looked like as this connection opened: a change the daemon hasn't
         // told the agent of by the time the shim goes idle still reaches it.
         let opened = library(&env).await;
@@ -231,6 +234,7 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
                 line = daemon_lines.next_line() => match line {
                     Ok(Some(line)) => {
                         last_heard = Instant::now();
+                        resend = None;
                         if session.heard_from_daemon(&line) {
                             stdout.write_all(format!("{line}\n").as_bytes()).await?;
                             stdout.flush().await?;
@@ -276,10 +280,21 @@ pub async fn run(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(500 * u64::from(failures))).await;
         }
+        let kept = resend.as_deref().and_then(|line| {
+            let id = serde_json::from_str::<Value>(line)
+                .ok()?
+                .get("id")?
+                .to_string();
+            Some((id.clone(), session.pending.remove(&id)?))
+        });
         for line in session.abandon() {
             stdout.write_all(format!("{line}\n").as_bytes()).await?;
         }
         stdout.flush().await?;
+        if let Some((id, sent)) = kept {
+            session.pending.insert(id, sent);
+        }
+        waiting = resend;
     }
 }
 
