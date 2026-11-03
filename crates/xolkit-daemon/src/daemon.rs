@@ -518,7 +518,15 @@ impl Daemon {
                     .await
             }
             Hello::Control => {
-                self.controls.fetch_add(1, Ordering::SeqCst);
+                // Counted under the sessions' lock, as sessions register, so a daemon that has
+                // decided to stop starts no more work for the app either.
+                {
+                    let _sessions = self.sessions.lock().unwrap();
+                    if self.stopping.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    self.controls.fetch_add(1, Ordering::SeqCst);
+                }
                 let result = self.serve_control(reader, send).await;
                 self.controls.fetch_sub(1, Ordering::SeqCst);
                 *self.last_active.lock().unwrap() = Instant::now();
