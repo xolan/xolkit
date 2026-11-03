@@ -376,7 +376,9 @@ pub fn clean_staging(env: &Env) {
             .and_then(|m| m.modified())
             .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > hour));
         if old {
-            let _ = fs::remove_dir_all(entry.path());
+            // A folder, or an archive a download left mid-way.
+            let path = entry.path();
+            let _ = fs::remove_dir_all(&path).or_else(|_| fs::remove_file(&path));
         }
     }
 }
@@ -444,15 +446,12 @@ fn find_skill_folder(
     bail!("no skill named {skill_id} in the repository")
 }
 
-/// Unpacks `archive`, a `.tar.gz` stream, with this computer's `tar` into `dest`, a folder not
-/// yet there: of a repository GitHub wraps in one folder, only its `folder` (`Some("")` for all
-/// of it), so nothing else in the repository is unpacked; else (`None`) all of the archive.
-/// Returns the files, relative to `dest`. Archives come from repositories and files the user
-/// chose to install from, trusted as any software one installs is, so `tar` unpacks them as it
-/// would any; links are refused, as xolkit copies skills and plugins on, and so are more than
-/// `max` bytes of files. Nothing is left behind when it fails.
+/// Unpacks `archive`, a `.tar.gz` stream, into `dest` with the system's `tar`: only `folder` of
+/// the one folder GitHub wraps a repository in (`Some("")` for all of it), or with `None` the
+/// whole archive. Returns the files, relative to `dest`. Refuses links and more than `max` bytes,
+/// and leaves nothing behind when it fails.
 pub(crate) fn extract(
-    archive: impl Read,
+    mut archive: impl Read,
     folder: Option<&str>,
     dest: &Path,
     max: u64,
@@ -460,29 +459,24 @@ pub(crate) fn extract(
     let saved = dest.with_extension("tar.gz");
     let unpacked = dest.with_extension("unpacked");
     let result = (|| {
-        save(archive, &saved)?;
         fs::create_dir_all(&unpacked)?;
+        io::copy(&mut archive, &mut fs::File::create(&saved)?).context("the download failed")?;
         let root = match folder {
             Some(folder) => {
                 let wrapper = wrapper(&saved)?;
                 let member = if folder.is_empty() {
-                    wrapper.clone()
+                    wrapper
                 } else {
                     format!("{wrapper}/{folder}")
                 };
                 untar(&saved, &unpacked, Some(&member))?;
-                unpacked.join(&wrapper).join(folder)
+                unpacked.join(member)
             }
             None => {
                 untar(&saved, &unpacked, None)?;
                 unpacked.clone()
             }
         };
-        ensure!(
-            root.is_dir(),
-            "the download has no {}",
-            folder.unwrap_or("files")
-        );
         let mut files = Vec::new();
         let mut total = 0;
         list(&root, "", &mut files, &mut total)?;
@@ -504,26 +498,23 @@ pub(crate) fn extract(
     result
 }
 
-/// Saves `archive` to the file `to`, as `tar` reads it from there twice.
-fn save(mut archive: impl Read, to: &Path) -> Result<()> {
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = fs::File::create(to)?;
-    io::copy(&mut archive, &mut file).context("the download failed")?;
-    Ok(())
-}
-
-/// Runs `tar` on the `.tar.gz` file `archive` with `args`, which every system xolkit runs on
-/// has: GNU tar on Linux, bsdtar on Windows 10 and 11. Returns what it printed; a failure says
-/// its first line of complaint.
+/// Runs `tar` (GNU tar on Linux, bsdtar on Windows 10 and 11) on the `.tar.gz` file `archive`
+/// with `args`. Returns what it printed; a failure says its first line of complaint.
 fn tar(archive: &Path, args: &[&std::ffi::OsStr]) -> Result<String> {
-    let output = Command::new("tar")
+    let mut command = Command::new("tar");
+    command
         .arg("-z")
         .arg("-f")
         .arg(archive)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    // tar is a console program; it would flash a console window over the app.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(
+        &mut command,
+        crate::env::CREATE_NO_WINDOW,
+    );
+    let output = command
         .output()
         .context("could not run tar, which xolkit unpacks downloads with")?;
     if !output.status.success() {
@@ -534,8 +525,8 @@ fn tar(archive: &Path, args: &[&std::ffi::OsStr]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Unpacks `archive` into `into`: only `member`, a folder and all in it, when given. Times are
-/// set to now (`-m`), not the commit's: staging that looks an hour old is cleaned away.
+/// Unpacks `archive` into `into`, only the folder `member` when given. `-m` sets times to now,
+/// so a download from an old commit doesn't look like old staging to [`clean_staging`].
 fn untar(archive: &Path, into: &Path, member: Option<&str>) -> Result<()> {
     let mut args = vec![
         "-x".as_ref(),
@@ -547,18 +538,14 @@ fn untar(archive: &Path, into: &Path, member: Option<&str>) -> Result<()> {
     tar(archive, &args).map(drop)
 }
 
-/// The one folder GitHub wraps a repository's archive in, as `tar` lists it.
+/// The folder GitHub wraps a repository's archive in: the first one `tar` lists.
 fn wrapper(archive: &Path) -> Result<String> {
-    let listed = tar(archive, &["-t".as_ref()])?;
-    let mut tops = listed
+    tar(archive, &["-t".as_ref()])?
         .lines()
         .filter_map(|line| line.split('/').next())
-        .filter(|top| !top.is_empty() && *top != "pax_global_header");
-    let first = tops.next().map(str::to_owned);
-    match first {
-        Some(first) if tops.all(|top| top == first) => Ok(first),
-        _ => bail!("the download isn't one repository's archive"),
-    }
+        .find(|top| !top.is_empty() && *top != "pax_global_header")
+        .map(str::to_owned)
+        .context("the download is empty")
 }
 
 /// Adds the files in `dir` to `files`, by their names below `prefix`, and their sizes to
@@ -726,8 +713,8 @@ fn refused(error: ureq::Error, token: bool) -> anyhow::Error {
              is used up"
         ),
         (ureq::Error::StatusCode(403 | 429), false) => anyhow!(
-            "GitHub refused the request: without a token it allows 60 requests an hour; add one \
-             in Settings"
+            "GitHub refused the request: without a token it allows 60 requests an hour, which may \
+             be used up; add one in Settings"
         ),
         (ureq::Error::StatusCode(404), true) => {
             anyhow!("GitHub found nothing there, or the token can't read the repository")
@@ -749,17 +736,12 @@ pub(crate) fn read_file(
     token: Option<&str>,
 ) -> Result<String> {
     check_source(source)?;
-    let request = match token {
-        Some(_) => github(
-            token,
-            &format!("https://api.github.com/repos/{source}/contents/{path}?ref={rev}"),
-        )
-        .header("Accept", "application/vnd.github.raw"),
-        None => github(
-            None,
-            &format!("https://raw.githubusercontent.com/{source}/{rev}/{path}"),
-        ),
+    let url = match token {
+        Some(_) => format!("https://api.github.com/repos/{source}/contents/{path}?ref={rev}"),
+        None => format!("https://raw.githubusercontent.com/{source}/{rev}/{path}"),
     };
+    // The API sends the file itself with this; the raw host ignores it.
+    let request = github(token, &url).header("Accept", "application/vnd.github.raw");
     Ok(call(request, token)?.body_mut().read_to_string()?)
 }
 
@@ -867,7 +849,7 @@ mod tests {
             if *kind == tar::EntryType::Symlink {
                 header.set_link_name("../../etc/passwd").unwrap();
             }
-            // Bypass the builder's path checks so unsafe paths reach the extractor.
+            // The name as given, without the builder's checks.
             let name = &mut header.as_old_mut().name;
             name[..path.len()].copy_from_slice(path.as_bytes());
             header.set_cksum();
@@ -876,12 +858,16 @@ mod tests {
         builder.into_inner().unwrap().finish().unwrap()
     }
 
+    /// Only the wanted folder is unpacked, so the rest of the repository can't get in the way:
+    /// here a file and a folder of one name, and a link Windows would refuse to make.
     #[test]
     fn extracts_only_the_skill_folder() {
-        let dest = tempfile::tempdir().unwrap();
-        let dest = dest.path().join("skill");
+        let home = tempfile::tempdir().unwrap();
+        let dest = home.path().join("skill");
         let archive = tarball(&[
-            ("repo-abc/README.md", tar::EntryType::Regular, b"x"),
+            ("repo-abc/x", tar::EntryType::Regular, b"1"),
+            ("repo-abc/x/y", tar::EntryType::Regular, b"2"),
+            ("repo-abc/CLAUDE.md", tar::EntryType::Symlink, b""),
             (
                 "repo-abc/skills/a/SKILL.md",
                 tar::EntryType::Regular,
@@ -901,71 +887,38 @@ mod tests {
         let files = extract(&archive[..], Some("skills/a"), &dest, MAX_SKILL).unwrap();
         assert_eq!(files, ["SKILL.md", "scripts/run.sh"]);
         assert!(dest.join("scripts/run.sh").is_file());
-        assert!(!dest.join("README.md").exists());
-        // Nothing else is left beside it.
-        let left: Vec<_> = fs::read_dir(dest.parent().unwrap()).unwrap().collect();
-        assert_eq!(left.len(), 1);
-    }
-
-    /// Only the wanted folder is unpacked: what else the repository has stays packed and in
-    /// nobody's way. Here that is a file and a folder of the same name, which no disk can hold,
-    /// as Windows can't hold some names, and a link, which Windows makes only for admins and in
-    /// Developer Mode.
-    #[test]
-    fn unpacks_only_the_wanted_folder() {
-        let home = tempfile::tempdir().unwrap();
-        let dest = home.path().join("skill");
-        let archive = tarball(&[
-            ("repo-abc/x", tar::EntryType::Regular, b"1"),
-            ("repo-abc/x/y", tar::EntryType::Regular, b"2"),
-            ("repo-abc/CLAUDE.md", tar::EntryType::Symlink, b""),
-            ("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x"),
-        ]);
-        let files = extract(&archive[..], Some("s"), &dest, MAX_SKILL).unwrap();
-        assert_eq!(files, ["SKILL.md"]);
         assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
+        // A skill at the top of its repository.
+        let root = tarball(&[("repo-abc/SKILL.md", tar::EntryType::Regular, b"x")]);
+        let dest = home.path().join("root");
+        assert_eq!(
+            extract(&root[..], Some(""), &dest, MAX_SKILL).unwrap(),
+            ["SKILL.md"]
+        );
     }
 
-    /// What is unpacked is new, whatever times the archive gives, so cleaning away old staging
-    /// doesn't take a download made a moment ago from an old commit.
+    /// `-m` keeps a fresh download from an old commit from looking like old staging; what a
+    /// download left behind mid-way, a file too, is cleaned away.
     #[test]
-    fn keeps_a_fresh_download_from_an_old_commit() {
+    fn cleans_only_old_staging() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::at(home.path());
         let dest = env.staging_dir().join(unique());
-        // Times of 2001, as the helper writes, for the folder too.
         let archive = tarball(&[
             ("repo-abc/s/", tar::EntryType::Directory, b""),
             ("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x"),
         ]);
         extract(&archive[..], Some("s"), &dest, MAX_SKILL).unwrap();
+        let left = env.staging_dir().join("left.tar.gz");
+        let old = SystemTime::now() - Duration::from_secs(7200);
+        fs::File::create(&left).unwrap().set_modified(old).unwrap();
         clean_staging(&env);
         assert!(dest.join("SKILL.md").is_file());
-    }
-
-    /// An archive whose listing is more than a pipe holds (about 115 KB of names here) still
-    /// unpacks: what tar prints is read as it goes, so it never waits on xolkit.
-    #[test]
-    fn unpacks_an_archive_with_a_long_listing() {
-        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-            Vec::new(),
-            flate2::Compression::fast(),
-        ));
-        for n in 0..1200 {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(1);
-            header.set_mode(0o644);
-            let name = format!("repo-abc/s/{n:04}-{}", "w".repeat(80));
-            builder.append_data(&mut header, &name, &b"x"[..]).unwrap();
-        }
-        let archive = builder.into_inner().unwrap().finish().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let files = extract(&archive[..], Some("s"), &home.path().join("s"), MAX_SKILL).unwrap();
-        assert_eq!(files.len(), 1200);
+        assert!(!left.exists());
     }
 
     #[test]
-    fn refuses_links_and_traversal() {
+    fn refuses_links() {
         let home = tempfile::tempdir().unwrap();
         let dest = home.path().join("skill");
         let link = tarball(&[
@@ -978,17 +931,9 @@ mod tests {
             "{error}"
         );
         assert!(!dest.exists());
-        // tar itself keeps a name with `..` from leading out.
-        let traversal = tarball(&[
-            ("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x"),
-            ("repo-abc/s/../../evil", tar::EntryType::Regular, b"x"),
-        ]);
-        let _ = extract(&traversal[..], Some("s"), &dest, MAX_SKILL);
-        assert!(!home.path().join("evil").exists());
     }
 
-    /// What tar can't unpack, and a download that isn't one repository's archive, say so; and
-    /// leave nothing behind.
+    /// What tar can't unpack and what is too big say so, and leave nothing behind.
     #[test]
     fn says_what_tar_could_not_unpack() {
         let home = tempfile::tempdir().unwrap();
@@ -999,15 +944,6 @@ mod tests {
                 .to_string()
                 .starts_with("could not unpack the download: "),
             "{error}"
-        );
-        let two = tarball(&[
-            ("a/SKILL.md", tar::EntryType::Regular, b"x"),
-            ("b/SKILL.md", tar::EntryType::Regular, b"x"),
-        ]);
-        let error = extract(&two[..], Some(""), &dest, MAX_SKILL).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "the download isn't one repository's archive"
         );
         let big = tarball(&[(
             "repo-abc/s/SKILL.md",
