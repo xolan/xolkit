@@ -856,6 +856,8 @@ impl Daemon {
         let sessions = self.sessions.lock().unwrap();
         let idle = sessions.values().all(|(s, _)| s.idle)
             && self.controls.load(Ordering::SeqCst) == 0
+            // A browser still on its way back to a sign-in needs someone to come back to.
+            && self.sign_ins.lock().unwrap().is_empty()
             && self.last_active.lock().unwrap().elapsed() > Duration::from_secs(minutes * 60);
         if idle {
             self.stopping.store(true, Ordering::SeqCst);

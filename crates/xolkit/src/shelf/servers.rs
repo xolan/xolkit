@@ -749,8 +749,9 @@ impl Shelf {
                             },
                         )?;
                     }
+                    // The server is gone either way; the daemon logs a sign-out that fails.
                     if let Some(sign_out) = sign_out {
-                        settings::call(&client, sign_out)?;
+                        let _ = settings::call(&client, sign_out);
                     }
                     anyhow::Ok(())
                 })
