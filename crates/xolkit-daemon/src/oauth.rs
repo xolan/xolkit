@@ -203,8 +203,8 @@ fn read(vault: &dyn Vault, key: &str) -> Result<Option<String>> {
 /// whatever is left of a generation starts at 1, and [`sweep`] finds it without the first piece.
 fn write(vault: &dyn Vault, key: &str, text: &str) -> Result<()> {
     let pieces = pieces(text);
-    let old = head(vault, key)?.map_or(1, |h| h.generation);
-    let generation = if old == 0 { 1 } else { 0 };
+    let old = head(vault, key)?.map(|h| h.generation);
+    let generation = if old == Some(0) { 1 } else { 0 };
     // Anything left there by a write that failed.
     sweep(vault, key, generation, 1)?;
     let written = pieces
@@ -224,6 +224,9 @@ fn write(vault: &dyn Vault, key: &str, text: &str) -> Result<()> {
     }
     // The old generation is no longer read; delete finds anything an error leaves of it.
     let _ = sweep(vault, key, 1 - generation, 1);
+    if let Some(old) = old.filter(|&g| g > 1) {
+        let _ = sweep(vault, key, old, 1);
+    }
     Ok(())
 }
 
@@ -258,6 +261,10 @@ fn pieces(text: &str) -> Vec<String> {
 fn delete(vault: &dyn Vault, key: &str) -> Result<()> {
     sweep(vault, key, 0, 1)?;
     sweep(vault, key, 1, 1)?;
+    // And whatever other generation the first piece names, should it name one.
+    if let Some(head) = head(vault, key)?.filter(|h| h.generation > 1) {
+        sweep(vault, key, head.generation, 1)?;
+    }
     vault.set(key, None)
 }
 
@@ -637,5 +644,20 @@ mod tests {
         Tokens::forget(vault.as_ref(), &epochs, "s").unwrap();
         let left = vault.inner.0.lock().unwrap().clone();
         assert!(left.is_empty(), "{:?}", left.keys());
+    }
+
+    #[test]
+    fn a_sign_out_removes_pieces_of_any_generation_the_first_names() {
+        let vault = MemoryVault::default();
+        let key = oauth_key("s");
+        vault.set(&key, Some("7 3\nfirst")).unwrap();
+        vault.set(&piece_key(&key, 7, 1), Some("second")).unwrap();
+        vault.set(&piece_key(&key, 7, 2), Some("third")).unwrap();
+        assert_eq!(
+            read(&vault, &key).unwrap().as_deref(),
+            Some("firstsecondthird")
+        );
+        delete(&vault, &key).unwrap();
+        assert!(vault.0.lock().unwrap().is_empty());
     }
 }
