@@ -59,19 +59,24 @@ struct Saved {
 const CHUNK: usize = 1000;
 
 /// Counts sign-outs per server, so a token write begun before one (a sign-in coming back, a
-/// refresh) can't put the tokens back after it. Every read and write of tokens holds its lock.
+/// refresh) can't put the tokens back after it.
 #[derive(Clone, Default)]
-pub(crate) struct Epochs(Arc<Mutex<HashMap<String, u64>>>);
+pub(crate) struct Epochs {
+    /// Only ever held for a moment.
+    counts: Arc<Mutex<HashMap<String, u64>>>,
+    /// Held by every read and write of tokens, which may wait for the keyring to be unlocked.
+    io: Arc<Mutex<()>>,
+}
 
 impl Epochs {
     fn current(&self, name: &str) -> u64 {
-        self.0.lock().unwrap().get(name).copied().unwrap_or(0)
+        self.counts.lock().unwrap().get(name).copied().unwrap_or(0)
     }
 }
 
 /// A server's tokens in the vault, bound to its URL: tokens saved for one address are never sent
-/// to another, even when a server keeps its name and changes its URL. They are kept in pieces
-/// under `oauth/<name>` and `oauth/<name>/<n>`; the first says how many there are.
+/// to another, even when a server keeps its name and changes its URL. They are kept in pieces;
+/// see [`write`].
 #[derive(Clone)]
 pub(crate) struct Tokens {
     vault: Arc<dyn Vault>,
@@ -97,14 +102,19 @@ impl Tokens {
     /// Forgets server `name`'s tokens, and stops any write under way from putting them back.
     /// Blocks.
     pub(crate) fn forget(vault: &dyn Vault, epochs: &Epochs, name: &str) -> Result<()> {
-        let mut epochs = epochs.0.lock().unwrap();
-        *epochs.entry(name.to_owned()).or_default() += 1;
+        let _io = epochs.io.lock().unwrap();
+        *epochs
+            .counts
+            .lock()
+            .unwrap()
+            .entry(name.to_owned())
+            .or_default() += 1;
         delete(vault, &oauth_key(name))
     }
 
     /// The saved credentials, if they are for this URL. Blocks.
     fn read(&self) -> Result<Option<StoredCredentials>> {
-        let _lock = self.epochs.0.lock().unwrap();
+        let _io = self.epochs.io.lock().unwrap();
         self.read_locked()
     }
 
@@ -121,9 +131,9 @@ impl Tokens {
 
     /// Runs `write` unless the server has been signed out of since these were made. Blocks.
     fn write(&self, write: impl FnOnce(&Tokens) -> Result<()>) -> Result<()> {
-        let epochs = self.epochs.0.lock().unwrap();
+        let _io = self.epochs.io.lock().unwrap();
         anyhow::ensure!(
-            epochs.get(&self.name).copied().unwrap_or(0) == self.epoch,
+            self.epochs.current(&self.name) == self.epoch,
             "signed out of {} meanwhile",
             self.name
         );
@@ -147,19 +157,38 @@ impl Tokens {
     }
 }
 
+/// What the first piece under `key` says: the generation of the rest, and how many pieces there
+/// are in all.
+struct Head {
+    generation: u64,
+    count: usize,
+    first: String,
+}
+
+fn head(vault: &dyn Vault, key: &str) -> Result<Option<Head>> {
+    Ok(vault.get(key)?.and_then(|text| {
+        let (line, first) = text.split_once('\n')?;
+        let (generation, count) = line.split_once(' ')?;
+        Some(Head {
+            generation: generation.parse().ok()?,
+            count: count.parse().ok()?,
+            first: first.to_owned(),
+        })
+    }))
+}
+
+fn piece_key(key: &str, generation: u64, i: usize) -> String {
+    format!("{key}/{generation}/{i}")
+}
+
 /// The text kept in pieces under `key`, if it is all there.
 fn read(vault: &dyn Vault, key: &str) -> Result<Option<String>> {
-    let Some(head) = vault.get(key)? else {
+    let Some(head) = head(vault, key)? else {
         return Ok(None);
     };
-    let Some((count, mut text)) = head
-        .split_once('\n')
-        .and_then(|(n, first)| Some((n.parse::<usize>().ok()?, first.to_owned())))
-    else {
-        return Ok(None);
-    };
-    for i in 1..count {
-        match vault.get(&format!("{key}/{i}"))? {
+    let mut text = head.first;
+    for i in 1..head.count {
+        match vault.get(&piece_key(key, head.generation, i))? {
             Some(piece) => text.push_str(&piece),
             None => return Ok(None),
         }
@@ -167,23 +196,30 @@ fn read(vault: &dyn Vault, key: &str) -> Result<Option<String>> {
     Ok(Some(text))
 }
 
-/// Keeps `text` in pieces under `key`, replacing what was there.
+/// Keeps `text` in pieces under `key`, replacing what was there: the first at `key`, saying how
+/// many there are, the rest at `key/<generation>/<n>`. A new generation is written in full before
+/// the first piece points at it, so a write that fails halfway leaves the old text whole.
 fn write(vault: &dyn Vault, key: &str, text: &str) -> Result<()> {
     let pieces = pieces(text);
-    let old = count(vault, key)?;
-    // The rest first, then the first piece, which says how many to read.
+    let old = head(vault, key)?;
+    let generation = old.as_ref().map_or(0, |h| h.generation.wrapping_add(1));
     for (i, piece) in pieces.iter().enumerate().skip(1) {
-        vault.set(&format!("{key}/{i}"), Some(piece))?;
+        vault.set(&piece_key(key, generation, i), Some(piece))?;
     }
-    let first = pieces.first().map(String::as_str).unwrap_or_default();
-    vault.set(key, Some(&format!("{}\n{first}", pieces.len().max(1))))?;
-    for i in pieces.len().max(1)..old {
-        vault.set(&format!("{key}/{i}"), None)?;
+    vault.set(
+        key,
+        Some(&format!("{generation} {}\n{}", pieces.len(), pieces[0])),
+    )?;
+    // The old generation is no longer read; one left over by an error is only clutter.
+    if let Some(old) = old {
+        for i in 1..old.count {
+            let _ = vault.set(&piece_key(key, old.generation, i), None);
+        }
     }
     Ok(())
 }
 
-/// `text` in pieces of at most `CHUNK` UTF-16 units.
+/// `text` in pieces of at most `CHUNK` UTF-16 units; at least one.
 fn pieces(text: &str) -> Vec<String> {
     let mut pieces = vec![String::new()];
     let mut units = 0;
@@ -199,19 +235,13 @@ fn pieces(text: &str) -> Vec<String> {
 }
 
 fn delete(vault: &dyn Vault, key: &str) -> Result<()> {
-    // The first piece last: it says how many there are, for a retry after an error.
-    for i in (1..count(vault, key)?).rev() {
-        vault.set(&format!("{key}/{i}"), None)?;
+    // The first piece last: it says where the rest are, for a retry after an error.
+    if let Some(head) = head(vault, key)? {
+        for i in (1..head.count).rev() {
+            vault.set(&piece_key(key, head.generation, i), None)?;
+        }
     }
     vault.set(key, None)
-}
-
-/// How many pieces are kept under `key`.
-fn count(vault: &dyn Vault, key: &str) -> Result<usize> {
-    Ok(vault
-        .get(key)?
-        .and_then(|head| head.split_once('\n')?.0.parse().ok())
-        .unwrap_or(1))
 }
 
 #[async_trait]
@@ -534,5 +564,41 @@ mod tests {
             format!("{refused:#}").contains("isn't a web page"),
             "{refused:#}"
         );
+    }
+
+    /// Fails every write once `fail_after` more have gone through.
+    struct FlakyVault {
+        inner: MemoryVault,
+        fail_after: Mutex<Option<usize>>,
+    }
+
+    impl Vault for FlakyVault {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.inner.get(key)
+        }
+
+        fn set(&self, key: &str, value: Option<&str>) -> Result<()> {
+            if let Some(left) = self.fail_after.lock().unwrap().as_mut() {
+                anyhow::ensure!(*left > 0, "the keyring went away");
+                *left -= 1;
+            }
+            self.inner.set(key, value)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_that_fails_halfway_leaves_the_old_tokens_whole() {
+        let vault = Arc::new(FlakyVault {
+            inner: MemoryVault::default(),
+            fail_after: Mutex::new(None),
+        });
+        let tokens = Tokens::new(vault.clone(), Epochs::default(), "s", "https://x/mcp");
+        let old = "a".repeat(2500);
+        tokens.save(credentials(&old)).await.unwrap();
+        // Same length, so pieces of the two would fit together.
+        *vault.fail_after.lock().unwrap() = Some(1);
+        assert!(tokens.save(credentials(&"b".repeat(2500))).await.is_err());
+        *vault.fail_after.lock().unwrap() = None;
+        assert_eq!(token(tokens.load().await.unwrap()), Some(old));
     }
 }
