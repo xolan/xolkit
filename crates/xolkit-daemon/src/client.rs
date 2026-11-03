@@ -46,6 +46,11 @@ impl Client {
     fn send(&mut self, request: &Request) -> Result<Response> {
         for _ in 0..STOPPING_RETRIES {
             match self.send_once(request)? {
+                // What was asked is happening anyway; a new daemon to stop would be wasted.
+                Response::Stopping if matches!(request, Request::Shutdown) => {
+                    self.connection = None;
+                    return Ok(Response::Ok);
+                }
                 Response::Stopping => {
                     self.connection = None;
                     std::thread::sleep(Duration::from_millis(200));
