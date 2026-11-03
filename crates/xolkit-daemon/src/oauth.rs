@@ -197,24 +197,44 @@ fn read(vault: &dyn Vault, key: &str) -> Result<Option<String>> {
 }
 
 /// Keeps `text` in pieces under `key`, replacing what was there: the first at `key`, saying how
-/// many there are, the rest at `key/<generation>/<n>`. A new generation is written in full before
-/// the first piece points at it, so a write that fails halfway leaves the old text whole.
+/// many there are, the rest at `key/<generation>/<n>`. Generations take turns, 0 and 1: the new
+/// one is written in full before the first piece points at it, so a write that fails halfway
+/// leaves the old text whole. Pieces are written from 1 up and removed from the top down, so
+/// whatever is left of a generation starts at 1, and [`sweep`] finds it without the first piece.
 fn write(vault: &dyn Vault, key: &str, text: &str) -> Result<()> {
     let pieces = pieces(text);
-    let old = head(vault, key)?;
-    let generation = old.as_ref().map_or(0, |h| h.generation.wrapping_add(1));
-    for (i, piece) in pieces.iter().enumerate().skip(1) {
-        vault.set(&piece_key(key, generation, i), Some(piece))?;
+    let old = head(vault, key)?.map_or(1, |h| h.generation);
+    let generation = if old == 0 { 1 } else { 0 };
+    // Anything left there by a write that failed.
+    sweep(vault, key, generation, 1)?;
+    let written = pieces
+        .iter()
+        .enumerate()
+        .skip(1)
+        .try_for_each(|(i, piece)| vault.set(&piece_key(key, generation, i), Some(piece)))
+        .and_then(|()| {
+            vault.set(
+                key,
+                Some(&format!("{generation} {}\n{}", pieces.len(), pieces[0])),
+            )
+        });
+    if let Err(e) = written {
+        let _ = sweep(vault, key, generation, 1);
+        return Err(e);
     }
-    vault.set(
-        key,
-        Some(&format!("{generation} {}\n{}", pieces.len(), pieces[0])),
-    )?;
-    // The old generation is no longer read; one left over by an error is only clutter.
-    if let Some(old) = old {
-        for i in 1..old.count {
-            let _ = vault.set(&piece_key(key, old.generation, i), None);
-        }
+    // The old generation is no longer read; delete finds anything an error leaves of it.
+    let _ = sweep(vault, key, 1 - generation, 1);
+    Ok(())
+}
+
+/// Removes generation `generation`'s pieces from `from` up, top down.
+fn sweep(vault: &dyn Vault, key: &str, generation: u64, from: usize) -> Result<()> {
+    let mut end = from;
+    while vault.get(&piece_key(key, generation, end))?.is_some() {
+        end += 1;
+    }
+    for i in (from..end).rev() {
+        vault.set(&piece_key(key, generation, i), None)?;
     }
     Ok(())
 }
@@ -234,13 +254,10 @@ fn pieces(text: &str) -> Vec<String> {
     pieces
 }
 
+/// Removes every piece under `key`, of either generation, even ones a failed write left.
 fn delete(vault: &dyn Vault, key: &str) -> Result<()> {
-    // The first piece last: it says where the rest are, for a retry after an error.
-    if let Some(head) = head(vault, key)? {
-        for i in (1..head.count).rev() {
-            vault.set(&piece_key(key, head.generation, i), None)?;
-        }
-    }
+    sweep(vault, key, 0, 1)?;
+    sweep(vault, key, 1, 1)?;
     vault.set(key, None)
 }
 
@@ -600,5 +617,25 @@ mod tests {
         assert!(tokens.save(credentials(&"b".repeat(2500))).await.is_err());
         *vault.fail_after.lock().unwrap() = None;
         assert_eq!(token(tokens.load().await.unwrap()), Some(old));
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_leaves_nothing_a_failed_write_left_behind() {
+        let vault = Arc::new(FlakyVault {
+            inner: MemoryVault::default(),
+            fail_after: Mutex::new(None),
+        });
+        let epochs = Epochs::default();
+        let tokens = Tokens::new(vault.clone(), epochs.clone(), "s", "https://x/mcp");
+        tokens.save(credentials(&"a".repeat(3500))).await.unwrap();
+        // Every way a write can stop: after each of its keyring writes in turn.
+        for fail_after in 0..8 {
+            *vault.fail_after.lock().unwrap() = Some(fail_after);
+            let _ = tokens.save(credentials(&"b".repeat(4500))).await;
+        }
+        *vault.fail_after.lock().unwrap() = None;
+        Tokens::forget(vault.as_ref(), &epochs, "s").unwrap();
+        let left = vault.inner.0.lock().unwrap().clone();
+        assert!(left.is_empty(), "{:?}", left.keys());
     }
 }
