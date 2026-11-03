@@ -54,8 +54,8 @@ struct Saved {
     credentials: StoredCredentials,
 }
 
-/// The longest piece of tokens kept in one keyring entry: Windows holds 2560 bytes in one, and
-/// keeps text as UTF-16.
+/// The most UTF-16 units of tokens kept in one keyring entry: Windows holds 2560 bytes in one,
+/// and keeps text as UTF-16.
 const CHUNK: usize = 1000;
 
 /// Counts sign-outs per server, so a token write begun before one (a sign-in coming back, a
@@ -169,8 +169,7 @@ fn read(vault: &dyn Vault, key: &str) -> Result<Option<String>> {
 
 /// Keeps `text` in pieces under `key`, replacing what was there.
 fn write(vault: &dyn Vault, key: &str, text: &str) -> Result<()> {
-    let chars: Vec<char> = text.chars().collect();
-    let pieces: Vec<String> = chars.chunks(CHUNK).map(|c| c.iter().collect()).collect();
+    let pieces = pieces(text);
     let old = count(vault, key)?;
     // The rest first, then the first piece, which says how many to read.
     for (i, piece) in pieces.iter().enumerate().skip(1) {
@@ -184,13 +183,27 @@ fn write(vault: &dyn Vault, key: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// `text` in pieces of at most `CHUNK` UTF-16 units.
+fn pieces(text: &str) -> Vec<String> {
+    let mut pieces = vec![String::new()];
+    let mut units = 0;
+    for c in text.chars() {
+        if units + c.len_utf16() > CHUNK {
+            pieces.push(String::new());
+            units = 0;
+        }
+        units += c.len_utf16();
+        pieces.last_mut().expect("never empty").push(c);
+    }
+    pieces
+}
+
 fn delete(vault: &dyn Vault, key: &str) -> Result<()> {
-    let old = count(vault, key)?;
-    vault.set(key, None)?;
-    for i in 1..old {
+    // The first piece last: it says how many there are, for a retry after an error.
+    for i in (1..count(vault, key)?).rev() {
         vault.set(&format!("{key}/{i}"), None)?;
     }
-    Ok(())
+    vault.set(key, None)
 }
 
 /// How many pieces are kept under `key`.
@@ -466,7 +479,7 @@ mod tests {
         let vault = Arc::new(MemoryVault::default());
         let tokens = Tokens::new(vault.clone(), Epochs::default(), "s", "https://x/mcp");
         // A JWT-sized token, past what one Windows credential holds.
-        let long = "é".repeat(2600);
+        let long = format!("{}{}", "é".repeat(1500), "🔑".repeat(700));
         tokens.save(credentials(&long)).await.unwrap();
         let entries = vault.0.lock().unwrap().clone();
         assert!(entries.len() >= 3, "{:?}", entries.keys());

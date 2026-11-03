@@ -445,8 +445,30 @@ impl Daemon {
 
     /// Reconnects to server `name`, unless the library can't be read or a save holds it.
     async fn restart_server(&self, name: &str) -> Result<()> {
-        // Under the lock, so a server held while it is saved isn't started halfway.
+        self.restart(name, false).await
+    }
+
+    /// Reconnects to server `name` after its tokens changed. One stopped by hand stays so, one
+    /// no agent has on has nothing to reconnect, and one a save holds, or any while the library
+    /// can't be read, connects once that is put right.
+    async fn reconnect_if_on(&self, name: &str) -> Result<()> {
+        self.restart(name, true).await
+    }
+
+    async fn restart(&self, name: &str, only_if_on: bool) -> Result<()> {
+        // Under the lock, so a server held while it is saved isn't started halfway, and one
+        // stopped meanwhile is seen stopped.
         let _running = self.executing.lock().await;
+        if only_if_on {
+            let on = self
+                .gateway()
+                .status()
+                .iter()
+                .any(|s| s.name == name && s.state != crate::protocol::ServerState::Stopped);
+            if !on || self.gateway().is_held(name) || self.broken.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+        }
         // Its settings may be older than its secrets until the library is read again.
         if self.broken.load(Ordering::SeqCst) {
             Err(anyhow::anyhow!("the library can't be read; fix it first"))
@@ -457,22 +479,6 @@ impl Daemon {
             ))
         } else {
             self.gateway().restart(name)
-        }
-    }
-
-    /// Reconnects to server `name` after its tokens changed. One stopped by hand stays so, one
-    /// no agent has on has nothing to reconnect, and one a save holds, or any while the library
-    /// can't be read, connects once that is put right.
-    async fn reconnect_if_on(&self, name: &str) -> Result<()> {
-        let on = self
-            .gateway()
-            .status()
-            .iter()
-            .any(|s| s.name == name && s.state != crate::protocol::ServerState::Stopped);
-        if on && !self.gateway().is_held(name) && !self.broken.load(Ordering::SeqCst) {
-            self.restart_server(name).await
-        } else {
-            Ok(())
         }
     }
 
