@@ -50,6 +50,11 @@ keeps a log. The app is a window onto the daemon: it reads `~/.xolkit`, and ever
 makes goes through the daemon. The one exception is `~/.xolkit/staging`, where the app puts
 downloads while you review them.
 
+A session that stays quiet (10 minutes by default; Settings → Daemon) lets go of the daemon,
+and its shim connects again with the agent's next message, so an agent never notices. Once
+every session is idle and the app is closed, the daemon exits and stops its MCP servers. A shim
+exits when its agent does, even if something else still holds its input open.
+
 How a skill reaches an agent:
 
 1. You start a Claude Code session. Claude Code starts `xolkit mcp`, which tells the daemon it
@@ -147,7 +152,7 @@ Download `xolkit-<version>-<arch>-unknown-linux-gnu.tar.gz` and its `.sha256` fr
 you picked and run:
 
 ```bash
-version=3.0.1
+version=3.1.0
 name=xolkit-$version-$(uname -m)-unknown-linux-gnu
 sha256sum -c "$name.tar.gz.sha256" &&
   tar -xzf "$name.tar.gz" &&

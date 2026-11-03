@@ -18,8 +18,19 @@ pub enum Hello {
         pid: u32,
         /// The folder the agent started it in: the session's project.
         cwd: Option<PathBuf>,
+        /// The process that started the shim: the agent, or the app hosting it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<Parent>,
     },
     Control,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Parent {
+    pub pid: u32,
+    /// Its program's name, where the OS says (Linux).
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -54,7 +65,8 @@ pub enum Request {
     StopServer {
         name: String,
     },
-    /// Ends an agent session; the agent may start a new one.
+    /// Ends an agent session; its shim connects again with the agent's next message. An idle
+    /// session is forgotten until then.
     Disconnect {
         session: u64,
     },
@@ -79,6 +91,9 @@ pub struct Status {
     /// Seconds since the Unix epoch.
     pub started: u64,
     pub idle_minutes: u64,
+    /// Minutes a session may stay quiet before its shim lets go; `0` for never.
+    #[serde(default)]
+    pub session_idle_minutes: u64,
     pub sessions: Vec<SessionStatus>,
     pub servers: Vec<ServerStatus>,
     /// Newest last.
@@ -95,10 +110,19 @@ pub struct SessionStatus {
     /// The shim's process.
     pub pid: u32,
     pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub parent: Option<Parent>,
     pub connected: u64,
     pub last_call: Option<u64>,
     pub calls: u64,
     pub errors: u64,
+    /// Whether the shim has let go of the daemon after a quiet spell. It is still running, and
+    /// connects again with the agent's next message.
+    #[serde(default)]
+    pub idle: bool,
+    /// When the session last connected or went idle.
+    #[serde(default)]
+    pub since: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -162,12 +186,24 @@ mod tests {
             agent: Some(Agent::Codex),
             pid: 7,
             cwd: None,
+            parent: None,
         };
         let line = serde_json::to_string(&hello).unwrap();
         assert_eq!(
             line,
             r#"{"kind":"session","agent":"codex","pid":7,"cwd":null}"#
         );
+        assert_eq!(serde_json::from_str::<Hello>(&line).unwrap(), hello);
+        let hello = Hello::Session {
+            agent: None,
+            pid: 7,
+            cwd: None,
+            parent: Some(Parent {
+                pid: 6,
+                name: Some("codex".into()),
+            }),
+        };
+        let line = serde_json::to_string(&hello).unwrap();
         assert_eq!(serde_json::from_str::<Hello>(&line).unwrap(), hello);
         let request = serde_json::to_string(&Request::Disconnect { session: 3 }).unwrap();
         assert_eq!(request, r#"{"request":"disconnect","session":3}"#);

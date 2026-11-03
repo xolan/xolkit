@@ -13,6 +13,7 @@ use crate::{Agent, Profile, Provider};
 pub const DEFAULT_PROFILE: &str = "Default";
 const MAX_NAME: usize = 40;
 const DEFAULT_IDLE_MINUTES: u64 = 5;
+const DEFAULT_SESSION_IDLE_MINUTES: u64 = 10;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +33,10 @@ pub struct Settings {
     /// Minutes the daemon waits with no sessions and no app before it exits.
     #[serde(default = "default_idle")]
     pub idle_minutes: u64,
+    /// Minutes an agent session may go without a message before its shim lets go of the daemon;
+    /// it connects again with the agent's next message. `0` keeps sessions connected.
+    #[serde(default = "default_session_idle")]
+    pub session_idle_minutes: u64,
     /// Where GitHub downloads get a token from.
     #[serde(default)]
     pub github: GitHubAccess,
@@ -42,6 +47,10 @@ pub struct Settings {
 
 fn default_idle() -> u64 {
     DEFAULT_IDLE_MINUTES
+}
+
+fn default_session_idle() -> u64 {
+    DEFAULT_SESSION_IDLE_MINUTES
 }
 
 impl Default for Settings {
@@ -103,6 +112,7 @@ impl Settings {
                 router: Vec::new(),
                 marketplaces: Vec::new(),
                 idle_minutes: DEFAULT_IDLE_MINUTES,
+                session_idle_minutes: DEFAULT_SESSION_IDLE_MINUTES,
                 github: GitHubAccess::default(),
                 other,
             }
@@ -306,6 +316,7 @@ mod tests {
         assert_eq!(settings.get("theme"), Some("xolkit Dark"));
         assert_eq!(settings.github, GitHubAccess::Token);
         assert_eq!(settings.idle_minutes, DEFAULT_IDLE_MINUTES);
+        assert_eq!(settings.session_idle_minutes, DEFAULT_SESSION_IDLE_MINUTES);
         let saved = serde_json::to_value(&settings).unwrap();
         assert_eq!(saved["theme"], "xolkit Dark");
         assert_eq!(saved["profile"], "Work");

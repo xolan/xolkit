@@ -29,6 +29,16 @@ use crate::theme;
 const NEW_TOKEN_URL: &str = "https://github.com/settings/personal-access-tokens/new";
 /// The idle timeouts to pick from, in minutes.
 const IDLE_CHOICES: [u64; 4] = [1, 5, 15, 60];
+/// Minutes a quiet agent session stays connected; `0` for always.
+const SESSION_IDLE_CHOICES: [u64; 5] = [5, 10, 30, 60, 0];
+
+fn session_idle_label(minutes: u64) -> String {
+    if minutes == 0 {
+        "Never".to_owned()
+    } else {
+        count(minutes as usize, "minute")
+    }
+}
 
 impl Shelf {
     /// Asks GitHub for the request limit the current choice gets, which also proves the token works.
@@ -319,6 +329,12 @@ impl Shelf {
         self.save_settings(settings, Vec::new(), None, window, cx);
     }
 
+    fn set_session_idle(&mut self, minutes: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let mut settings = self.settings().clone();
+        settings.session_idle_minutes = minutes;
+        self.save_settings(settings, Vec::new(), None, window, cx);
+    }
+
     pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let active_theme = cx.theme().theme_name().clone();
         let theme = cx.theme().clone();
@@ -502,7 +518,9 @@ impl Shelf {
                             .child(div().text_sm().text_color(muted).child(
                                 "The daemon serves agent sessions and connects to MCP servers. \
                                  The first session or the app starts it; it exits once no \
-                                 session and no app has used it for this long.",
+                                 session and no app has used it for this long. A session that \
+                                 stays quiet lets go of it, and connects again with the agent's \
+                                 next message.",
                             ))
                             .child(
                                 h_flex()
@@ -535,6 +553,44 @@ impl Shelf {
                                                                 shelf
                                                                     .update(cx, |shelf, cx| {
                                                                         shelf.set_idle(
+                                                                            minutes, window, cx,
+                                                                        )
+                                                                    })
+                                                                    .ok();
+                                                            }),
+                                                        );
+                                                    }
+                                                    menu
+                                                }
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("session-idle")
+                                            .small()
+                                            .outline()
+                                            .label(match self.settings().session_idle_minutes {
+                                                0 => "Sessions never go idle".to_owned(),
+                                                minutes => format!(
+                                                    "Sessions idle after {}",
+                                                    count(minutes as usize, "minute")
+                                                ),
+                                            })
+                                            .dropdown_menu({
+                                                let shelf = cx.weak_entity();
+                                                let current = self.settings().session_idle_minutes;
+                                                move |menu, _, _| {
+                                                    let mut menu = menu;
+                                                    for minutes in SESSION_IDLE_CHOICES {
+                                                        let shelf = shelf.clone();
+                                                        menu = menu.item(
+                                                            PopupMenuItem::new(session_idle_label(
+                                                                minutes,
+                                                            ))
+                                                            .checked(minutes == current)
+                                                            .on_click(move |_, window, cx| {
+                                                                shelf
+                                                                    .update(cx, |shelf, cx| {
+                                                                        shelf.set_session_idle(
                                                                             minutes, window, cx,
                                                                         )
                                                                     })

@@ -82,8 +82,10 @@ async fn serves_an_agent_session() {
     let mut stream = xolkit_daemon::connect(&env).await.unwrap();
     let hello = Hello::Session {
         agent: Some(Agent::Claude),
-        pid: 1,
+        // A process that runs on after the session ends, as a shim that goes idle does.
+        pid: std::process::id(),
         cwd: Some(home.path().to_path_buf()),
+        parent: None,
     };
     stream
         .write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())
@@ -253,7 +255,39 @@ async fn serves_an_agent_session() {
         .into_inner()
         .unwrap();
 
+    // The session ends while its "shim" runs on: the daemon keeps it, idle, and picks it up
+    // again when the same shim connects.
+    let id = status.sessions[0].id;
     session.cancel().await.unwrap();
+    let app = std::sync::Arc::new(std::sync::Mutex::new(app));
+    let idle = async |want: bool| {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || {
+            let status = app.lock().unwrap().status().unwrap();
+            status.sessions.len() == 1
+                && status.sessions[0].id == id
+                && status.sessions[0].idle == want
+        })
+        .await
+        .unwrap()
+    };
+    wait_for("the idle session", async || idle(true).await).await;
+    let mut stream = xolkit_daemon::connect(&env).await.unwrap();
+    stream
+        .write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    let session = Agentish::default()
+        .serve(tokio::io::split(stream))
+        .await
+        .unwrap();
+    wait_for("the session back", async || idle(false).await).await;
+    session.cancel().await.unwrap();
+    let app = std::sync::Arc::try_unwrap(app)
+        .ok()
+        .unwrap()
+        .into_inner()
+        .unwrap();
     tokio::task::spawn_blocking(move || {
         let mut app = app;
         app.call(&xolkit_daemon::Request::Shutdown).unwrap();

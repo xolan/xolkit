@@ -15,7 +15,7 @@ use xolkit_core::{Agent, Env};
 
 pub use client::Client;
 pub use protocol::{
-    Event, Hello, Request, Response, ServerState, ServerStatus, SessionStatus, Status,
+    Event, Hello, Parent, Request, Response, ServerState, ServerStatus, SessionStatus, Status,
 };
 
 /// Connects to the daemon of `env`, if it runs, without starting it.
@@ -36,5 +36,10 @@ pub fn run_daemon(env: Env) -> Result<()> {
 
 /// `xolkit mcp`: serves one agent session through the daemon, which `exe` starts when needed.
 pub fn run_shim(env: Env, exe: &Path, agent: Option<Agent>) -> Result<()> {
-    runtime()?.block_on(shim::run(env, exe, agent))
+    let runtime = runtime()?;
+    let result = runtime.block_on(shim::run(env, exe, agent));
+    // Without waiting for the thread reading stdin: when the shim leaves because its agent is
+    // gone, something else may still hold stdin open, and that read never returns.
+    runtime.shutdown_background();
+    result
 }
