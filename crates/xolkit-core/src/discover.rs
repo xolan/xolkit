@@ -14,7 +14,7 @@ use crate::skills::frontmatter;
 use crate::{Action, Env};
 
 const USER_AGENT: &str = concat!("xolkit/", env!("CARGO_PKG_VERSION"));
-/// A GET request to GitHub, and its answer.
+/// A GET request to GitHub.
 pub(crate) type Request = ureq::RequestBuilder<ureq::typestate::WithoutBody>;
 /// How long a request to GitHub may take.
 const WAIT: Duration = Duration::from_secs(60);
@@ -904,6 +904,31 @@ mod tests {
         let dest = home.path().join("root");
         assert_eq!(
             extract(&root[..], Some(""), &dest, MAX_SKILL).unwrap(),
+            ["SKILL.md"]
+        );
+    }
+
+    /// Windows may hand `tar` its arguments in the system's code page; a path beyond it, as a
+    /// user folder can be, must still work.
+    #[test]
+    fn unpacks_under_a_path_beyond_the_code_page() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = home.path().join("Łukasz").join("skill");
+        let archive = tarball(&[("repo-abc/s/SKILL.md", tar::EntryType::Regular, b"x")]);
+        assert_eq!(
+            extract(&archive[..], Some("s"), &dest, MAX_SKILL).unwrap(),
+            ["SKILL.md"]
+        );
+    }
+
+    /// The same for a skill folder named beyond the code page.
+    #[test]
+    fn unpacks_a_folder_named_beyond_the_code_page() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = home.path().join("skill");
+        let archive = tarball(&[("repo-abc/Łódź/SKILL.md", tar::EntryType::Regular, b"x")]);
+        assert_eq!(
+            extract(&archive[..], Some("Łódź"), &dest, MAX_SKILL).unwrap(),
             ["SKILL.md"]
         );
     }
