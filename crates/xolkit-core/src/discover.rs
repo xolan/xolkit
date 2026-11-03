@@ -533,6 +533,9 @@ fn untar(archive: &Path, into: &Path, member: Option<&str>) -> Result<()> {
         "-C".as_ref(),
         into.as_os_str(),
     ];
+    // Windows' bsdtar reads names in the console's code page; archives hold UTF-8.
+    #[cfg(windows)]
+    args.extend(["--options", "hdrcharset=UTF-8"].map(std::ffi::OsStr::new));
     args.extend(member.map(std::ffi::OsStr::new));
     tar(archive, &args).map(drop)
 }
