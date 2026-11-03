@@ -218,20 +218,25 @@ fn write(vault: &dyn Vault, key: &str, text: &str) -> Result<()> {
                 Some(&format!("{generation} {}\n{}", pieces.len(), pieces[0])),
             )
         });
-    if let Err(e) = written {
-        // Unless the first piece was saved after all, and points at what was written.
-        let landed = matches!(head(vault, key), Ok(Some(h)) if h.generation == generation);
-        if !landed {
-            let _ = sweep(vault, key, generation, 1);
+    if written.is_err() {
+        // Where the first piece points now: the old text, or (saved despite the error) the new.
+        match head(vault, key) {
+            Ok(head) if head.as_ref().map(|h| h.generation) != Some(generation) => {
+                let _ = sweep(vault, key, generation, 1);
+                return written;
+            }
+            // Switched after all: tidy up as after a write that went well.
+            Ok(_) => {}
+            // Unknown: keep everything; delete finds pieces of 0 and 1 either way.
+            Err(_) => return written,
         }
-        return Err(e);
     }
     // The old generation is no longer read; delete finds anything an error leaves of it.
     let _ = sweep(vault, key, 1 - generation, 1);
     if let Some(old) = old.filter(|&g| g > 1) {
         let _ = sweep(vault, key, old, 1);
     }
-    Ok(())
+    written
 }
 
 /// Removes generation `generation`'s pieces from `from` up, top down.
@@ -687,8 +692,12 @@ mod tests {
     fn a_first_piece_saved_despite_an_error_keeps_its_pieces() {
         let vault = LyingVault(MemoryVault::default());
         let key = oauth_key("s");
+        // Over pieces of a generation only earlier builds wrote.
+        vault.0.set(&key, Some("7 2\nold")).unwrap();
+        vault.0.set(&piece_key(&key, 7, 1), Some("er")).unwrap();
         let text = "x".repeat(2500);
         assert!(write(&vault, &key, &text).is_err());
         assert_eq!(read(&vault, &key).unwrap(), Some(text));
+        assert!(vault.get(&piece_key(&key, 7, 1)).unwrap().is_none());
     }
 }
