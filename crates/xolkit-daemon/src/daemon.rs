@@ -968,13 +968,16 @@ pub async fn run(env: Env) -> Result<()> {
     // from idle meanwhile starts the next daemon instead of losing its request to this one.
     drop(listener);
     ipc::remove_socket(&env, &instance);
-    // Connections already accepted hear that the daemon is stopping before it goes.
-    let deadline = Instant::now() + REFUSED_READ + Duration::from_secs(1);
-    while daemon.handshaking.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     daemon.event("daemon", "stopped", false);
-    daemon.gateway().close_all().await;
+    // Connections already accepted hear that the daemon is stopping before it goes, while the
+    // servers close, so the two waits don't add up.
+    let handshakes = async {
+        let deadline = Instant::now() + REFUSED_READ + Duration::from_secs(1);
+        while daemon.handshaking.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::join!(handshakes, daemon.gateway().close_all());
     let _ = std::fs::remove_file(env.run_dir().join("daemon.pid"));
     Ok(())
 }
