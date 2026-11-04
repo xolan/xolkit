@@ -188,13 +188,20 @@ impl Env {
         PathBuf::from(program)
     }
 
-    /// Whether `program` is missing from the user's whole `PATH` as it is now: from the login
-    /// shell, or on Windows from the registry, as a newly started program would get it. `false`
+    /// Whether `program` is missing from both the configured `PATH` and the user's whole
+    /// `PATH` as it is now: from the login shell, or on Windows from the registry. `false`
     /// when that can't be told.
     pub fn tool_gone(&self, program: &str) -> bool {
+        self.tool_gone_with(program, || self.with_fresh_path())
+    }
+
+    fn tool_gone_with(&self, program: &str, fresh: impl FnOnce() -> Option<Env>) -> bool {
+        // A tool we can still run is present, even when a fresh shell cannot find it.
+        if self.has_tool(program) {
+            return false;
+        }
         // A PATH that can't be read or put together can't tell either.
-        self.with_fresh_path()
-            .is_some_and(|fresh| !fresh.has_tool(program))
+        fresh().is_some_and(|fresh| !fresh.has_tool(program))
     }
 
     /// This environment with the `PATH` as it is now, merged with this process's own.
@@ -566,6 +573,40 @@ mod tests {
         assert_eq!(merged, paths(&["/a", "/b", "/c", "/d"]));
         assert_eq!(merge_paths(None, paths(&["/c"])), paths(&["/c"]));
         assert_eq!(merge_paths(None, None), None);
+    }
+
+    #[test]
+    fn a_tool_on_the_configured_path_is_not_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::at(dir.path());
+        env.path = Some(dir.path().into());
+        // A distinct name keeps this independent of agents installed on the host.
+        let program = "xolkit-configured-path-test-provider";
+        let extension = if cfg!(windows) {
+            let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE".into());
+            let Some(extension) = pathext.split(';').find(|ext| {
+                [".com", ".exe", ".bat", ".cmd"]
+                    .iter()
+                    .any(|known| ext.eq_ignore_ascii_case(known))
+            }) else {
+                // This host cannot discover any runnable file type through PATH.
+                return;
+            };
+            extension.to_owned()
+        } else {
+            String::new()
+        };
+        let tool = dir.path().join(format!("{program}{extension}"));
+        std::fs::write(&tool, "").unwrap();
+        let mut fresh = env.clone();
+        fresh.path = Some(dir.path().join("empty-bin").into());
+        assert!(!fresh.has_tool(program));
+        assert!(!env.tool_gone_with(program, || Some(fresh.clone())));
+        // Once the configured tool is removed, a readable fresh PATH proves absence;
+        // an unreadable PATH still cannot. No host shell or registry is involved.
+        std::fs::remove_file(tool).unwrap();
+        assert!(env.tool_gone_with(program, || Some(fresh)));
+        assert!(!env.tool_gone_with(program, || None));
     }
 
     #[test]
