@@ -1023,7 +1023,14 @@ mod tests {
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> claude.log\nexit 0\n",
             )
             .unwrap();
-            let retry = update_plugin(&env, &settings, &lock, &fetched_update(&env, true)).unwrap();
+            let retry =
+                update_plugin(&env, &settings, &interrupted, &fetched_update(&env, true)).unwrap();
+            for command in [
+                "claude plugin uninstall p@xolkit --scope user",
+                "codex plugin remove p@xolkit",
+            ] {
+                assert!(runs(&retry).iter().any(|run| run == command));
+            }
             crate::execute(&env, &retry).unwrap();
             let updated = Lock::read(&env.lock_file()).unwrap();
             assert_eq!(updated.plugins["p@m"].native, BTreeSet::from(Provider::ALL));
