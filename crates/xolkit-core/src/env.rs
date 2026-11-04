@@ -192,13 +192,16 @@ impl Env {
     /// `PATH` as it is now: from the login shell, or on Windows from the registry. `false`
     /// when that can't be told.
     pub fn tool_gone(&self, program: &str) -> bool {
+        self.tool_gone_with(program, || self.with_fresh_path())
+    }
+
+    fn tool_gone_with(&self, program: &str, fresh: impl FnOnce() -> Option<Env>) -> bool {
         // A tool we can still run is present, even when a fresh shell cannot find it.
         if self.has_tool(program) {
             return false;
         }
         // A PATH that can't be read or put together can't tell either.
-        self.with_fresh_path()
-            .is_some_and(|fresh| !fresh.has_tool(program))
+        fresh().is_some_and(|fresh| !fresh.has_tool(program))
     }
 
     /// This environment with the `PATH` as it is now, merged with this process's own.
@@ -584,9 +587,17 @@ mod tests {
         } else {
             program.to_owned()
         };
-        std::fs::write(dir.path().join(filename), "").unwrap();
-        assert!(env.has_tool(program));
-        assert!(!env.tool_gone(program));
+        let tool = dir.path().join(filename);
+        std::fs::write(&tool, "").unwrap();
+        let mut fresh = env.clone();
+        fresh.path = Some(dir.path().join("empty-bin").into());
+        assert!(!fresh.has_tool(program));
+        assert!(!env.tool_gone_with(program, || Some(fresh.clone())));
+        // Once the configured tool is removed, a readable fresh PATH proves absence;
+        // an unreadable PATH still cannot. No host shell or registry is involved.
+        std::fs::remove_file(tool).unwrap();
+        assert!(env.tool_gone_with(program, || Some(fresh)));
+        assert!(!env.tool_gone_with(program, || None));
     }
 
     #[test]
