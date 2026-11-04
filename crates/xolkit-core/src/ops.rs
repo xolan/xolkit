@@ -30,11 +30,13 @@ pub enum Action {
         from: PathBuf,
         to: PathBuf,
     },
-    /// Swaps a downloaded folder into place, restoring the installed folder if the move fails.
+    /// Swaps a downloaded folder into place and runs its refresh steps. Restores the installed
+    /// folder if the move or any refresh step fails; the last step commits the new pin.
     ReplaceDir {
         from: PathBuf,
         to: PathBuf,
         backup: PathBuf,
+        steps: Vec<Action>,
     },
     WriteFile {
         path: PathBuf,
@@ -148,10 +150,14 @@ impl Action {
                 format!("Move the download to {}", show(to))
             }
             Action::Rename { from, .. } => format!("Move {} aside", show(from)),
-            Action::ReplaceDir { to, .. } => format!(
-                "Replace {} (keep the old copy until the update finishes)",
-                show(to)
-            ),
+            Action::ReplaceDir { to, steps, .. } => {
+                let mut lines = vec![format!(
+                    "Replace {} (restore the old copy if the refresh fails)",
+                    show(to)
+                )];
+                lines.extend(steps.iter().map(|step| step.describe(env)));
+                lines.join("\n")
+            }
             Action::WriteFile { path, .. } => format!("Write {}", show(path)),
             Action::PinSkill { name, pin: Some(_) }
             | Action::PinPlugin {
@@ -230,7 +236,12 @@ fn run(env: &Env, action: &Action) -> Result<()> {
             fs::create_dir_all(to.parent().context("target has no parent directory")?)?;
             Ok(fs::rename(from, to)?)
         }
-        Action::ReplaceDir { from, to, backup } => {
+        Action::ReplaceDir {
+            from,
+            to,
+            backup,
+            steps,
+        } => {
             anyhow::ensure!(
                 fs::symlink_metadata(to).is_ok_and(|m| m.is_dir()),
                 "{} is not a folder xolkit can replace",
@@ -238,7 +249,19 @@ fn run(env: &Env, action: &Action) -> Result<()> {
             );
             fs::create_dir_all(backup.parent().context("backup has no parent directory")?)?;
             fs::rename(to, backup)?;
-            if let Err(error) = fs::rename(from, to) {
+            let refresh = fs::rename(from, to)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| execute(env, steps));
+            if let Err(error) = refresh {
+                // Preserve the failed download while restoring the previous installed files.
+                if to.exists() {
+                    fs::rename(to, from).with_context(|| {
+                        format!(
+                            "could not move the failed update aside; old copy is at {}",
+                            backup.display()
+                        )
+                    })?;
+                }
                 fs::rename(backup, to).with_context(|| {
                     format!(
                         "could not restore {}; the old copy is at {}",
@@ -246,7 +269,7 @@ fn run(env: &Env, action: &Action) -> Result<()> {
                         backup.display()
                     )
                 })?;
-                return Err(error.into());
+                return Err(error);
             }
             Ok(())
         }
@@ -447,6 +470,7 @@ mod tests {
                 from: home.path().join("missing-download"),
                 to: target.clone(),
                 backup: backup.clone(),
+                steps: Vec::new(),
             }],
         );
         assert!(result.is_err());

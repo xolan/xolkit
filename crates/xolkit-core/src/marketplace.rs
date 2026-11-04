@@ -274,11 +274,7 @@ pub fn update_plugin(
     );
     let previous = Plugin::read(&target).context("could not read the installed plugin")?;
     let old = env.staging_dir().join(format!("{}-old", unique()));
-    let mut actions = vec![Action::ReplaceDir {
-        from: plugin.dir.clone(),
-        to: target.clone(),
-        backup: old.clone(),
-    }];
+    let mut actions = Vec::new();
     let mut after = lock.clone();
     for provider in &installed.native {
         actions.extend(native_uninstall(env, &after, &previous, *provider));
@@ -299,7 +295,7 @@ pub fn update_plugin(
     after.plugins.insert(plugin.id.clone(), pin);
     if plugin.needs_native() {
         let updated = Plugin {
-            dir: target,
+            dir: target.clone(),
             ..plugin.clone()
         };
         let mut providers = installed.native.clone();
@@ -312,6 +308,15 @@ pub fn update_plugin(
             }
         }
         for provider in providers {
+            // Record intent before invoking a new provider: a CLI can install successfully
+            // and still report failure. Retry and uninstall must own that possible install.
+            if !installed.native.contains(&provider) {
+                actions.push(Action::SetNative {
+                    id: plugin.id.clone(),
+                    provider,
+                    installed: true,
+                });
+            }
             actions.extend(native_install(env, &after, &updated, provider)?);
             after
                 .plugins
@@ -328,15 +333,30 @@ pub fn update_plugin(
             ));
         }
     }
-    // Keep the old pin and native ownership until every external step succeeds. A failed
-    // refresh then still offers the update, with all original providers available for retry.
-    actions.retain(|action| !matches!(action, Action::SetNative { .. }));
+    // Keep the old content pin and all attempted native providers until completion. A failed
+    // refresh still offers the update and retains ownership for retry or uninstall cleanup.
+    actions.retain(|action| {
+        !matches!(
+            action,
+            Action::SetNative {
+                installed: false,
+                ..
+            }
+        )
+    });
     actions.push(Action::PinPlugin {
         id: plugin.id.clone(),
         pin: after.plugins.get(&plugin.id).cloned(),
     });
-    actions.push(Action::Remove { path: old });
-    Ok(actions)
+    Ok(vec![
+        Action::ReplaceDir {
+            from: plugin.dir.clone(),
+            to: target,
+            backup: old.clone(),
+            steps: actions,
+        },
+        Action::Remove { path: old },
+    ])
 }
 
 /// Downloads plugin `id` as `pin` has it, as a shared profile pins it. `token` is needed for a
@@ -771,8 +791,18 @@ mod tests {
         Plugin::read(&dir).unwrap()
     }
 
-    fn runs(actions: &[Action]) -> Vec<String> {
+    fn flattened(actions: &[Action]) -> Vec<Action> {
         actions
+            .iter()
+            .flat_map(|action| match action {
+                Action::ReplaceDir { steps, .. } => flattened(steps),
+                other => vec![other.clone()],
+            })
+            .collect()
+    }
+
+    fn runs(actions: &[Action]) -> Vec<String> {
+        flattened(actions)
             .iter()
             .filter_map(|a| match a {
                 Action::Run { provider, args } | Action::Undo { provider, args, .. } => {
@@ -865,16 +895,16 @@ mod tests {
         ] {
             assert!(commands.iter().any(|c| c == command), "{commands:?}");
         }
-        assert!(actions.contains(&Action::SetClaudePlugin {
+        assert!(flattened(&actions).contains(&Action::SetClaudePlugin {
             id: "p@xolkit".into(),
             enabled: true
         }));
-        assert!(actions.contains(&Action::SetCodexPlugin {
+        assert!(flattened(&actions).contains(&Action::SetCodexPlugin {
             id: "p@xolkit".into(),
             enabled: false
         }));
         assert_eq!(
-            actions
+            flattened(&actions)
                 .iter()
                 .filter(|a| matches!(a, Action::Copy { .. }))
                 .count(),
@@ -914,7 +944,12 @@ mod tests {
     #[test]
     fn failed_native_refresh_keeps_old_pin_and_all_providers_for_retry() {
         use std::os::unix::fs::PermissionsExt;
-        for (failing_provider, failing_verb) in [("codex", "remove"), ("claude", "install")] {
+        for (original_native, failing_provider, failing_verb) in [
+            (BTreeSet::from(Provider::ALL), "codex", "remove"),
+            (BTreeSet::from(Provider::ALL), "claude", "install"),
+            (BTreeSet::new(), "codex", "add"),
+            (BTreeSet::from([Provider::Claude]), "codex", "add"),
+        ] {
             let home = tempfile::tempdir().unwrap();
             let mut env = Env::at(home.path());
             installed(&env, true);
@@ -942,6 +977,11 @@ mod tests {
             settings
                 .active_mut()
                 .set(Kind::Plugin, "p@m", Agent::Claude, true);
+            let codex_on = !original_native.contains(&Provider::Codex);
+            settings.active_mut().set_agent(Agent::Codex, true);
+            settings
+                .active_mut()
+                .set(Kind::Plugin, "p@m", Agent::Codex, codex_on);
             let mut lock = Lock::default();
             lock.plugins.insert(
                 "p@m".into(),
@@ -950,7 +990,7 @@ mod tests {
                         tree: "old-tree".into(),
                         ..Pin::default()
                     },
-                    native: BTreeSet::from(Provider::ALL),
+                    native: original_native,
                     ..PluginPin::default()
                 },
             );
@@ -958,8 +998,25 @@ mod tests {
             let actions =
                 update_plugin(&env, &settings, &lock, &fetched_update(&env, true)).unwrap();
             assert!(crate::execute(&env, &actions).is_err());
-            assert_eq!(Lock::read(&env.lock_file()).unwrap(), lock);
-            assert!(env.plugins_dir().join("p@m/commands/new.md").is_file());
+            let interrupted = Lock::read(&env.lock_file()).unwrap();
+            assert_eq!(interrupted.plugins["p@m"].pin.tree, "old-tree");
+            assert_eq!(
+                interrupted.plugins["p@m"].native,
+                BTreeSet::from(Provider::ALL)
+            );
+            let current = Plugin::read(&env.plugins_dir().join("p@m")).unwrap();
+            let cleanup = uninstall_plugin(&env, &settings, &interrupted, &current);
+            assert!(
+                runs(&cleanup)
+                    .iter()
+                    .any(|run| run == "claude plugin uninstall p@xolkit --scope user")
+            );
+            assert!(
+                runs(&cleanup)
+                    .iter()
+                    .any(|run| run == "codex plugin remove p@xolkit")
+            );
+            assert!(!env.plugins_dir().join("p@m/commands/new.md").exists());
             fs::write(bin.join(failing_provider), "#!/bin/sh\nexit 0\n").unwrap();
             fs::write(
                 bin.join("claude"),
@@ -974,7 +1031,7 @@ mod tests {
             let codex = crate::config::read_toml(&env.codex_config()).unwrap();
             assert_eq!(
                 codex["plugins"]["p@xolkit"]["enabled"].as_bool(),
-                Some(false)
+                Some(codex_on)
             );
             let calls = fs::read_to_string(home.path().join("claude.log")).unwrap();
             assert!(
@@ -1013,7 +1070,7 @@ mod tests {
         .unwrap();
         assert!(crate::execute(&env, &actions).is_err());
         assert_eq!(Lock::read(&env.lock_file()).unwrap(), lock);
-        assert!(env.plugins_dir().join("p@m/commands/new.md").is_file());
+        assert!(!env.plugins_dir().join("p@m/commands/new.md").exists());
         fs::remove_dir(env.xolkit_dir.join(".lock.json.xolkit-tmp")).unwrap();
         let retry = update_plugin(
             &env,
