@@ -12,7 +12,7 @@ use gpui_kit::*;
 use xolkit_core::{
     Action as Step, Agent, Env, FetchedPlugin, FetchedSkill, Kind, Lock, Plugin, Provider,
     Settings, Skill, install_plugin, install_skill, native_install, native_toggle,
-    uninstall_plugin, uninstall_skill, update_skill,
+    uninstall_plugin, uninstall_skill, update_plugin, update_skill,
 };
 
 use super::discover::is_code;
@@ -27,6 +27,7 @@ pub(super) enum Change {
     },
     UninstallSkill(Skill),
     InstallPlugin(FetchedPlugin),
+    UpdatePlugin(FetchedPlugin),
     UninstallPlugin(Plugin),
     /// Installs an installed plugin natively in one more agent.
     NativeInstall {
@@ -41,7 +42,7 @@ impl Change {
             Change::InstallSkill(skill) => &skill.name,
             Change::UpdateSkill { name, .. } => name,
             Change::UninstallSkill(skill) => &skill.name,
-            Change::InstallPlugin(fetched) => &fetched.plugin.id,
+            Change::InstallPlugin(fetched) | Change::UpdatePlugin(fetched) => &fetched.plugin.id,
             Change::UninstallPlugin(plugin) | Change::NativeInstall { plugin, .. } => &plugin.id,
         }
     }
@@ -101,6 +102,9 @@ impl ChangeForm {
             Change::InstallPlugin(fetched) => {
                 install_plugin(&self.env, &self.settings, &self.lock, fetched, &chosen)?
             }
+            Change::UpdatePlugin(fetched) => {
+                update_plugin(&self.env, &self.settings, &self.lock, fetched)?
+            }
             Change::UninstallPlugin(plugin) => {
                 uninstall_plugin(&self.env, &self.settings, &self.lock, plugin)
             }
@@ -137,6 +141,9 @@ impl Render for ChangeForm {
                  their own tools, for the agents you pick.",
                 fetched.plugin.parts.native.join(" and ")
             )),
+            Change::UpdatePlugin(fetched) if fetched.plugin.needs_native() => Some(
+                "Native installs are refreshed and keep their active profile switches.".to_owned(),
+            ),
             _ => None,
         };
         v_flex()
@@ -209,11 +216,16 @@ pub(super) fn open_change_dialog(
     let installs = change.installs();
     let moves_download = matches!(
         change,
-        Change::InstallSkill(_) | Change::UpdateSkill { .. } | Change::InstallPlugin(_)
+        Change::InstallSkill(_)
+            | Change::UpdateSkill { .. }
+            | Change::InstallPlugin(_)
+            | Change::UpdatePlugin(_)
     );
-    let updates = matches!(change, Change::UpdateSkill { .. });
+    let updates = matches!(change, Change::UpdateSkill { .. } | Change::UpdatePlugin(_));
     let (verb, done) = match &change {
-        Change::UpdateSkill { .. } => ("Update", format!("Updated {name}")),
+        Change::UpdateSkill { .. } | Change::UpdatePlugin(_) => {
+            ("Update", format!("Updated {name}"))
+        }
         Change::NativeInstall { provider, .. } => (
             "Install",
             format!("Installed {name} in {}", provider.name()),

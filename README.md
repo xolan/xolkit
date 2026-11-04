@@ -95,6 +95,10 @@ registers that marketplace with the agent once, and installs from it with the ag
 too. While an agent has a plugin natively, xolkit stops serving that plugin's parts to it, so
 nothing shows up twice.
 
+Select a managed plugin to check its marketplace for updated contents. When an update is
+available, **Update…** downloads it and shows the steps before installing. Updates refresh
+native installs and keep profile switches. Use **Reload** to check again.
+
 ### MCP servers
 
 Add a server by the command that starts it or by its URL. xolkit starts local servers itself and
@@ -287,7 +291,7 @@ keyring's own tool (Seahorse, KeePassXC, or the Windows Credential Manager).
 | --- | --- |
 | `Ctrl+K` | Command palette: go to a page, reload, switch profile, pick a theme |
 | `Up` / `Down` | Move through the list, also from the filter field |
-| `Enter` | Install the selected search result, update the selected skill, edit the selected server, or switch to the selected profile |
+| `Enter` | Install the selected search result, update the selected skill or plugin, edit the selected server, or switch to the selected profile |
 | `Delete` | Remove the selected skill, plugin or server, unless the filter field has focus |
 | `Ctrl+F` | Focus the filter |
 | `Ctrl+R` | Reload |

@@ -29,8 +29,9 @@ pub use env::Env;
 pub use library::{Library, uninstall_skill};
 pub use lock::{Lock, Pin, PluginPin};
 pub use marketplace::{
-    FetchedPlugin, Offer, PluginSource, fetch_offers, fetch_plugin, fetch_plugin_at,
-    install_plugin, native_changes, native_install, native_steps, native_toggle, uninstall_plugin,
+    FetchedPlugin, Offer, PluginSource, PluginUpdate, check_plugin_update, fetch_offers,
+    fetch_plugin, fetch_plugin_at, fetch_plugin_update, install_plugin, native_changes,
+    native_install, native_steps, native_toggle, uninstall_plugin, update_plugin,
     valid_marketplace,
 };
 pub use ops::{Action, execute};
