@@ -274,7 +274,11 @@ pub fn update_plugin(
     );
     let previous = Plugin::read(&target).context("could not read the installed plugin")?;
     let old = env.staging_dir().join(format!("{}-old", unique()));
-    let mut actions = Vec::new();
+    let mut actions = vec![Action::ReplaceDir {
+        from: plugin.dir.clone(),
+        to: target.clone(),
+        backup: old.clone(),
+    }];
     let mut after = lock.clone();
     for provider in &installed.native {
         actions.extend(native_uninstall(env, &after, &previous, *provider));
@@ -292,20 +296,6 @@ pub fn update_plugin(
     if pin.version.is_empty() {
         pin.version = plugin.version.clone();
     }
-    actions.extend([
-        Action::Rename {
-            from: target.clone(),
-            to: old.clone(),
-        },
-        Action::Rename {
-            from: plugin.dir.clone(),
-            to: target.clone(),
-        },
-        Action::PinPlugin {
-            id: plugin.id.clone(),
-            pin: Some(pin.clone()),
-        },
-    ]);
     after.plugins.insert(plugin.id.clone(), pin);
     if plugin.needs_native() {
         let updated = Plugin {
@@ -338,6 +328,13 @@ pub fn update_plugin(
             ));
         }
     }
+    // Keep the old pin and native ownership until every external step succeeds. A failed
+    // refresh then still offers the update, with all original providers available for retry.
+    actions.retain(|action| !matches!(action, Action::SetNative { .. }));
+    actions.push(Action::PinPlugin {
+        id: plugin.id.clone(),
+        pin: after.plugins.get(&plugin.id).cloned(),
+    });
     actions.push(Action::Remove { path: old });
     Ok(actions)
 }
@@ -911,6 +908,127 @@ mod tests {
                 .any(|c| c == "claude plugin uninstall p@xolkit --scope user")
         );
         assert!(!actions.iter().any(|a| matches!(a, Action::Run { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_native_refresh_keeps_old_pin_and_all_providers_for_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        for (failing_provider, failing_verb) in [("codex", "remove"), ("claude", "install")] {
+            let home = tempfile::tempdir().unwrap();
+            let mut env = Env::at(home.path());
+            installed(&env, true);
+            let bin = home.path().join("bin");
+            fs::create_dir(&bin).unwrap();
+            for provider in ["claude", "codex"] {
+                let cli = bin.join(provider);
+                let script = if provider == failing_provider {
+                    format!("#!/bin/sh\nif [ \"$2\" = {failing_verb} ]; then exit 1; fi\nexit 0\n")
+                } else {
+                    "#!/bin/sh\nexit 0\n".to_owned()
+                };
+                fs::write(&cli, script).unwrap();
+                fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            env.path = Some(bin.clone().into_os_string());
+            fs::create_dir_all(&env.codex_dir).unwrap();
+            fs::write(
+                env.codex_config(),
+                "[plugins.\"p@xolkit\"]\nenabled = true\n",
+            )
+            .unwrap();
+            let mut settings = Settings::default();
+            settings.active_mut().set_agent(Agent::Claude, true);
+            settings
+                .active_mut()
+                .set(Kind::Plugin, "p@m", Agent::Claude, true);
+            let mut lock = Lock::default();
+            lock.plugins.insert(
+                "p@m".into(),
+                PluginPin {
+                    pin: Pin {
+                        tree: "old-tree".into(),
+                        ..Pin::default()
+                    },
+                    native: BTreeSet::from(Provider::ALL),
+                    ..PluginPin::default()
+                },
+            );
+            lock.write(&env.lock_file()).unwrap();
+            let actions =
+                update_plugin(&env, &settings, &lock, &fetched_update(&env, true)).unwrap();
+            assert!(crate::execute(&env, &actions).is_err());
+            assert_eq!(Lock::read(&env.lock_file()).unwrap(), lock);
+            assert!(env.plugins_dir().join("p@m/commands/new.md").is_file());
+            fs::write(bin.join(failing_provider), "#!/bin/sh\nexit 0\n").unwrap();
+            fs::write(
+                bin.join("claude"),
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> claude.log\nexit 0\n",
+            )
+            .unwrap();
+            let retry = update_plugin(&env, &settings, &lock, &fetched_update(&env, true)).unwrap();
+            crate::execute(&env, &retry).unwrap();
+            let updated = Lock::read(&env.lock_file()).unwrap();
+            assert_eq!(updated.plugins["p@m"].native, BTreeSet::from(Provider::ALL));
+            assert_eq!(updated.plugins["p@m"].pin.tree, "new-tree");
+            let codex = crate::config::read_toml(&env.codex_config()).unwrap();
+            assert_eq!(
+                codex["plugins"]["p@xolkit"]["enabled"].as_bool(),
+                Some(false)
+            );
+            let calls = fs::read_to_string(home.path().join("claude.log")).unwrap();
+            assert!(
+                calls
+                    .lines()
+                    .any(|line| line == "plugin enable p@xolkit --scope user")
+            );
+        }
+    }
+
+    #[test]
+    fn failed_pin_write_keeps_update_available() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        installed(&env, false);
+        let mut lock = Lock::default();
+        lock.plugins.insert(
+            "p@m".into(),
+            PluginPin {
+                pin: Pin {
+                    tree: "old-tree".into(),
+                    ..Pin::default()
+                },
+                ..PluginPin::default()
+            },
+        );
+        lock.write(&env.lock_file()).unwrap();
+        // Block the atomic lock write while leaving its existing contents readable.
+        fs::create_dir(env.xolkit_dir.join(".lock.json.xolkit-tmp")).unwrap();
+        let actions = update_plugin(
+            &env,
+            &Settings::default(),
+            &lock,
+            &fetched_update(&env, false),
+        )
+        .unwrap();
+        assert!(crate::execute(&env, &actions).is_err());
+        assert_eq!(Lock::read(&env.lock_file()).unwrap(), lock);
+        assert!(env.plugins_dir().join("p@m/commands/new.md").is_file());
+        fs::remove_dir(env.xolkit_dir.join(".lock.json.xolkit-tmp")).unwrap();
+        let retry = update_plugin(
+            &env,
+            &Settings::default(),
+            &lock,
+            &fetched_update(&env, false),
+        )
+        .unwrap();
+        crate::execute(&env, &retry).unwrap();
+        assert_eq!(
+            Lock::read(&env.lock_file()).unwrap().plugins["p@m"]
+                .pin
+                .tree,
+            "new-tree"
+        );
     }
 
     #[test]
