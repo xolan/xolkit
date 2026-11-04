@@ -188,10 +188,14 @@ impl Env {
         PathBuf::from(program)
     }
 
-    /// Whether `program` is missing from the user's whole `PATH` as it is now: from the login
-    /// shell, or on Windows from the registry, as a newly started program would get it. `false`
+    /// Whether `program` is missing from both the configured `PATH` and the user's whole
+    /// `PATH` as it is now: from the login shell, or on Windows from the registry. `false`
     /// when that can't be told.
     pub fn tool_gone(&self, program: &str) -> bool {
+        // A tool we can still run is present, even when a fresh shell cannot find it.
+        if self.has_tool(program) {
+            return false;
+        }
         // A PATH that can't be read or put together can't tell either.
         self.with_fresh_path()
             .is_some_and(|fresh| !fresh.has_tool(program))
@@ -566,6 +570,23 @@ mod tests {
         assert_eq!(merged, paths(&["/a", "/b", "/c", "/d"]));
         assert_eq!(merge_paths(None, paths(&["/c"])), paths(&["/c"]));
         assert_eq!(merge_paths(None, None), None);
+    }
+
+    #[test]
+    fn a_tool_on_the_configured_path_is_not_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::at(dir.path());
+        env.path = Some(dir.path().into());
+        // A distinct name keeps this independent of agents installed on the host.
+        let program = "xolkit-configured-path-test-provider";
+        let filename = if cfg!(windows) {
+            format!("{program}.cmd")
+        } else {
+            program.to_owned()
+        };
+        std::fs::write(dir.path().join(filename), "").unwrap();
+        assert!(env.has_tool(program));
+        assert!(!env.tool_gone(program));
     }
 
     #[test]
