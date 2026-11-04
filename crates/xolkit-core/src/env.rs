@@ -582,12 +582,21 @@ mod tests {
         env.path = Some(dir.path().into());
         // A distinct name keeps this independent of agents installed on the host.
         let program = "xolkit-configured-path-test-provider";
-        let filename = if cfg!(windows) {
-            format!("{program}.cmd")
+        let extension = if cfg!(windows) {
+            let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE".into());
+            let Some(extension) = pathext.split(';').find(|ext| {
+                [".com", ".exe", ".bat", ".cmd"]
+                    .iter()
+                    .any(|known| ext.eq_ignore_ascii_case(known))
+            }) else {
+                // This host cannot discover any runnable file type through PATH.
+                return;
+            };
+            extension.to_owned()
         } else {
-            program.to_owned()
+            String::new()
         };
-        let tool = dir.path().join(filename);
+        let tool = dir.path().join(format!("{program}{extension}"));
         std::fs::write(&tool, "").unwrap();
         let mut fresh = env.clone();
         fresh.path = Some(dir.path().join("empty-bin").into());
