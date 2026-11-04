@@ -9,7 +9,16 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use xolkit_core::{Agent, Kind, Plugin, Provider, Skill, check_skill_update, fetch_update};
+use xolkit_core::{
+    Agent, Kind, Plugin, PluginUpdate, Provider, Skill, SkillUpdate, check_plugin_update,
+    check_skill_update, fetch_plugin_update, fetch_update,
+};
+
+#[derive(Clone)]
+pub(super) enum ItemUpdate {
+    Skill(SkillUpdate),
+    Plugin(PluginUpdate),
+}
 
 use super::change::{Change, open_change_dialog};
 use super::{
@@ -43,13 +52,25 @@ impl Shelf {
         matches!(self.updates.get(name), Some(Ok(Some(_))))
     }
 
-    /// Asks GitHub whether the selected skill has a newer version, once per skill and only for
-    /// skills installed from GitHub.
+    /// Checks the selected managed item once, after the selection settles.
     pub(super) fn check_update(&mut self, cx: &mut Context<Self>) {
-        let Some(Selection::Skill(name)) = self.selected.clone() else {
-            return;
+        let (name, plugin) = match &self.selected {
+            Some(Selection::Skill(name)) if self.library.lock.skills.contains_key(name) => {
+                (name.clone(), false)
+            }
+            Some(Selection::Plugin(id))
+                if self
+                    .library
+                    .lock
+                    .plugins
+                    .get(id)
+                    .is_some_and(|pin| !pin.marketplace.is_empty()) =>
+            {
+                (id.clone(), true)
+            }
+            _ => return,
         };
-        if !self.library.lock.skills.contains_key(&name) || self.updates.contains_key(&name) {
+        if self.updates.contains_key(&name) {
             return;
         }
         let env = self.env.clone();
@@ -61,7 +82,13 @@ impl Shelf {
                 let name = name.clone();
                 cx.background_spawn(async move {
                     let token = settings::github_token(access, &env).ok().flatten();
-                    check_skill_update(&env, &name, token.as_deref())
+                    if plugin {
+                        check_plugin_update(&env, &name, token.as_deref())
+                            .map(|u| u.map(ItemUpdate::Plugin))
+                    } else {
+                        check_skill_update(&env, &name, token.as_deref())
+                            .map(|u| u.map(ItemUpdate::Skill))
+                    }
                 })
                 .await
             };
@@ -74,10 +101,14 @@ impl Shelf {
         }));
     }
 
-    /// Downloads the selected skill's update, then asks to install it.
+    /// Downloads the selected item's update, then asks to install it.
     pub(super) fn download_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Selection::Skill(name)) = self.selected.clone() else {
+        let Some(selection) = self.selected.clone() else {
             return;
+        };
+        let name = match &selection {
+            Selection::Skill(name) | Selection::Plugin(name) => name.clone(),
+            _ => return,
         };
         let Some(Ok(Some(update))) = self.updates.get(&name) else {
             return;
@@ -90,31 +121,47 @@ impl Shelf {
         let access = self.settings().github;
         self.fetching = true;
         self.fetch_error = None;
-        let selection = Selection::Skill(name.clone());
         self.fetch_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
                     let token = settings::github_token(access, &env).ok().flatten();
-                    fetch_update(&env, &update, token.as_deref())
+                    match update {
+                        ItemUpdate::Skill(update) => fetch_update(&env, &update, token.as_deref())
+                            .map(|download| Change::UpdateSkill {
+                                name: update.name,
+                                download,
+                            }),
+                        ItemUpdate::Plugin(update) => {
+                            fetch_plugin_update(&env, &update, token.as_deref())
+                                .map(Change::UpdatePlugin)
+                        }
+                    }
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 if this.selected.as_ref() != Some(&selection) {
-                    if let Ok(download) = result {
-                        download.discard();
+                    if let Ok(change) = result {
+                        match change {
+                            Change::UpdateSkill { download, .. } => download.discard(),
+                            Change::UpdatePlugin(download) => download.discard(),
+                            _ => {}
+                        }
                     }
                     return;
                 }
                 this.fetching = false;
                 match result {
-                    Ok(download) => {
-                        this.set_fetched(Some(download.clone()));
-                        open_change_dialog(
-                            this,
-                            Change::UpdateSkill { name, download },
-                            window,
-                            cx,
-                        );
+                    Ok(change) => {
+                        match &change {
+                            Change::UpdateSkill { download, .. } => {
+                                this.set_fetched(Some(download.clone()))
+                            }
+                            Change::UpdatePlugin(download) => {
+                                this.set_fetched_plugin(Some(download.clone()))
+                            }
+                            _ => {}
+                        }
+                        open_change_dialog(this, change, window, cx);
                     }
                     Err(e) => this.fetch_error = Some(format!("{e:#}").into()),
                 }
@@ -126,8 +173,17 @@ impl Shelf {
     }
 
     /// Whether a newer version is on GitHub, with the button that installs it.
-    fn update_status(&self, skill: &Skill, cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.library.lock.skills.get(&skill.name)?;
+    fn update_status(&self, name: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.library.lock.skills.contains_key(name)
+            && !self
+                .library
+                .lock
+                .plugins
+                .get(name)
+                .is_some_and(|pin| !pin.marketplace.is_empty())
+        {
+            return None;
+        }
         let muted = cx.theme().muted_foreground;
         let line = |text: SharedString| h_flex().gap_2().text_sm().text_color(muted).child(text);
         let element = if self.fetching {
@@ -135,7 +191,7 @@ impl Shelf {
         } else if let Some(error) = &self.fetch_error {
             line(error.clone()).text_color(cx.theme().danger)
         } else {
-            match self.updates.get(&skill.name) {
+            match self.updates.get(name) {
                 None if self.update_task.is_some() => {
                     line("Checking for updates…".into()).child(Spinner::new().small())
                 }
@@ -331,7 +387,9 @@ impl Shelf {
         let selection = Selection::Plugin(id.clone());
         controls.push(self.row_uninstall(format!("uninstall-plugin-{id}"), &selection, cx));
         let selected = self.selected.as_ref() == Some(&selection);
-        let tag = if plugin.needs_native() {
+        let tag = if self.has_update(&id) {
+            format!("{} · update available", plugin.marketplace)
+        } else if plugin.needs_native() {
             format!("{} · native", plugin.marketplace)
         } else {
             plugin.marketplace.clone()
@@ -434,7 +492,7 @@ impl Shelf {
                             .p_4()
                             .gap_3()
                             .child(skill.description.clone())
-                            .children(self.update_status(skill, cx))
+                            .children(self.update_status(&skill.name, cx))
                             .child(v_flex().gap_1().children(facts))
                             .child(section("In the active profile"))
                             .child(v_flex().gap_1().children(self.served_to(
@@ -535,6 +593,7 @@ impl Shelf {
                                     })
                                     .child(fact("Served", served, cx)),
                             )
+                            .children(self.update_status(&plugin.id, cx))
                             .child(section("In the active profile"))
                             .child(v_flex().gap_1().children(self.served_to(
                                 Kind::Plugin,

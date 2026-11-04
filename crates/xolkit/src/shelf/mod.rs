@@ -34,8 +34,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use xolkit_core::{
     Action as Step, Agent, Env, FetchedPlugin, FetchedSkill, Kind, Library, Offer, Provider,
-    Registration, Settings, SkillHit, SkillUpdate, clean_old_exe, clean_staging, native_toggle,
-    registration, strip_frontmatter,
+    Registration, Settings, SkillHit, clean_old_exe, clean_staging, native_toggle, registration,
+    strip_frontmatter,
 };
 use xolkit_daemon::{Request, Status};
 
@@ -158,8 +158,8 @@ pub struct Shelf {
     offers: Option<Vec<Offer>>,
     offer_errors: Vec<String>,
     loading_offers: bool,
-    /// Update checks of installed skills, by name; a skill is checked when it is first selected.
-    updates: HashMap<String, Result<Option<SkillUpdate>, SharedString>>,
+    /// Update checks by skill name or plugin id, checked when first selected.
+    updates: HashMap<String, Result<Option<installed::ItemUpdate>, SharedString>>,
     update_task: Option<Task<()>>,
     /// What the daemon last reported, while the Connections page is open.
     status: Option<Result<Status, SharedString>>,
@@ -607,7 +607,7 @@ impl Shelf {
     fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.selected {
             None => self.move_selection(1, cx),
-            Some(Selection::Skill(_)) => self.download_update(window, cx),
+            Some(Selection::Skill(_) | Selection::Plugin(_)) => self.download_update(window, cx),
             Some(Selection::Hit(_)) => self.install_hit(window, cx),
             Some(Selection::Offer(_)) => self.install_offer(window, cx),
             Some(Selection::Profile(name)) => {
@@ -619,12 +619,7 @@ impl Shelf {
                 let name = name.clone();
                 self.open_server_dialog(Some(name), window, cx);
             }
-            Some(
-                Selection::Plugin(_)
-                | Selection::License(_)
-                | Selection::Session(_)
-                | Selection::Connection(_),
-            ) => {}
+            Some(Selection::License(_) | Selection::Session(_) | Selection::Connection(_)) => {}
         }
     }
 
