@@ -32,6 +32,6 @@ if command -v apt-get > /dev/null; then
   exec "$scripts/install_debian.sh" "$version" "$@"
 fi
 
-echo "mise run install supports only Arch Linux, Debian, Ubuntu and distributions based on them for now." >&2
+echo "This installer supports only Arch Linux, Debian, Ubuntu and distributions based on them for now." >&2
 echo "See Install in README.md for the other ways to install xolkit." >&2
 exit 1

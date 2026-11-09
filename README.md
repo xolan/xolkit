@@ -208,12 +208,14 @@ If you installed from the tarball before, remove that copy first (the first `rm`
 
 On Debian 12, Ubuntu 22.04 and newer, and other apt-based distributions, download
 `xolkit-<version>-<arch>-unknown-linux-gnu.deb` and its `.sha256` from
-[Releases](https://github.com/xolan/xolkit/releases), where `<arch>` is `x86_64` or `aarch64`. In
-the folder you downloaded them to, set `version` to the release you picked and run:
+[Releases](https://github.com/xolan/xolkit/releases), where `<arch>` is `x86_64` if
+`dpkg --print-architecture` says `amd64`, or `aarch64` if it says `arm64`. In the folder you
+downloaded them to, set `version` and `arch` to the ones you picked and run:
 
 ```bash
 version=3.2.3
-name=xolkit-$version-$(uname -m)-unknown-linux-gnu.deb
+arch=x86_64
+name=xolkit-$version-$arch-unknown-linux-gnu.deb
 sha256sum -c "$name.sha256" && sudo apt install "./$name"
 ```
 
@@ -379,7 +381,7 @@ command line).
 | `mise run fmt` | Format the code |
 | `mise run build` | Build a release binary |
 | `mise run install` | Install xolkit as a system package from the release matching the checked-out version |
-| `mise run deb <target>` | Build a Debian package for a Linux target into `dist/` (on Debian or Ubuntu, with the libraries above installed) |
+| `mise run deb <target>` | Build a Debian package for a Linux target into `dist/` (on Debian or Ubuntu, with the libraries above and `dpkg-dev` installed) |
 | `mise run package <target>` | Build a release archive into `dist/` for the host's own platform: a tarball on Linux, a zip on Windows |
 | `mise run licenses` | Regenerate `THIRD_PARTY_LICENSES.md` and the app's `licenses.json` after changing dependencies |
 | `mise run icon` | Render the Windows app icon from the SVGs in `assets/brand/` |

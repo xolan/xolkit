@@ -10,14 +10,14 @@ trap 'rm -rf "$dir"' EXIT
 # Prints the tag of release v$version, or of the latest release if v$version isn't released.
 release_tag() {
   local status latest
-  status="$(curl -sSL --proto '=https' -o /dev/null -w '%{http_code}' "$repo/releases/tag/v$version")" || {
+  status="$(curl -sSL --proto '=https' --connect-timeout 30 -o /dev/null -w '%{http_code}' "$repo/releases/tag/v$version")" || {
     echo "couldn't reach $repo" >&2
     return 1
   }
   case "$status" in
   200) echo "v$version" ;;
   404)
-    latest="$(curl -fsSL --proto '=https' -o /dev/null -w '%{url_effective}' "$repo/releases/latest")"
+    latest="$(curl -fsSL --proto '=https' --connect-timeout 30 -o /dev/null -w '%{url_effective}' "$repo/releases/latest")"
     latest="${latest##*/tag/}"
     [[ "$latest" =~ ^v[0-9] ]] || { echo "couldn't find the latest release" >&2; return 1; }
     echo "xolkit $version has no release; installing the latest release, ${latest#v}." >&2
@@ -30,7 +30,7 @@ release_tag() {
 # Downloads <file> of release <tag> into $dir.
 fetch() {
   local status
-  status="$(curl -sSL --proto '=https' -o "$dir/$2" -w '%{http_code}' "$repo/releases/download/$1/$2")" || {
+  status="$(curl -sSL --proto '=https' --connect-timeout 30 -o "$dir/$2" -w '%{http_code}' "$repo/releases/download/$1/$2")" || {
     echo "couldn't download $2 from release $1" >&2
     return 1
   }

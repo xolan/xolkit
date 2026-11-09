@@ -47,6 +47,7 @@ jobs:
         include:
           # The Linux binaries need the glibc of the image they're built on, so these stay on the
           # oldest supported LTS (22.04): the .deb then installs on Debian 12 and Ubuntu 22.04.
+          # When GitHub retires these images, build in an ubuntu:22.04 container to keep that floor.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
@@ -62,7 +63,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev
+          # dpkg-dev's dpkg-shlibdeps fills in the .deb's library dependencies.
+          sudo apt-get install -y dpkg-dev libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev
       - uses: jdx/mise-action@v5
       - uses: Swatinem/rust-cache@v2
         with:
