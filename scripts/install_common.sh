@@ -25,7 +25,8 @@ has_file() {
 # Prints the tag of the latest release.
 latest_tag() {
   local latest
-  latest="$(curl -fsSL --proto '=https' --connect-timeout 30 -o /dev/null -w '%{url_effective}' "$repo/releases/latest")" || {
+  # GitHub redirects to the latest release's page; read where to, without fetching the page.
+  latest="$(curl -fsS --proto '=https' --connect-timeout 30 -o /dev/null -w '%{redirect_url}' "$repo/releases/latest")" || {
     echo "couldn't look up the latest release" >&2
     return 1
   }
@@ -35,13 +36,17 @@ latest_tag() {
 }
 
 # Downloads <name> and its .sha256 from release v$version, or from the latest release if
-# v$version doesn't have it (not released, or released before that file was), and checks them.
+# v$version doesn't have them (not released, or released before that file was), and checks them.
 # @VERSION@ in <name> stands for the release's version. Sets $tag and $file.
 download_release_file() {
   tag="v$version"
   file="${1//@VERSION@/$version}"
-  if ! has_file "$tag" "$file"; then
+  if ! { has_file "$tag" "$file" && has_file "$tag" "$file.sha256"; }; then
     tag="$(latest_tag)"
+    if [[ "$tag" == "v$version" ]]; then
+      echo "No release has $file yet." >&2
+      exit 1
+    fi
     echo "No $file in a v$version release (not released, or released without it); installing from the latest release, ${tag#v}." >&2
     file="${1//@VERSION@/${tag#v}}"
   fi
