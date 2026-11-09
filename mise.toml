@@ -27,7 +27,7 @@ run = [
 ]
 
 [tasks.install]
-description = "Install xolkit as a system package from its release (Arch Linux and other pacman-based distributions for now)"
+description = "Install xolkit as a system package from its release"
 run = "scripts/install.sh"
 
 [tasks.ci]
