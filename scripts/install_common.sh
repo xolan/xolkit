@@ -26,7 +26,7 @@ has_file() {
 latest_tag() {
   local latest
   # GitHub redirects to the latest release's page; read where to, without fetching the page.
-  latest="$(curl -fsS --proto '=https' --connect-timeout 30 -o /dev/null -w '%{redirect_url}' "$repo/releases/latest")" || {
+  latest="$(curl -fsS --proto '=https' --connect-timeout 30 --max-time 60 -o /dev/null -w '%{redirect_url}' "$repo/releases/latest")" || {
     echo "couldn't look up the latest release" >&2
     return 1
   }

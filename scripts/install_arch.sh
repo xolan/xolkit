@@ -23,10 +23,9 @@ if ! command -v fakeroot > /dev/null; then
   exit 1
 fi
 if [[ $EUID -eq 0 ]]; then
-  echo "Run this as your own user, not root: makepkg won't build as root and asks for sudo itself." >&2
+  echo "Run this as your own user, not root: makepkg won't build as root and gets root itself to install." >&2
   exit 1
 fi
-command -v sudo > /dev/null || { echo "makepkg -si installs with sudo: install sudo first" >&2; exit 1; }
 
 . "$(dirname "$0")/install_common.sh"
 download_release_file PKGBUILD

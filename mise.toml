@@ -42,7 +42,8 @@ mkdir -p dist
 cargo deb -p xolkit --no-build --target "$target" --output "dist/$name"
 # cargo-deb only warns when dpkg-shlibdeps (from dpkg-dev) can't work out the linked libraries;
 # without them the package would install on systems whose glibc is too old.
-dpkg-deb -f "dist/$name" Depends | grep -q 'libc6 (>=' || {
+depends="$(dpkg-deb -f "dist/$name" Depends)"
+[[ "$depends" == *"libc6 (>="* ]] || {
   echo "dist/$name has no libc6 dependency: is dpkg-dev installed?" >&2
   exit 1
 }
