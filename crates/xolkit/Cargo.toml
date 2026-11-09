@@ -3,6 +3,7 @@ name = "xolkit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "One library of skills, plugins and MCP servers, served to Claude Code, Codex CLI and other agents"
 
 [dependencies]
 anyhow = "1"
@@ -22,3 +23,32 @@ embed-resource = "3"
 [dev-dependencies]
 resvg = { version = "0.46", default-features = false }
 tempfile = "3"
+
+# The Debian package, built by `mise run deb <target>` with cargo-deb and attached to each release.
+[package.metadata.deb]
+name = "xolkit"
+maintainer = "Jonas Svarvaa <jonassvarvaa@gmail.com>"
+copyright = "Jonas Svarvaa"
+license-file = ["../../LICENSE", "0"]
+section = "utils"
+priority = "optional"
+# $auto adds the libraries the binary links. libvulkan and libwayland-client are loaded at run time,
+# so the binary doesn't list them.
+depends = "$auto, libvulkan1, libwayland-client0, libxkbcommon-x11-0, hicolor-icon-theme, mesa-vulkan-drivers | vulkan-icd"
+suggests = "gh, gnome-keyring"
+assets = [
+  ["target/release/xolkit", "usr/bin/", "755"],
+  ["../../assets/linux/xolkit.desktop", "usr/share/applications/", "644"],
+  # The tile at large sizes, the case alone at small ones, as the Windows icon has them.
+  ["../../assets/brand/xolkit.svg", "usr/share/icons/hicolor/scalable/apps/xolkit.svg", "644"],
+  ["../../assets/brand/xolkit-small.svg", "usr/share/icons/hicolor/16x16/apps/xolkit.svg", "644"],
+  ["../../assets/brand/xolkit-small.svg", "usr/share/icons/hicolor/22x22/apps/xolkit.svg", "644"],
+  ["../../assets/brand/xolkit-small.svg", "usr/share/icons/hicolor/24x24/apps/xolkit.svg", "644"],
+  ["../../assets/brand/xolkit-glyph.svg", "usr/share/icons/hicolor/32x32/apps/xolkit.svg", "644"],
+  ["../../assets/brand/xolkit-glyph.svg", "usr/share/icons/hicolor/48x48/apps/xolkit.svg", "644"],
+  ["../../README.md", "usr/share/doc/xolkit/", "644"],
+  ["../../THIRD_PARTY_LICENSES.md", "usr/share/doc/xolkit/", "644"],
+  ["themes/base16/LICENSE", "usr/share/doc/xolkit/LICENSE-base16-schemes", "644"],
+  # The embedded Geist fonts are under the OFL, which must travel with them.
+  ["fonts/OFL.txt", "usr/share/doc/xolkit/OFL-Geist.txt", "644"],
+]
