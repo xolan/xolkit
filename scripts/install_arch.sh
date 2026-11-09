@@ -32,4 +32,10 @@ download_release_file PKGBUILD
 
 # makepkg checks the release tarball against the checksum in the PKGBUILD.
 cd "$dir"
-makepkg -si "$@"
+makepkg -si "$@" || {
+  status=$?
+  # Keep makepkg's files to look into, rather than clean them up on exit.
+  trap - EXIT
+  echo "makepkg failed; its files are in $dir" >&2
+  exit "$status"
+}

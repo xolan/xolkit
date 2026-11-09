@@ -149,16 +149,15 @@ xolkit talks to `skills.sh`, `api.github.com`, `codeload.github.com` and
 
 ## Install
 
-Each release holds a Linux tarball, a Debian package and a Windows zip for x86_64 and aarch64, and
-a `PKGBUILD` for Arch Linux, each with a `.sha256` checksum file.
+Each release holds a Linux tarball, a Debian package (from 3.2.3 on) and a Windows zip for x86_64
+and aarch64, and a `PKGBUILD` for Arch Linux, each with a `.sha256` checksum file.
 
 On Arch Linux, Debian, Ubuntu and distributions based on them, the simplest way is to run
 `scripts/install.sh` in a clone of this repository. It installs the package for your system from
 the release matching the checked-out version (the latest release if that one isn't out yet, or
 has no package for your system), after checking it against its `.sha256`, and needs neither mise
-nor Rust. The sections below
-say what it does on each system. If you have the development tools set up (see
-[Development](#development)), `mise run install` does the same.
+nor Rust. The sections below say what it does on each system. If you have the development tools
+set up (see [Development](#development)), `mise run install` does the same.
 
 ### Linux
 
@@ -209,9 +208,9 @@ If you installed from the tarball before, remove that copy first (the first `rm`
 
 On Debian 12, Ubuntu 22.04 and newer, and other apt-based distributions, download
 `xolkit-<version>-<arch>-unknown-linux-gnu.deb` and its `.sha256` from
-[Releases](https://github.com/xolan/xolkit/releases), where `<arch>` is `x86_64` if
-`dpkg --print-architecture` says `amd64`, or `aarch64` if it says `arm64`. In the folder you
-downloaded them to, set `version` and `arch` to the ones you picked and run:
+[Releases](https://github.com/xolan/xolkit/releases) (3.2.3 and later have them), where `<arch>`
+is `x86_64` if `dpkg --print-architecture` says `amd64`, or `aarch64` if it says `arm64`. In the
+folder you downloaded them to, set `version` and `arch` to the ones you picked and run:
 
 ```bash
 version=3.2.3

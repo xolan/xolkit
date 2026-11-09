@@ -30,7 +30,7 @@ name = "xolkit"
 maintainer = "Jonas Svarvaa <jonassvarvaa@gmail.com>"
 copyright = "Jonas Svarvaa"
 license-file = ["../../LICENSE", "0"]
-section = "devel"
+section = "utils"
 priority = "optional"
 # $auto adds the libraries the binary links. libvulkan and libwayland-client are loaded at run time,
 # so the binary doesn't list them.

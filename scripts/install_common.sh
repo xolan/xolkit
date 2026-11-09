@@ -10,8 +10,9 @@ trap 'rm -rf "$dir"' EXIT
 # Succeeds if release <tag> has <file>, fails if it doesn't, and exits on any other answer.
 has_file() {
   local status
-  # One byte is enough to tell; the asset host answers 206, or 200 if it ignores the range.
-  status="$(curl -sSL --proto '=https' --connect-timeout 30 -r 0-0 -o /dev/null -w '%{http_code}' "$repo/releases/download/$1/$2")" || {
+  # One byte is enough to tell; the asset host answers 206, or 200 if it ignores the range (the
+  # time limit then stops it fetching the whole file).
+  status="$(curl -sSL --proto '=https' --connect-timeout 30 --max-time 60 -r 0-0 -o /dev/null -w '%{http_code}' "$repo/releases/download/$1/$2")" || {
     echo "couldn't reach $repo" >&2
     exit 1
   }
@@ -44,7 +45,7 @@ download_release_file() {
   if ! { has_file "$tag" "$file" && has_file "$tag" "$file.sha256"; }; then
     tag="$(latest_tag)"
     if [[ "$tag" == "v$version" ]]; then
-      echo "No release has $file yet." >&2
+      echo "No release has $file and its .sha256 yet." >&2
       exit 1
     fi
     echo "No $file in a v$version release (not released, or released without it); installing from the latest release, ${tag#v}." >&2

@@ -32,7 +32,7 @@ deb="$file"
 
 # The package needs the glibc of the system it was built on (see release.yml). Say so plainly
 # rather than leave apt to report an unmet libc6 dependency.
-need="$(dpkg-deb -f "$dir/$deb" Depends | sed -n 's/.*libc6 (>= \([^)]*\)).*/\1/p')"
+need="$(dpkg-deb -f "$dir/$deb" Depends | sed -n 's/.*libc6 (>= \([^)]*\)).*/\1/p')" || need=""
 have="$(dpkg-query -W -f '${Version}' "libc6:$arch" 2> /dev/null)" || have=""
 if [[ -n "$need" && -n "$have" ]] && ! dpkg --compare-versions "$have" ge "$need"; then
   echo "xolkit needs glibc $need or newer (Debian 12, Ubuntu 22.04 or newer, or a distribution based on them); this system has $have" >&2
