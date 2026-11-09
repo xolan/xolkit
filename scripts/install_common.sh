@@ -2,6 +2,8 @@
 # release to install and downloads its files, each checked against its .sha256, into $dir.
 repo=https://github.com/xolan/xolkit
 
+command -v curl > /dev/null || { echo "installing needs curl" >&2; exit 1; }
+
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 
@@ -32,15 +34,19 @@ fetch() {
     echo "couldn't download $2 from release $1" >&2
     return 1
   }
-  [[ "$status" == 200 ]] || { echo "downloading $2 from release $1 failed: HTTP $status" >&2; return 1; }
+  case "$status" in
+  200) ;;
+  404) echo "release $1 has no $2" >&2; return 1 ;;
+  *) echo "downloading $2 from release $1 failed: HTTP $status" >&2; return 1 ;;
+  esac
 }
 
 # Downloads <file> and <file>.sha256 of release <tag> into $dir, and checks the one against the
 # other. Fails, leaving nothing to install, if they don't match.
 download_verified() {
   local tag="$1" file="$2"
-  fetch "$tag" "$file"
-  fetch "$tag" "$file.sha256"
+  fetch "$tag" "$file" || return 1
+  fetch "$tag" "$file.sha256" || return 1
   # The checksum file must name <file> alone, so `sha256sum -c` checks nothing else.
   local sum
   sum="$(cat "$dir/$file.sha256")"

@@ -153,9 +153,11 @@ Each release holds a Linux tarball, a Debian package and a Windows zip for x86_6
 a `PKGBUILD` for Arch Linux, each with a `.sha256` checksum file.
 
 On Arch Linux, Debian, Ubuntu and distributions based on them, the simplest way is to run
-`mise run install` in a clone of this repository. It installs the package for your system from the
-release matching the checked-out version (the latest release if that version isn't released yet),
-after checking it against its `.sha256`. The sections below say what it does on each system.
+`scripts/install.sh` in a clone of this repository. It installs the package for your system from
+the release matching the checked-out version (the latest release if that version isn't released
+yet), after checking it against its `.sha256`, and needs neither mise nor Rust. The sections below
+say what it does on each system. If you have the development tools set up (see
+[Development](#development)), `mise run install` does the same.
 
 ### Linux
 
@@ -192,7 +194,7 @@ run:
 sha256sum -c PKGBUILD.sha256 && makepkg -si
 ```
 
-`mise run install` does the same in a temporary folder.
+`scripts/install.sh` does the same in a temporary folder.
 
 This builds a `xolkit-bin` package from the release's prebuilt binary, checks the tarball
 against the checksum in the `PKGBUILD`, and installs it with pacman, which pulls in the libraries it
@@ -204,7 +206,7 @@ If you installed from the tarball before, remove that copy first (the first `rm`
 
 ### Debian and Ubuntu
 
-On Debian, Ubuntu and other apt-based distributions, download
+On Debian 12, Ubuntu 22.04 and newer, and other apt-based distributions, download
 `xolkit-<version>-<arch>-unknown-linux-gnu.deb` and its `.sha256` from
 [Releases](https://github.com/xolan/xolkit/releases), where `<arch>` is `x86_64` or `aarch64`. In
 the folder you downloaded them to, set `version` to the release you picked and run:
@@ -215,7 +217,7 @@ name=xolkit-$version-$(uname -m)-unknown-linux-gnu.deb
 sha256sum -c "$name.sha256" && sudo apt install "./$name"
 ```
 
-`mise run install` does the same. apt installs the `xolkit` package and pulls in the libraries it
+`scripts/install.sh` does the same. apt installs the `xolkit` package and pulls in the libraries it
 needs, including a Vulkan driver (`mesa-vulkan-drivers`, unless you already have one).
 
 If you installed from the tarball before, remove that copy first (the first `rm` command under
@@ -295,7 +297,8 @@ First, in Settings → Agents, **Unregister** xolkit from each agent, which take
 wrote there.
 
 On Linux, if you installed the Arch package, run `sudo pacman -R xolkit-bin` in place of the
-first `rm` command (for the Debian package, `sudo apt remove xolkit`), which removes the binary, desktop entry and icons:
+first `rm` command (for the Debian package, `sudo apt remove xolkit`), which removes the binary,
+desktop entry and icons:
 
 ```bash
 rm ~/.local/bin/xolkit \
