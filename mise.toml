@@ -26,6 +26,10 @@ run = [
   "actionlint",
 ]
 
+[tasks.install]
+description = "Install xolkit as a system package from its release (Arch Linux and other pacman-based distributions for now)"
+run = "scripts/install.sh"
+
 [tasks.ci]
 description = "Everything CI checks"
 depends = ["lint", "test", "licenses-check"]
