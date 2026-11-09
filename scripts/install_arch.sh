@@ -13,6 +13,10 @@ if ! command -v pacman > /dev/null || ! command -v makepkg > /dev/null; then
   echo "installing on Arch needs pacman and makepkg (from the pacman package)" >&2
   exit 1
 fi
+if ! command -v fakeroot > /dev/null; then
+  echo "makepkg needs fakeroot: install base-devel first (sudo pacman -S --needed base-devel)" >&2
+  exit 1
+fi
 if [[ $EUID -eq 0 ]]; then
   echo "Run this as your own user, not root: makepkg won't build as root and asks for sudo itself." >&2
   exit 1

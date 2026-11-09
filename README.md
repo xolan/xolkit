@@ -186,9 +186,9 @@ only your shell's, and log out and back in.
 
 ### Arch Linux
 
-On Arch and other pacman-based distributions, download `PKGBUILD` and `PKGBUILD.sha256` from
-[Releases](https://github.com/xolan/xolkit/releases) into an empty folder, and in that folder
-run:
+On Arch and other pacman-based distributions, with `base-devel` installed, download `PKGBUILD`
+and `PKGBUILD.sha256` from [Releases](https://github.com/xolan/xolkit/releases) into an empty
+folder, and in that folder run:
 
 ```bash
 sha256sum -c PKGBUILD.sha256 && makepkg -si

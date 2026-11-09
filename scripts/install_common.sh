@@ -17,7 +17,10 @@ release_tag() {
   case "$status" in
   200) echo "v$version" ;;
   404)
-    latest="$(curl -fsSL --proto '=https' --connect-timeout 30 -o /dev/null -w '%{url_effective}' "$repo/releases/latest")"
+    latest="$(curl -fsSL --proto '=https' --connect-timeout 30 -o /dev/null -w '%{url_effective}' "$repo/releases/latest")" || {
+      echo "couldn't look up the latest release" >&2
+      return 1
+    }
     latest="${latest##*/tag/}"
     [[ "$latest" =~ ^v[0-9] ]] || { echo "couldn't find the latest release" >&2; return 1; }
     echo "xolkit $version has no release; installing the latest release, ${latest#v}." >&2
