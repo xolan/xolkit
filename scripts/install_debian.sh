@@ -44,6 +44,9 @@ chmod 755 "$dir"
 chmod 644 "$dir/$deb"
 "${sudo[@]}" apt-get install "$@" "$dir/$deb" || {
   status=$?
-  echo "If apt couldn't locate a package xolkit depends on, run 'sudo apt-get update' and try again." >&2
+  # apt-get exits 100 on errors such as a package it can't locate, 1 when you decline.
+  if [[ $status -eq 100 ]]; then
+    echo "If apt couldn't locate a package xolkit depends on, run 'sudo apt-get update' and try again." >&2
+  fi
   exit "$status"
 }

@@ -10,14 +10,13 @@ trap 'rm -rf "$dir"' EXIT
 # Succeeds if release <tag> has <file>, fails if it doesn't, and exits on any other answer.
 has_file() {
   local status
-  # One byte is enough to tell; the asset host answers 206, or 200 if it ignores the range (the
-  # time limit then stops it fetching the whole file).
-  status="$(curl -sSL --proto '=https' --connect-timeout 30 --max-time 60 -r 0-0 -o /dev/null -w '%{http_code}' "$repo/releases/download/$1/$2")" || {
+  # A HEAD request: the answer tells, without downloading the file.
+  status="$(curl -sSIL --proto '=https' --connect-timeout 30 --max-time 60 -o /dev/null -w '%{http_code}' "$repo/releases/download/$1/$2")" || {
     echo "couldn't reach $repo" >&2
     exit 1
   }
   case "$status" in
-  200 | 206) return 0 ;;
+  200) return 0 ;;
   404) return 1 ;;
   *) echo "looking for $2 in release $1 failed: HTTP $status" >&2; exit 1 ;;
   esac
@@ -36,20 +35,31 @@ latest_tag() {
   echo "$latest"
 }
 
+# Succeeds if release <tag> has <file> and <file>.sha256.
+has_files() {
+  has_file "$1" "$2" && has_file "$1" "$2.sha256"
+}
+
 # Downloads <name> and its .sha256 from release v$version, or from the latest release if
 # v$version doesn't have them (not released, or released before that file was), and checks them.
 # @VERSION@ in <name> stands for the release's version. Sets $tag and $file.
 download_release_file() {
+  local latest
   tag="v$version"
   file="${1//@VERSION@/$version}"
-  if ! { has_file "$tag" "$file" && has_file "$tag" "$file.sha256"; }; then
-    tag="$(latest_tag)"
-    if [[ "$tag" == "v$version" ]]; then
-      echo "No release has $file and its .sha256 yet." >&2
+  if ! has_files "$tag" "$file"; then
+    latest="$(latest_tag)"
+    if [[ "$latest" == "$tag" ]]; then
+      echo "Release $tag, the latest, doesn't have $file and its .sha256." >&2
       exit 1
     fi
-    echo "No $file in a v$version release (not released, or released without it); installing from the latest release, ${tag#v}." >&2
-    file="${1//@VERSION@/${tag#v}}"
+    if ! has_files "$latest" "${1//@VERSION@/${latest#v}}"; then
+      echo "Neither release $tag nor the latest, $latest, has the package to install and its .sha256 ($file)." >&2
+      exit 1
+    fi
+    echo "Release $tag doesn't have $file and its .sha256 (not released, or released without them); installing from the latest release, ${latest#v}." >&2
+    tag="$latest"
+    file="${1//@VERSION@/${latest#v}}"
   fi
   download_verified "$tag" "$file"
 }
