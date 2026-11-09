@@ -1,21 +1,10 @@
 #!/usr/bin/env bash
-# Installs xolkit as a system package. For now that is the xolkit-bin package on Arch Linux and
-# other pacman-based distributions: it downloads the PKGBUILD of the release matching the checked
-# out version (the latest release if that version isn't released), checks it against the release's
-# PKGBUILD.sha256, and builds and installs it with `makepkg -si`.
+# Installs xolkit as a system package: works out which system this is and hands over to the
+# install script for it, with the checked-out version and any arguments given here. For now only
+# Arch Linux and other pacman-based distributions (scripts/install_arch.sh) are supported.
 set -euo pipefail
-repo=https://github.com/xolan/xolkit
-root="$(cd "$(dirname "$0")/.." && pwd)"
-
-if ! command -v pacman > /dev/null || ! command -v makepkg > /dev/null; then
-  echo "mise run install supports only Arch Linux and other pacman-based distributions for now." >&2
-  echo "See Install in README.md for the other ways to install xolkit." >&2
-  exit 1
-fi
-if [[ $EUID -eq 0 ]]; then
-  echo "Run this as your own user, not root: makepkg won't build as root and asks for sudo itself." >&2
-  exit 1
-fi
+scripts="$(cd "$(dirname "$0")" && pwd)"
+root="$(dirname "$scripts")"
 
 # The version in [workspace.package] in Cargo.toml.
 version="$(awk '
@@ -24,42 +13,20 @@ version="$(awk '
 ' "$root/Cargo.toml")"
 [[ -n "$version" ]] || { echo "no version in $root/Cargo.toml" >&2; exit 1; }
 
-dir="$(mktemp -d)"
-trap 'rm -rf "$dir"' EXIT
-
-# Downloads <file> of release <tag> into $dir. Prints curl's HTTP status; fails on other errors.
-fetch() {
-  curl -sSL --proto '=https' -o "$dir/$2" -w '%{http_code}' "$repo/releases/download/$1/$2" || {
-    echo "couldn't download $2 from release $1" >&2
-    return 1
-  }
-}
-
-tag="v$version"
-status="$(fetch "$tag" PKGBUILD)"
-if [[ "$status" == 404 ]]; then
-  latest="$(curl -fsSL --proto '=https' -o /dev/null -w '%{url_effective}' "$repo/releases/latest")"
-  latest="${latest##*/tag/}"
-  [[ "$latest" =~ ^v[0-9] ]] || { echo "couldn't find the latest release" >&2; exit 1; }
-  echo "xolkit $version has no release; installing the latest release, ${latest#v}."
-  tag="$latest"
-  status="$(fetch "$tag" PKGBUILD)"
+# ID and ID_LIKE from os-release, such as "cachyos arch".
+distro=""
+if [[ "$(uname -s)" == Linux && -r /etc/os-release ]]; then
+  distro="$(. /etc/os-release && echo "${ID:-} ${ID_LIKE:-}")"
 fi
-[[ "$status" == 200 ]] || { echo "downloading PKGBUILD from release $tag failed: HTTP $status" >&2; exit 1; }
-status="$(fetch "$tag" PKGBUILD.sha256)"
-[[ "$status" == 200 ]] || { echo "downloading PKGBUILD.sha256 from release $tag failed: HTTP $status" >&2; exit 1; }
 
-# The checksum file must name the PKGBUILD alone, so `sha256sum -c` checks nothing else.
-grep -Eqx '[0-9a-f]{64}  PKGBUILD' "$dir/PKGBUILD.sha256" || {
-  echo "PKGBUILD.sha256 from release $tag isn't a checksum of PKGBUILD" >&2
-  exit 1
-}
-(cd "$dir" && sha256sum --quiet -c PKGBUILD.sha256) || {
-  echo "PKGBUILD from release $tag doesn't match PKGBUILD.sha256; not installing it" >&2
-  exit 1
-}
-echo "PKGBUILD from release $tag matches its checksum."
+case " $distro " in
+*" arch "*) exec "$scripts/install_arch.sh" "$version" "$@" ;;
+esac
+# A pacman-based distribution that doesn't say it is like Arch.
+if command -v pacman > /dev/null; then
+  exec "$scripts/install_arch.sh" "$version" "$@"
+fi
 
-# makepkg checks the release tarball against the checksum in the PKGBUILD.
-cd "$dir"
-makepkg -si "$@"
+echo "mise run install supports only Arch Linux and other pacman-based distributions for now." >&2
+echo "See Install in README.md for the other ways to install xolkit." >&2
+exit 1
