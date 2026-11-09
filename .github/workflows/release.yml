@@ -66,12 +66,16 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: mise run package ${{ matrix.target }}
+      - name: Build the Debian package
+        if: runner.os == 'Linux'
+        run: mise run deb ${{ matrix.target }}
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
-          # A tarball for Linux, a zip for Windows, each with its .sha256.
+          # A tarball and a .deb for Linux, a zip for Windows, each with its .sha256.
           path: |
             dist/*.tar.gz*
+            dist/*.deb*
             dist/*.zip*
 
   release:

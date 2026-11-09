@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Installs xolkit as a system package: works out which system this is and hands over to the
-# install script for it, with the checked-out version and any arguments given here. For now only
-# Arch Linux and other pacman-based distributions (scripts/install_arch.sh) are supported.
+# install script for it, with the checked-out version and any arguments given here:
+# scripts/install_arch.sh for Arch Linux and other pacman-based distributions, and
+# scripts/install_debian.sh for Debian, Ubuntu and other apt-based ones.
 set -euo pipefail
 scripts="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$scripts")"
@@ -21,12 +22,16 @@ fi
 
 case " $distro " in
 *" arch "*) exec "$scripts/install_arch.sh" "$version" "$@" ;;
+*" debian "* | *" ubuntu "*) exec "$scripts/install_debian.sh" "$version" "$@" ;;
 esac
-# A pacman-based distribution that doesn't say it is like Arch.
+# A distribution that doesn't say what it is like, by its package manager.
 if command -v pacman > /dev/null; then
   exec "$scripts/install_arch.sh" "$version" "$@"
 fi
+if command -v apt-get > /dev/null; then
+  exec "$scripts/install_debian.sh" "$version" "$@"
+fi
 
-echo "mise run install supports only Arch Linux and other pacman-based distributions for now." >&2
+echo "mise run install supports only Arch Linux, Debian, Ubuntu and distributions based on them for now." >&2
 echo "See Install in README.md for the other ways to install xolkit." >&2
 exit 1

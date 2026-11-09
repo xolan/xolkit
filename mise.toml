@@ -26,6 +26,24 @@ run = [
   "actionlint",
 ]
 
+[tasks.deb]
+description = "Build a Debian package for a Linux target into dist/"
+usage = 'arg "<target>" help="Rust target triple, e.g. x86_64-unknown-linux-gnu"'
+tools = { "cargo:cargo-deb" = "3.8.0" }
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+target="$usage_target"
+pkgid=$(cargo pkgid -p xolkit)
+version="${pkgid##*[#@]}"
+cargo build --release --locked -p xolkit --target "$target"
+name="xolkit-$version-$target.deb"
+mkdir -p dist
+cargo deb -p xolkit --no-build --target "$target" --output "dist/$name"
+(cd dist && sha256sum "$name" > "$name.sha256")
+echo "dist/$name"
+'''
+
 [tasks.install]
 description = "Install xolkit as a system package from its release"
 run = "scripts/install.sh"

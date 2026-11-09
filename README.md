@@ -149,8 +149,13 @@ xolkit talks to `skills.sh`, `api.github.com`, `codeload.github.com` and
 
 ## Install
 
-Each release holds a Linux tarball and a Windows zip for x86_64 and aarch64, and a `PKGBUILD`
-for Arch Linux, each with a `.sha256` checksum file.
+Each release holds a Linux tarball, a Debian package and a Windows zip for x86_64 and aarch64, and
+a `PKGBUILD` for Arch Linux, each with a `.sha256` checksum file.
+
+On Arch Linux, Debian, Ubuntu and distributions based on them, the simplest way is to run
+`mise run install` in a clone of this repository. It installs the package for your system from the
+release matching the checked-out version (the latest release if that version isn't released yet),
+after checking it against its `.sha256`. The sections below say what it does on each system.
 
 ### Linux
 
@@ -187,14 +192,31 @@ run:
 sha256sum -c PKGBUILD.sha256 && makepkg -si
 ```
 
-Or, in a clone of this repository, run `mise run install`: it downloads the `PKGBUILD` of the
-release matching the checked-out version (the latest release if that version isn't released yet),
-checks it against `PKGBUILD.sha256`, and runs `makepkg -si` in a temporary folder.
+`mise run install` does the same in a temporary folder.
 
-Either way, this builds a `xolkit-bin` package from the release's prebuilt binary, checks the tarball
+This builds a `xolkit-bin` package from the release's prebuilt binary, checks the tarball
 against the checksum in the `PKGBUILD`, and installs it with pacman, which pulls in the libraries it
 needs. If you have no Vulkan driver yet, pacman asks you to pick the one for your GPU, such as
 `vulkan-radeon`, `vulkan-intel` or `nvidia-utils`.
+
+If you installed from the tarball before, remove that copy first (the first `rm` command under
+[Uninstall](#uninstall)), or the one in `~/.local/bin` keeps starting instead.
+
+### Debian and Ubuntu
+
+On Debian, Ubuntu and other apt-based distributions, download
+`xolkit-<version>-<arch>-unknown-linux-gnu.deb` and its `.sha256` from
+[Releases](https://github.com/xolan/xolkit/releases), where `<arch>` is `x86_64` or `aarch64`. In
+the folder you downloaded them to, set `version` to the release you picked and run:
+
+```bash
+version=3.2.3
+name=xolkit-$version-$(uname -m)-unknown-linux-gnu.deb
+sha256sum -c "$name.sha256" && sudo apt install "./$name"
+```
+
+`mise run install` does the same. apt installs the `xolkit` package and pulls in the libraries it
+needs, including a Vulkan driver (`mesa-vulkan-drivers`, unless you already have one).
 
 If you installed from the tarball before, remove that copy first (the first `rm` command under
 [Uninstall](#uninstall)), or the one in `~/.local/bin` keeps starting instead.
@@ -273,7 +295,7 @@ First, in Settings → Agents, **Unregister** xolkit from each agent, which take
 wrote there.
 
 On Linux, if you installed the Arch package, run `sudo pacman -R xolkit-bin` in place of the
-first `rm` command, which removes the binary, desktop entry and icons:
+first `rm` command (for the Debian package, `sudo apt remove xolkit`), which removes the binary, desktop entry and icons:
 
 ```bash
 rm ~/.local/bin/xolkit \
@@ -354,6 +376,7 @@ command line).
 | `mise run fmt` | Format the code |
 | `mise run build` | Build a release binary |
 | `mise run install` | Install xolkit as a system package from the release matching the checked-out version |
+| `mise run deb <target>` | Build a Debian package for a Linux target into `dist/` (on Debian or Ubuntu, with the libraries above installed) |
 | `mise run package <target>` | Build a release archive into `dist/` for the host's own platform: a tarball on Linux, a zip on Windows |
 | `mise run licenses` | Regenerate `THIRD_PARTY_LICENSES.md` and the app's `licenses.json` after changing dependencies |
 | `mise run icon` | Render the Windows app icon from the SVGs in `assets/brand/` |
@@ -375,8 +398,9 @@ version on `main` publishes a release.
 ## Releases
 
 Pushing to `main` with a new `version` in `Cargo.toml` runs CI, builds Linux and Windows binaries
-(x86_64 and aarch64), writes the Arch Linux `PKGBUILD` from `assets/arch/PKGBUILD` with the
-tarballs' checksums, and publishes a GitHub release `v<version>`.
+(x86_64 and aarch64) and Debian packages (with [cargo-deb](https://github.com/kornelski/cargo-deb),
+from `[package.metadata.deb]` in `crates/xolkit/Cargo.toml`), writes the Arch Linux `PKGBUILD` from
+`assets/arch/PKGBUILD` with the tarballs' checksums, and publishes a GitHub release `v<version>`.
 
 ## License
 
