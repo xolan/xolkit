@@ -1,5 +1,5 @@
 # Shared by the install_<system>.sh scripts, which source it after setting $version: finds the
-# release to install and downloads its files, each checked against its .sha256, into $dir.
+# release to install from and downloads a file of it, checked against its .sha256, into $dir.
 repo=https://github.com/xolan/xolkit
 
 command -v curl > /dev/null || { echo "installing needs curl" >&2; exit 1; }
@@ -7,27 +7,45 @@ command -v curl > /dev/null || { echo "installing needs curl" >&2; exit 1; }
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 
-# Prints the tag of release v$version, or of the latest release if v$version isn't released.
-release_tag() {
-  local status latest
-  status="$(curl -sSL --proto '=https' --connect-timeout 30 -o /dev/null -w '%{http_code}' "$repo/releases/tag/v$version")" || {
+# Succeeds if release <tag> has <file>, fails if it doesn't, and exits on any other answer.
+has_file() {
+  local status
+  # One byte is enough to tell; the asset host answers 206, or 200 if it ignores the range.
+  status="$(curl -sSL --proto '=https' --connect-timeout 30 -r 0-0 -o /dev/null -w '%{http_code}' "$repo/releases/download/$1/$2")" || {
     echo "couldn't reach $repo" >&2
-    return 1
+    exit 1
   }
   case "$status" in
-  200) echo "v$version" ;;
-  404)
-    latest="$(curl -fsSL --proto '=https' --connect-timeout 30 -o /dev/null -w '%{url_effective}' "$repo/releases/latest")" || {
-      echo "couldn't look up the latest release" >&2
-      return 1
-    }
-    latest="${latest##*/tag/}"
-    [[ "$latest" =~ ^v[0-9] ]] || { echo "couldn't find the latest release" >&2; return 1; }
-    echo "xolkit $version has no release; installing the latest release, ${latest#v}." >&2
-    echo "$latest"
-    ;;
-  *) echo "looking up release v$version failed: HTTP $status" >&2; return 1 ;;
+  200 | 206) return 0 ;;
+  404) return 1 ;;
+  *) echo "looking for $2 in release $1 failed: HTTP $status" >&2; exit 1 ;;
   esac
+}
+
+# Prints the tag of the latest release.
+latest_tag() {
+  local latest
+  latest="$(curl -fsSL --proto '=https' --connect-timeout 30 -o /dev/null -w '%{url_effective}' "$repo/releases/latest")" || {
+    echo "couldn't look up the latest release" >&2
+    return 1
+  }
+  latest="${latest##*/tag/}"
+  [[ "$latest" =~ ^v[0-9] ]] || { echo "couldn't find the latest release" >&2; return 1; }
+  echo "$latest"
+}
+
+# Downloads <name> and its .sha256 from release v$version, or from the latest release if
+# v$version doesn't have it (not released, or released before that file was), and checks them.
+# @VERSION@ in <name> stands for the release's version. Sets $tag and $file.
+download_release_file() {
+  tag="v$version"
+  file="${1//@VERSION@/$version}"
+  if ! has_file "$tag" "$file"; then
+    tag="$(latest_tag)"
+    echo "No $file in a v$version release (not released, or released without it); installing from the latest release, ${tag#v}." >&2
+    file="${1//@VERSION@/${tag#v}}"
+  fi
+  download_verified "$tag" "$file"
 }
 
 # Downloads <file> of release <tag> into $dir.

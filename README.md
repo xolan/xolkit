@@ -154,8 +154,9 @@ a `PKGBUILD` for Arch Linux, each with a `.sha256` checksum file.
 
 On Arch Linux, Debian, Ubuntu and distributions based on them, the simplest way is to run
 `scripts/install.sh` in a clone of this repository. It installs the package for your system from
-the release matching the checked-out version (the latest release if that version isn't released
-yet), after checking it against its `.sha256`, and needs neither mise nor Rust. The sections below
+the release matching the checked-out version (the latest release if that one isn't out yet, or
+has no package for your system), after checking it against its `.sha256`, and needs neither mise
+nor Rust. The sections below
 say what it does on each system. If you have the development tools set up (see
 [Development](#development)), `mise run install` does the same.
 

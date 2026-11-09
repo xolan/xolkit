@@ -2,9 +2,9 @@
 # Installs the xolkit package on Debian 12, Ubuntu 22.04 and newer, and other apt-based
 # distributions. Run it through scripts/install.sh. Usage: install_debian.sh <version> [apt-get args]
 #
-# Downloads the .deb of release v<version> (the latest release if that version isn't released),
-# checks it against the release's .deb.sha256, and installs it with `apt-get install`, which pulls
-# in the libraries it needs.
+# Downloads the .deb of release v<version> (the latest release's if that one has none), checks
+# it against the release's .deb.sha256, and installs it with `apt-get install`, which pulls in
+# the libraries it needs.
 set -euo pipefail
 version="${1:?usage: install_debian.sh <version> [apt-get args]}"
 shift
@@ -27,16 +27,15 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 . "$(dirname "$0")/install_common.sh"
-tag="$(release_tag)"
-deb="xolkit-${tag#v}-$target.deb"
-download_verified "$tag" "$deb"
+download_release_file "xolkit-@VERSION@-$target.deb"
+deb="$file"
 
 # The package needs the glibc of the system it was built on (see release.yml). Say so plainly
 # rather than leave apt to report an unmet libc6 dependency.
 need="$(dpkg-deb -f "$dir/$deb" Depends | sed -n 's/.*libc6 (>= \([^)]*\)).*/\1/p')"
 have="$(dpkg-query -W -f '${Version}' "libc6:$arch")"
 if [[ -n "$need" ]] && ! dpkg --compare-versions "$have" ge "$need"; then
-  echo "xolkit needs glibc $need or newer (Debian 12, Ubuntu 22.04 or newer); this system has $have" >&2
+  echo "xolkit needs glibc $need or newer (Debian 12, Ubuntu 22.04 or newer, or a distribution based on them); this system has $have" >&2
   exit 1
 fi
 
