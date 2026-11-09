@@ -353,7 +353,7 @@ command line).
 | `mise run ci` | Lint, tests and the licenses check, as CI runs them |
 | `mise run fmt` | Format the code |
 | `mise run build` | Build a release binary |
-| `mise run install` | Install xolkit from the release matching the checked-out version with `makepkg -si` (Arch Linux and other pacman-based distributions) |
+| `mise run install` | Install xolkit as a system package from the release matching the checked-out version |
 | `mise run package <target>` | Build a release archive into `dist/` for the host's own platform: a tarball on Linux, a zip on Windows |
 | `mise run licenses` | Regenerate `THIRD_PARTY_LICENSES.md` and the app's `licenses.json` after changing dependencies |
 | `mise run icon` | Render the Windows app icon from the SVGs in `assets/brand/` |
