@@ -21,11 +21,11 @@ const WAIT: Duration = Duration::from_secs(60);
 /// How long a repository's archive may take to download.
 const DOWNLOAD: Duration = Duration::from_secs(30 * 60);
 /// Largest repository archive to download.
-const MAX_ARCHIVE: u64 = 200 * 1024 * 1024;
+const MAX_ARCHIVE: u64 = 512 * 1024 * 1024;
 /// Largest skill folder to extract.
-const MAX_SKILL: u64 = 20 * 1024 * 1024;
+const MAX_SKILL: u64 = 128 * 1024 * 1024;
 /// Largest plugin folder to extract.
-pub(crate) const MAX_PLUGIN: u64 = 100 * 1024 * 1024;
+pub(crate) const MAX_PLUGIN: u64 = 256 * 1024 * 1024;
 
 /// A skills.sh search result.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
