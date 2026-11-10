@@ -425,8 +425,11 @@ fn find_skill_folder(
     if let [folder] = by_dir[..] {
         return Ok(folder.to_owned());
     }
-    if let [folder] = folders[..] {
-        return Ok(folder.to_owned());
+    // A repository that is one skill at its root is that skill, whatever skills.sh calls it. A
+    // lone skill further down still has to match, or a skill removed from a repository would
+    // install whichever one remains.
+    if let [""] = folders[..] {
+        return Ok(String::new());
     }
     let candidates = if by_dir.is_empty() { &folders } else { &by_dir };
     for folder in candidates.iter().take(50) {
@@ -442,7 +445,7 @@ fn find_skill_folder(
     if tree.truncated {
         bail!("the repository is too large to search for {skill_id}");
     }
-    bail!("no skill named {skill_id} in the repository")
+    bail!("no skill named {skill_id} in the repository; it may have been renamed or removed")
 }
 
 /// Unpacks `archive`, a `.tar.gz` stream, into `dest` with the system's `tar`: only `folder` of
@@ -847,6 +850,14 @@ mod tests {
             "skills/b"
         );
         assert!(find_skill_folder(&t, "missing", |_| Ok(String::new())).is_err());
+        // A lone nested skill that isn't the one asked for is not installed in its place.
+        let other = |_: &str| -> Result<String> { Ok("---\nname: other\n---\n".into()) };
+        let lone = tree(&["skills/other/SKILL.md"]);
+        assert!(find_skill_folder(&lone, "gone", other).is_err());
+        assert_eq!(
+            find_skill_folder(&lone, "other", no_read).unwrap(),
+            "skills/other"
+        );
     }
 
     fn tarball(entries: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {
@@ -1138,6 +1149,18 @@ mod tests {
         assert_eq!(skills[0].name, "find-skills");
         let again = fetch_skill_at(&env, &fetched.pin, "find-skills", None).unwrap();
         assert_eq!(again.pin.tree, fetched.pin.tree);
+    }
+
+    #[test]
+    #[ignore = "uses the network"]
+    fn removed_skill_is_not_swapped_for_another() {
+        // skills.sh still lists gpt-taste, but the repository now holds only design-taste-frontend.
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        let token = std::env::var("GITHUB_TOKEN").ok();
+        let err = fetch_skill(&env, "leonxlnx/taste-skill", "gpt-taste", token.as_deref())
+            .expect_err("gpt-taste is no longer in leonxlnx/taste-skill");
+        assert!(format!("{err:#}").contains("no skill named gpt-taste"));
     }
 
     #[test]
