@@ -234,10 +234,8 @@ impl Shelf {
     }
 
     fn installed_skill(&self, hit: &SkillHit) -> bool {
-        self.library
-            .skills
-            .iter()
-            .any(|s| s.name == hit.skill_id || s.name == hit.name)
+        self.library.has_skill_from(&hit.skill_id, &hit.source)
+            || self.library.has_skill_from(&hit.name, &hit.source)
     }
 
     pub(super) fn render_find_skills(&self, cx: &mut Context<Self>) -> AnyElement {

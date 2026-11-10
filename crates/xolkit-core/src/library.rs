@@ -43,6 +43,17 @@ impl Library {
         self.skills.iter().find(|s| s.name == name)
     }
 
+    /// Whether skill `name` is installed from GitHub repository `source` (`owner/repo`). A
+    /// skill of the same name from another repository, or added from disk, doesn't count.
+    pub fn has_skill_from(&self, name: &str, source: &str) -> bool {
+        self.skill(name).is_some()
+            && self
+                .lock
+                .skills
+                .get(name)
+                .is_some_and(|pin| pin.source.eq_ignore_ascii_case(source))
+    }
+
     pub fn plugin(&self, id: &str) -> Option<&Plugin> {
         self.plugins.iter().find(|p| p.id == id)
     }
@@ -165,6 +176,20 @@ mod tests {
         assert!(library.plugin("p@m").is_some());
         let names: Vec<_> = library.all_servers().into_iter().map(|s| s.name).collect();
         assert_eq!(names, ["p", "p-2"]);
+
+        // Only the repository the lock file records counts as where the skill came from.
+        assert!(!library.has_skill_from("s", "t3dotgg/tstack"));
+        let mut library = library;
+        library.lock.skills.insert(
+            "s".into(),
+            crate::lock::Pin {
+                source: "t3dotgg/tstack".into(),
+                ..Default::default()
+            },
+        );
+        assert!(library.has_skill_from("s", "T3dotgg/tstack"));
+        assert!(!library.has_skill_from("s", "gkaria/t3dotgg-tstack"));
+        assert!(!library.has_skill_from("t", "t3dotgg/tstack"));
 
         execute(&env, &uninstall_skill(&env, &settings, "s")).unwrap();
         let library = Library::load(&env).unwrap();
