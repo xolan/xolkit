@@ -101,7 +101,8 @@ impl std::fmt::Display for LeftOut {
 
 /// The names agents see for the `tools` of `server`, in their order. No two tools get one name,
 /// and a name that needed no shortening goes to its tool before any shortened to the same, so
-/// the names of tools that fit never change or go to another tool.
+/// the names of tools that fit never change or go to another tool. Of two tools shortened to
+/// one name, the first by its own name gets it, whatever order the server lists them in.
 pub(crate) fn tool_names<'a>(
     server: &str,
     tools: impl IntoIterator<Item = &'a str>,
@@ -112,15 +113,19 @@ pub(crate) fn tool_names<'a>(
         .iter()
         .map(|tool| tool_name(server, tool).ok_or(LeftOut::Unusable))
         .collect();
+    let mut order: Vec<usize> = (0..tools.len()).collect();
+    order.sort_by_key(|&i| {
+        let shortened = names[i]
+            .as_ref()
+            .is_ok_and(|seen| seen.len() < full(tools[i]));
+        (shortened, shortened.then_some(tools[i]))
+    });
     let mut taken = std::collections::HashSet::new();
-    for shortened in [false, true] {
-        for (tool, name) in tools.iter().zip(&mut names) {
-            if let Ok(seen) = name
-                && (seen.len() < full(tool)) == shortened
-                && !taken.insert(seen.clone())
-            {
-                *name = Err(LeftOut::Taken);
-            }
+    for i in order {
+        if let Ok(seen) = &names[i]
+            && !taken.insert(seen.clone())
+        {
+            names[i] = Err(LeftOut::Taken);
         }
     }
     names
@@ -550,18 +555,10 @@ mod tests {
             Some("planetscale__get_organization_billing_payment_e051")
         );
         // Only a whole word is dropped from the front.
-        let github = "github_create_pull_request_review_comment_reply_now";
-        assert!(
-            tool_name("git", github)
-                .unwrap()
-                .starts_with("git__github_create_")
+        assert_eq!(
+            tool_name("git", "github_create_pull_request_review_comment_reply_now").as_deref(),
+            Some("git__github_create_pull_request_review_comment_e338")
         );
-        // Two tools cut at the same place keep names of their own.
-        let (a, b) = (
-            format!("{}_a", "x".repeat(60)),
-            format!("{}_b", "x".repeat(60)),
-        );
-        assert_ne!(tool_name("server", &a), tool_name("server", &b));
     }
 
     #[test]
@@ -580,6 +577,18 @@ mod tests {
         }
         // Without the other, the long one gets the name, and calls to it reach the tool.
         assert_eq!(own_tool_name("planetscale", [long], seen), Some(long));
+    }
+
+    #[test]
+    fn a_shortened_name_goes_to_the_same_tool_in_any_order() {
+        let (dash, underscore) = (
+            format!("ps-{}", "x".repeat(46)),
+            format!("ps_{}", "x".repeat(46)),
+        );
+        let seen = format!("ps__{}", "x".repeat(46));
+        for tools in [[&*dash, &*underscore], [&*underscore, &*dash]] {
+            assert_eq!(own_tool_name("ps", tools, &seen), Some(&*dash));
+        }
     }
 
     #[test]

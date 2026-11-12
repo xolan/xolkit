@@ -17,9 +17,9 @@ pub const GITHUB_TOKEN: &str = "github-token";
 /// starts or comes back after xolkit did is found without restarting xolkit.
 enum Keyring {
     Unreached,
-    /// Not reached when last tried, at `at`, for the reason `why`.
+    /// It failed, for the reason `why`, and is not tried again before `until`.
     Failed {
-        at: Instant,
+        until: Instant,
         why: String,
     },
     Reached,
@@ -27,9 +27,19 @@ enum Keyring {
 
 static KEYRING: Mutex<Keyring> = Mutex::new(Keyring::Unreached);
 
-/// How long a failure to reach the keyring stands before trying again. Reaching for a keyring
-/// that hangs can take many seconds, and callers ask for one secret after another.
+/// The least time a failure of the keyring stands before it is tried again.
 const RETRY_AFTER: Duration = Duration::from_secs(3);
+
+impl Keyring {
+    /// The keyring having failed for the reason `why`, in an attempt begun at `started`. The
+    /// failure stands for as long as the attempt took, if that is longer than [`RETRY_AFTER`]:
+    /// a keyring that hangs takes many seconds to fail, callers ask for one secret after
+    /// another, and they should not spend most of their time waiting on it.
+    fn failed(why: String, started: Instant) -> Self {
+        let until = Instant::now() + started.elapsed().max(RETRY_AFTER);
+        Keyring::Failed { until, why }
+    }
+}
 
 fn keyring() -> MutexGuard<'static, Keyring> {
     KEYRING.lock().unwrap_or_else(PoisonError::into_inner)
@@ -56,41 +66,43 @@ fn entry(key: &str) -> Result<Entry> {
         let mut keyring = keyring();
         match &*keyring {
             Keyring::Reached => {}
-            Keyring::Failed { at, why } if at.elapsed() < RETRY_AFTER => bail!("{why}"),
-            _ => match store() {
-                Ok(store) => {
-                    keyring_core::set_default_store(store);
-                    *keyring = Keyring::Reached;
+            Keyring::Failed { until, why } if Instant::now() < *until => bail!("{why}"),
+            _ => {
+                let started = Instant::now();
+                match store() {
+                    Ok(store) => {
+                        keyring_core::set_default_store(store);
+                        *keyring = Keyring::Reached;
+                    }
+                    Err(e) => {
+                        let why = format!("{UNREACHABLE}: {e}");
+                        *keyring = Keyring::failed(why.clone(), started);
+                        bail!(why);
+                    }
                 }
-                Err(e) => {
-                    let why = format!("{UNREACHABLE}: {e}");
-                    *keyring = Keyring::Failed {
-                        at: Instant::now(),
-                        why: why.clone(),
-                    };
-                    bail!(why);
-                }
-            },
+            }
         }
     }
     Entry::new(SERVICE, key).context("could not open the OS keyring")
 }
 
-/// Has the next use reach for the keyring anew when `error` may mean the connection to it was
-/// lost, as when the Secret Service provider was restarted.
-fn lost(error: &Error) {
-    if matches!(error, Error::PlatformFailure(_) | Error::NoStorageAccess(_)) {
-        *keyring() = Keyring::Unreached;
+/// Has the keyring reached for anew, after a while, when the `error` of a use begun at `started`
+/// may mean the connection to it was lost, as when the Secret Service provider was restarted.
+/// A keyring that is locked is still connected.
+fn lost(error: &Error, started: Instant) {
+    if matches!(error, Error::PlatformFailure(_)) {
+        *keyring() = Keyring::failed(format!("the OS keyring failed: {error}"), started);
     }
 }
 
 /// The secret saved under `key`, or `None` when there is none.
 pub fn get_secret(key: &str) -> Result<Option<String>> {
-    match entry(key)?.get_password() {
+    let (entry, started) = (entry(key)?, Instant::now());
+    match entry.get_password() {
         Ok(secret) => Ok(Some(secret)),
         Err(Error::NoEntry) => Ok(None),
         Err(e) => {
-            lost(&e);
+            lost(&e, started);
             Err(e).context("could not read from the OS keyring")
         }
     }
@@ -98,16 +110,16 @@ pub fn get_secret(key: &str) -> Result<Option<String>> {
 
 /// Saves `secret` under `key`, or deletes it when `None`.
 pub fn set_secret(key: &str, secret: Option<&str>) -> Result<()> {
-    let entry = entry(key)?;
+    let (entry, started) = (entry(key)?, Instant::now());
     match secret {
         Some(secret) => entry
             .set_password(secret)
-            .inspect_err(lost)
+            .inspect_err(|e| lost(e, started))
             .context("could not save to the OS keyring"),
         None => match entry.delete_credential() {
             Ok(()) | Err(Error::NoEntry) => Ok(()),
             Err(e) => {
-                lost(&e);
+                lost(&e, started);
                 Err(e).context("could not delete from the OS keyring")
             }
         },
