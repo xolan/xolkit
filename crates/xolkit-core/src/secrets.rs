@@ -141,11 +141,11 @@ pub fn get_secret(key: &str) -> Result<Option<String>> {
 /// Saves `secret` under `key`, or deletes it when `None`.
 pub fn set_secret(key: &str, secret: Option<&str>) -> Result<()> {
     match secret {
-        // An entry that is gone by the time it is written to was not saved.
+        // A keyring that finds no entry to write to has not saved the secret.
         Some(secret) => with_entry(key, "could not save to the OS keyring", false, |entry| {
             entry.set_password(secret)
         })?
-        .context("could not save to the OS keyring: its entry was deleted meanwhile"),
+        .context("could not save to the OS keyring: it reported no such entry"),
         None => with_entry(
             key,
             "could not delete from the OS keyring",

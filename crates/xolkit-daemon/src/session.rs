@@ -157,8 +157,9 @@ pub(crate) fn own_tool_name<'a>(
 /// `planetscale_list_schema_recommendations` of `planetscale` becomes
 /// `planetscale__list_schema_recommendations_8311`. Those characters tell it from other tools
 /// shortened alike, and from a tool the server may add later under the shorter name, so a name
-/// an agent was allowed to call does not come to mean another tool, unless two tools are
-/// shortened to the very same name.
+/// an agent was allowed to call does not come to mean another tool. The one exception is two
+/// tools shortened to the very same name: the first by its own name gets it, even if the
+/// server added that tool later.
 fn tool_name(server: &str, tool: &str) -> Option<String> {
     let usable = |s: &str| {
         s.chars()
