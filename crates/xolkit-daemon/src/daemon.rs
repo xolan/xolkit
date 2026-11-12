@@ -195,14 +195,10 @@ impl Daemon {
     }
 
     /// Logs that a server's tool was left out, once per tool.
-    pub(crate) fn left_out(&self, server: &str, tool: &str) {
+    pub(crate) fn left_out(&self, server: &str, tool: &str, why: &crate::session::LeftOut) {
         let key = format!("{server}{SEPARATOR}{tool}");
         if self.left_out.lock().unwrap().insert(key) {
-            self.event(
-                server,
-                format!("left out the tool {tool}: agents would not accept its name"),
-                true,
-            );
+            self.event(server, format!("left out the tool {tool}: {why}"), true);
         }
     }
 

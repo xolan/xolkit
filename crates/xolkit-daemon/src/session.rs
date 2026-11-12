@@ -81,6 +81,64 @@ const MAX_TOOL_NAME: usize = 64 - "mcp__xolkit__".len();
 /// The fewest characters of a tool's own name kept when shortening it.
 const MIN_KEPT: usize = 8;
 
+/// Why a server's tool is left out of what agents see.
+#[derive(Debug, PartialEq)]
+pub(crate) enum LeftOut {
+    /// Agents would not accept its name, however it was shortened.
+    Unusable,
+    /// Another tool of the server has the name agents would see for it.
+    Taken,
+}
+
+impl std::fmt::Display for LeftOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            LeftOut::Unusable => "agents would not accept its name",
+            LeftOut::Taken => "another tool has the name agents would see for it",
+        })
+    }
+}
+
+/// The names agents see for the `tools` of `server`, in their order. No two tools get one name,
+/// and a name that needed no shortening goes to its tool before any shortened to the same, so
+/// the names of tools that fit never change or go to another tool.
+pub(crate) fn tool_names<'a>(
+    server: &str,
+    tools: impl IntoIterator<Item = &'a str>,
+) -> Vec<Result<String, LeftOut>> {
+    let full = |tool: &str| server.len() + SEPARATOR.len() + tool.len();
+    let tools: Vec<&str> = tools.into_iter().collect();
+    let mut names: Vec<_> = tools
+        .iter()
+        .map(|tool| tool_name(server, tool).ok_or(LeftOut::Unusable))
+        .collect();
+    let mut taken = std::collections::HashSet::new();
+    for shortened in [false, true] {
+        for (tool, name) in tools.iter().zip(&mut names) {
+            if let Ok(seen) = name
+                && (seen.len() < full(tool)) == shortened
+                && !taken.insert(seen.clone())
+            {
+                *name = Err(LeftOut::Taken);
+            }
+        }
+    }
+    names
+}
+
+/// The server's own name for the tool agents see as `seen`, among its `tools`.
+pub(crate) fn own_tool_name<'a>(
+    server: &str,
+    tools: impl IntoIterator<Item = &'a str> + Clone,
+    seen: &str,
+) -> Option<&'a str> {
+    tools
+        .clone()
+        .into_iter()
+        .zip(tool_names(server, tools))
+        .find_map(|(tool, name)| (name.as_deref() == Ok(seen)).then_some(tool))
+}
+
 /// The name agents see for `tool` of `server`: `<server>__<tool>`, or `None` if agents would
 /// not accept it, as tool names are letters, digits, `_` and `-`. One that would be too long is
 /// shortened: first by dropping the server's name from the front of the tool's
@@ -99,8 +157,10 @@ fn tool_name(server: &str, tool: &str) -> Option<String> {
     if tool.len() <= room {
         return Some(format!("{server}{SEPARATOR}{tool}"));
     }
+    // Only a whole word: `git` is not dropped from `github_create_issue`.
     let short = tool
         .strip_prefix(server)
+        .filter(|rest| rest.starts_with(['_', '-']))
         .map(|rest| rest.trim_start_matches(['_', '-']))
         .filter(|rest| !rest.is_empty())
         .unwrap_or(tool);
@@ -112,11 +172,8 @@ fn tool_name(server: &str, tool: &str) -> Option<String> {
         (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
     });
     let kept = room.checked_sub(5).filter(|kept| *kept >= MIN_KEPT)?;
-    Some(format!(
-        "{server}{SEPARATOR}{}_{:04x}",
-        short[..kept].trim_end_matches(['_', '-']),
-        hash & 0xffff
-    ))
+    let kept = short[..kept].trim_end_matches(['_', '-']);
+    (!kept.is_empty()).then(|| format!("{server}{SEPARATOR}{kept}_{:04x}", hash & 0xffff))
 }
 
 fn schema(value: serde_json::Value) -> Arc<JsonObject> {
@@ -307,20 +364,19 @@ impl ServerHandler for Session {
     ) -> Result<ListToolsResult, McpError> {
         self.note_client(&context);
         let mut tools = Session::own_tools();
-        let mut taken = std::collections::HashSet::new();
         for server in self.catalogue().servers {
-            for tool in self.daemon.gateway().tools(&server.name) {
+            let theirs = self.daemon.gateway().tools(&server.name);
+            let names = tool_names(&server.name, theirs.iter().map(|t| t.name.as_ref()));
+            for (mut tool, name) in theirs.into_iter().zip(names) {
                 // Agents refuse a whole request over one bad tool name, or over two tools with
                 // one name, so leave such tools out.
-                let Some(name) =
-                    tool_name(&server.name, &tool.name).filter(|name| taken.insert(name.clone()))
-                else {
-                    self.daemon.left_out(&server.name, &tool.name);
-                    continue;
-                };
-                let mut tool = tool.clone();
-                tool.name = name.into();
-                tools.push(tool);
+                match name {
+                    Ok(name) => {
+                        tool.name = name.into();
+                        tools.push(tool);
+                    }
+                    Err(why) => self.daemon.left_out(&server.name, &tool.name, &why),
+                }
             }
         }
         Ok(ListToolsResult::with_all_items(tools))
@@ -359,18 +415,10 @@ impl ServerHandler for Session {
                         None,
                     ));
                 }
-                // The server's own name for the tool, which the one agents see may shorten.
-                let tool = self
-                    .daemon
-                    .gateway()
-                    .tools(server)
-                    .into_iter()
-                    .find(|t| tool_name(server, &t.name).as_deref() == Some(name.as_str()))
-                    .map_or_else(|| tool.to_owned(), |t| t.name.to_string());
                 match self
                     .daemon
                     .gateway()
-                    .call(server, &tool, request.arguments.clone())
+                    .call(server, tool, request.arguments.clone())
                     .await
                 {
                     Ok(result) => result.into(),
@@ -478,6 +526,7 @@ mod tests {
         assert_eq!(tool_name("has.dot", "tool"), None);
         // No room left for a tool's name worth reading.
         assert_eq!(tool_name(&"s".repeat(40), &"x".repeat(50)), None);
+        assert_eq!(tool_name("server", &"_".repeat(60)), None);
     }
 
     #[test]
@@ -491,17 +540,46 @@ mod tests {
             tool_name("planetscale", "planetscale_list_schema_recommendations").as_deref(),
             Some("planetscale__list_schema_recommendations")
         );
-        let long = "planetscale_get_organization_billing_payment_method";
-        let name = tool_name("planetscale", long).unwrap();
-        assert!(name.starts_with("planetscale__get_organization_billing_payment_"));
-        assert!(name.len() <= MAX_TOOL_NAME);
-        assert_eq!(tool_name("planetscale", long).unwrap(), name);
+        // The exact name, as agents keep it in their settings from one version to the next.
+        assert_eq!(
+            tool_name(
+                "planetscale",
+                "planetscale_get_organization_billing_payment_method"
+            )
+            .as_deref(),
+            Some("planetscale__get_organization_billing_payment_e051")
+        );
+        // Only a whole word is dropped from the front.
+        let github = "github_create_pull_request_review_comment_reply_now";
+        assert!(
+            tool_name("git", github)
+                .unwrap()
+                .starts_with("git__github_create_")
+        );
         // Two tools cut at the same place keep names of their own.
         let (a, b) = (
             format!("{}_a", "x".repeat(60)),
             format!("{}_b", "x".repeat(60)),
         );
         assert_ne!(tool_name("server", &a), tool_name("server", &b));
+    }
+
+    #[test]
+    fn a_shortened_name_never_takes_one_that_fits() {
+        let (long, fits) = (
+            "planetscale_list_schema_recommendations",
+            "list_schema_recommendations",
+        );
+        let seen = "planetscale__list_schema_recommendations";
+        for tools in [[long, fits], [fits, long]] {
+            let names = tool_names("planetscale", tools);
+            let of = |tool| &names[tools.iter().position(|t| *t == tool).unwrap()];
+            assert_eq!(of(fits).as_deref(), Ok(seen));
+            assert_eq!(of(long), &Err(LeftOut::Taken));
+            assert_eq!(own_tool_name("planetscale", tools, seen), Some(fits));
+        }
+        // Without the other, the long one gets the name, and calls to it reach the tool.
+        assert_eq!(own_tool_name("planetscale", [long], seen), Some(long));
     }
 
     #[test]

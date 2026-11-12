@@ -2,9 +2,10 @@
 //! Nothing secret is written to `~/.xolkit`, so the folder can be backed up or kept in a
 //! dotfiles repository.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use keyring_core::{Entry, Error};
 
 const SERVICE: &str = "xolkit";
@@ -12,9 +13,27 @@ const SERVICE: &str = "xolkit";
 /// The keyring entry for the GitHub token typed under Settings.
 pub const GITHUB_TOKEN: &str = "github-token";
 
-/// Whether the OS keyring has been reached. Until it has, every use tries again, so a keyring
-/// that starts after xolkit does is found without restarting xolkit.
-static CONNECTED: Mutex<bool> = Mutex::new(false);
+/// Whether the OS keyring has been reached. While it has not, uses try again, so a keyring that
+/// starts or comes back after xolkit did is found without restarting xolkit.
+enum Keyring {
+    Unreached,
+    /// Not reached when last tried, at `at`, for the reason `why`.
+    Failed {
+        at: Instant,
+        why: String,
+    },
+    Reached,
+}
+
+static KEYRING: Mutex<Keyring> = Mutex::new(Keyring::Unreached);
+
+/// How long a failure to reach the keyring stands before trying again. Reaching for a keyring
+/// that hangs can take many seconds, and callers ask for one secret after another.
+const RETRY_AFTER: Duration = Duration::from_secs(3);
+
+fn keyring() -> MutexGuard<'static, Keyring> {
+    KEYRING.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[cfg(all(unix, not(target_os = "macos")))]
 const UNREACHABLE: &str = "could not reach the OS keyring: is a Secret Service provider, such as \
@@ -34,13 +53,35 @@ fn store() -> keyring_core::Result<Arc<keyring_core::CredentialStore>> {
 
 fn entry(key: &str) -> Result<Entry> {
     {
-        let mut connected = CONNECTED.lock().unwrap_or_else(PoisonError::into_inner);
-        if !*connected {
-            keyring_core::set_default_store(store().context(UNREACHABLE)?);
-            *connected = true;
+        let mut keyring = keyring();
+        match &*keyring {
+            Keyring::Reached => {}
+            Keyring::Failed { at, why } if at.elapsed() < RETRY_AFTER => bail!("{why}"),
+            _ => match store() {
+                Ok(store) => {
+                    keyring_core::set_default_store(store);
+                    *keyring = Keyring::Reached;
+                }
+                Err(e) => {
+                    let why = format!("{UNREACHABLE}: {e}");
+                    *keyring = Keyring::Failed {
+                        at: Instant::now(),
+                        why: why.clone(),
+                    };
+                    bail!(why);
+                }
+            },
         }
     }
     Entry::new(SERVICE, key).context("could not open the OS keyring")
+}
+
+/// Has the next use reach for the keyring anew when `error` may mean the connection to it was
+/// lost, as when the Secret Service provider was restarted.
+fn lost(error: &Error) {
+    if matches!(error, Error::PlatformFailure(_) | Error::NoStorageAccess(_)) {
+        *keyring() = Keyring::Unreached;
+    }
 }
 
 /// The secret saved under `key`, or `None` when there is none.
@@ -48,7 +89,10 @@ pub fn get_secret(key: &str) -> Result<Option<String>> {
     match entry(key)?.get_password() {
         Ok(secret) => Ok(Some(secret)),
         Err(Error::NoEntry) => Ok(None),
-        Err(e) => Err(e).context("could not read from the OS keyring"),
+        Err(e) => {
+            lost(&e);
+            Err(e).context("could not read from the OS keyring")
+        }
     }
 }
 
@@ -58,10 +102,14 @@ pub fn set_secret(key: &str, secret: Option<&str>) -> Result<()> {
     match secret {
         Some(secret) => entry
             .set_password(secret)
+            .inspect_err(lost)
             .context("could not save to the OS keyring"),
         None => match entry.delete_credential() {
             Ok(()) | Err(Error::NoEntry) => Ok(()),
-            Err(e) => Err(e).context("could not delete from the OS keyring"),
+            Err(e) => {
+                lost(&e);
+                Err(e).context("could not delete from the OS keyring")
+            }
         },
     }
 }
