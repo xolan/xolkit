@@ -214,7 +214,7 @@ is `x86_64` if `dpkg --print-architecture` says `amd64`, or `aarch64` if it says
 folder you downloaded them to, set `version` and `arch` to the ones you picked and run:
 
 ```bash
-version=3.2.7
+version=3.2.8
 arch=x86_64
 name=xolkit-$version-$arch-unknown-linux-gnu.deb
 sha256sum -c "$name.sha256" && sudo apt install "./$name"

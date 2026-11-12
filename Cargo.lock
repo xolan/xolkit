@@ -8630,7 +8630,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xolkit"
-version = "3.2.7"
+version = "3.2.8"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -8647,7 +8647,7 @@ dependencies = [
 
 [[package]]
 name = "xolkit-core"
-version = "3.2.7"
+version = "3.2.8"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -8675,7 +8675,7 @@ dependencies = [
 
 [[package]]
 name = "xolkit-daemon"
-version = "3.2.7"
+version = "3.2.8"
 dependencies = [
  "anyhow",
  "async-trait",
