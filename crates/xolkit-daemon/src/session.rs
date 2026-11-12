@@ -156,11 +156,11 @@ pub(crate) fn own_tool_name<'a>(
 /// The name agents see for `tool` of `server`: `<server>__<tool>`, or `None` if agents would
 /// not accept it, as tool names are letters, digits, `_` and `-`. One that would be too long is
 /// shortened: the server's name is dropped from the front of the tool's, the end is cut if it
-/// must be, and a few characters made from the tool's whole name close it
-/// (`planetscale_list_schema_recommendations` of `planetscale` to
-/// `planetscale__list_schema_recommendations_8311`). Those tell it from other
-/// tools shortened alike, and from a tool the server may add later under the shorter name, so
-/// a name an agent was allowed to call does not come to mean another tool.
+/// must be, and a few characters made from the tool's whole name close it. So
+/// `planetscale_list_schema_recommendations` of `planetscale` becomes
+/// `planetscale__list_schema_recommendations_8311`. Those characters tell it from other tools
+/// shortened alike, and from a tool the server may add later under the shorter name, so a name
+/// an agent was allowed to call does not come to mean another tool.
 fn tool_name(server: &str, tool: &str) -> Option<String> {
     let usable = |s: &str| {
         s.chars()

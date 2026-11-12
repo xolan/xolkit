@@ -39,11 +39,17 @@ static KEYRING: Mutex<Connection> = Mutex::new(Connection::Unreached);
 const SLOW: Duration = Duration::from_secs(1);
 const LONGEST_PAUSE: Duration = Duration::from_secs(10);
 
-#[cfg(all(unix, not(target_os = "macos")))]
-const UNREACHABLE: &str = "could not reach the OS keyring: is a Secret Service provider, such as \
-                           GNOME Keyring, KWallet or KeePassXC, running?";
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-const UNREACHABLE: &str = "could not reach the OS keyring";
+/// Says that the keyring could not be reached, for the reason `error`.
+fn unreachable(error: &Error) -> String {
+    if cfg!(all(unix, not(target_os = "macos"))) {
+        format!(
+            "could not reach the OS keyring ({error}): is a Secret Service provider, such as \
+             GNOME Keyring, KWallet or KeePassXC, running?"
+        )
+    } else {
+        format!("could not reach the OS keyring: {error}")
+    }
+}
 
 fn store() -> keyring_core::Result<Arc<keyring_core::CredentialStore>> {
     #[cfg(windows)]
@@ -82,7 +88,7 @@ fn with_entry<T>(
                     *keyring = Connection::Reached;
                 }
                 Err(e) => {
-                    let (why, took) = (format!("{UNREACHABLE}: {e}"), started.elapsed());
+                    let (why, took) = (unreachable(&e), started.elapsed());
                     *keyring = if took < SLOW {
                         Connection::Unreached
                     } else {
