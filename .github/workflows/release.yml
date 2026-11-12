@@ -104,7 +104,7 @@ jobs:
           pattern: release-*
           merge-multiple: true
       - name: Verify release checksums
-        run: cd dist && sha256sum -c *.sha256
+        run: cd dist && sha256sum -c ./*.sha256
       - name: Write the Arch Linux PKGBUILD
         env:
           VERSION: ${{ needs.check.outputs.version }}

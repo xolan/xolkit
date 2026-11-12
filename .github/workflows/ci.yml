@@ -56,10 +56,11 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          (cd dist && shasum -a 256 -c *.sha256)
+          (cd dist && shasum -a 256 -c ./*.sha256)
           mkdir -p smoke
-          tar -xzf dist/xolkit-*-$TARGET.tar.gz -C smoke
-          smoke/xolkit-*-$TARGET/xolkit --help
+          tar -xzf dist/xolkit-*-"$TARGET".tar.gz -C smoke
+          binaries=(smoke/xolkit-*-"$TARGET"/xolkit)
+          "${binaries[0]}" --help
       - uses: actions/upload-artifact@v7
         with:
           name: ci-${{ matrix.target }}

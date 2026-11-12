@@ -1,6 +1,7 @@
 [tools]
 rust = { version = "1.99.1", components = "rustfmt,clippy" }
 actionlint = "1.7.12"
+shellcheck = "0.11.0"
 
 [tasks.run]
 description = "Run the app"

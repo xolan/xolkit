@@ -369,7 +369,7 @@ License (`OFL-Geist.txt` in the release archive).
 
 ## Development
 
-Tooling is pinned in `mise.toml`: Rust 1.99.1 with rustfmt and clippy, and actionlint. Run every
+Tooling is pinned in `mise.toml`: Rust 1.99.1 with rustfmt and clippy, actionlint and ShellCheck. Run every
 developer command through [mise](https://mise.jdx.dev); you don't need rustup.
 
 You also need:
