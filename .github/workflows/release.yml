@@ -84,7 +84,7 @@ jobs:
         run: mise run deb ${{ matrix.target }}
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.target }}
+          name: release-${{ matrix.target }}
           # Tarballs for Linux/macOS, .deb for Linux, zip for Windows, each with its .sha256.
           path: |
             dist/*.tar.gz*
@@ -101,7 +101,10 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: dist
+          pattern: release-*
           merge-multiple: true
+      - name: Verify release checksums
+        run: cd dist && sha256sum -c *.sha256
       - name: Write the Arch Linux PKGBUILD
         env:
           VERSION: ${{ needs.check.outputs.version }}
