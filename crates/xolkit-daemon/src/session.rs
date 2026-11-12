@@ -137,6 +137,15 @@ pub(crate) fn own_tool_name<'a>(
     tools: impl IntoIterator<Item = &'a str> + Clone,
     seen: &str,
 ) -> Option<&'a str> {
+    // Most names were not shortened, and such a name is its tool's whatever the others are.
+    let unshortened = seen
+        .strip_prefix(server)
+        .and_then(|rest| rest.strip_prefix(SEPARATOR))
+        .and_then(|own| tools.clone().into_iter().find(|tool| *tool == own))
+        .filter(|tool| tool_name(server, tool).as_deref() == Some(seen));
+    if unshortened.is_some() {
+        return unshortened;
+    }
     tools
         .clone()
         .into_iter()
@@ -151,9 +160,8 @@ pub(crate) fn own_tool_name<'a>(
 /// closing with a few characters that tell it from other tools cut at the same place.
 fn tool_name(server: &str, tool: &str) -> Option<String> {
     let usable = |s: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     };
     if !usable(server) || !usable(tool) {
         return None;

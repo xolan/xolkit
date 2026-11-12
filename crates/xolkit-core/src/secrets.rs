@@ -25,8 +25,9 @@ enum Keyring {
     Reached,
 }
 
-/// Held for the whole of each use, so uses take turns and one that waited on a keyring that
-/// hung sees that it did.
+/// Held for the whole of each use, so uses take turns across the process and one that waited
+/// on a keyring that hung sees that it did. A use that waits on the keyring, for the user to
+/// unlock it or for a provider that never answers, keeps every other use waiting with it.
 static KEYRING: Mutex<Keyring> = Mutex::new(Keyring::Unreached);
 
 /// How long a use of the keyring may take to fail before the keyring counts as hung.
@@ -36,9 +37,9 @@ impl Keyring {
     /// The keyring after a use begun at `started` failed for the reason `why`. The next use
     /// reaches for it anew, as the connection may be lost: a Secret Service provider that was
     /// restarted, say. That is at once if the failure came quickly, so a caller can still undo
-    /// what it half did. A keyring that hangs takes many seconds to fail and callers ask for
-    /// one secret after another, so after a slow failure it is left alone for as long as the
-    /// failure took.
+    /// what it half did. A keyring that is slow to fail can take many seconds over it and
+    /// callers ask for one secret after another, so after a slow failure it is left alone for
+    /// as long as the failure took. None of this helps with one that never answers at all.
     fn after_failure(why: String, started: Instant) -> Self {
         let took = started.elapsed();
         if took < SLOW {
