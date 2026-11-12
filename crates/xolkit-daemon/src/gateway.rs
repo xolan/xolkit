@@ -19,6 +19,7 @@ use xolkit_core::{Env, Server, ServerConfig, get_secret, secret_key};
 
 use crate::oauth::{self, Epochs, Keyring, Tokens, Vault};
 use crate::protocol::{ServerState, ServerStatus};
+use crate::session::{SEPARATOR, own_tool_name};
 
 /// How long a server gets to start and list its tools.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -614,7 +615,7 @@ impl Gateway {
             .unwrap_or_default()
     }
 
-    /// Calls `tool` on server `name`.
+    /// Calls the tool of server `name` that agents see as `<name>__<tool>`.
     pub(crate) async fn call(
         &self,
         name: &str,
@@ -622,12 +623,19 @@ impl Gateway {
         arguments: Option<rmcp::model::JsonObject>,
     ) -> Result<CallToolResult> {
         let deadline = Instant::now() + START_WAIT;
-        let service = loop {
+        let (service, tool) = loop {
             {
                 let connections = self.connections.lock().unwrap();
                 let connection = connections.get(name).context("no such server")?;
                 match (&connection.service, &connection.state) {
-                    (Some(service), _) => break service.clone(),
+                    (Some(service), _) => {
+                        // The server's own name for the tool, which the one agents see may
+                        // shorten. Looked up once the server is connected and its tools known.
+                        let seen = format!("{name}{SEPARATOR}{tool}");
+                        let theirs = connection.tools.iter().map(|t| t.name.as_ref());
+                        let tool = own_tool_name(name, theirs, &seen).unwrap_or(tool);
+                        break (service.clone(), tool.to_owned());
+                    }
                     (None, ServerState::NeedsSecret { key }) => {
                         bail!("the server {name} needs {key}; save it in xolkit")
                     }
@@ -641,7 +649,7 @@ impl Gateway {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
-        let mut params = CallToolRequestParams::new(tool.to_owned());
+        let mut params = CallToolRequestParams::new(tool);
         if let Some(arguments) = arguments {
             params = params.with_arguments(arguments);
         }
@@ -901,8 +909,20 @@ mod tests {
 
         gateway.restart("fake").unwrap();
         assert_eq!(settle(&gateway).await, ServerState::Running);
-        assert_eq!(gateway.tools("fake").len(), 1);
+        assert_eq!(gateway.tools("fake").len(), 2);
         assert!(gateway.status()[0].signed_in);
+        // A call by the shortened name agents see reaches the server under the tool's own.
+        let long = crate::fake_oauth::LONG_TOOL;
+        let seen = crate::session::tool_names("fake", [long])
+            .remove(0)
+            .unwrap();
+        assert_ne!(seen, format!("fake{SEPARATOR}{long}"));
+        let called = gateway
+            .call("fake", seen.strip_prefix("fake__").unwrap(), None)
+            .await
+            .unwrap();
+        let called = serde_json::to_string(&called).unwrap();
+        assert!(called.contains(long), "{called}");
 
         // Tokens are for the URL they were got for, not for one the server moves to.
         gateway.sync(vec![server(&format!("{}?moved", fake.url))]);

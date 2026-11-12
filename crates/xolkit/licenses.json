@@ -4502,24 +4502,6 @@
    ]
   },
   {
-   "name": "keyring",
-   "version": "4.2.0",
-   "license": "MIT OR Apache-2.0",
-   "link": "https://github.com/open-source-cooperative/keyring-rs",
-   "texts": [
-    {
-     "text": 2,
-     "notices": []
-    },
-    {
-     "text": 1,
-     "notices": [
-      "Copyright (c) 2016 keyring Developers"
-     ]
-    }
-   ]
-  },
-  {
    "name": "keyring-core",
    "version": "1.0.1",
    "license": "MIT OR Apache-2.0",

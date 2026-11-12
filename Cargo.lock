@@ -3504,18 +3504,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keyring"
-version = "4.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2270074a3d26bcac93c1dc5d2845eb4c089e8d761ccf6e0ea266a16004640627"
-dependencies = [
- "apple-native-keyring-store",
- "keyring-core",
- "windows-native-keyring-store",
- "zbus-secret-service-keyring-store",
-]
-
-[[package]]
 name = "keyring-core"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8642,7 +8630,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xolkit"
-version = "3.2.6"
+version = "3.2.7"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -8659,15 +8647,16 @@ dependencies = [
 
 [[package]]
 name = "xolkit-core"
-version = "3.2.6"
+version = "3.2.7"
 dependencies = [
  "anyhow",
+ "apple-native-keyring-store",
  "base64 0.22.1",
  "dunce",
  "flate2",
  "humantime",
  "junction",
- "keyring",
+ "keyring-core",
  "libc",
  "semver",
  "serde",
@@ -8679,12 +8668,14 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "toml_edit 0.25.17+spec-1.1.0",
  "ureq",
+ "windows-native-keyring-store",
  "windows-sys 0.61.2",
+ "zbus-secret-service-keyring-store",
 ]
 
 [[package]]
 name = "xolkit-daemon"
-version = "3.2.6"
+version = "3.2.7"
 dependencies = [
  "anyhow",
  "async-trait",

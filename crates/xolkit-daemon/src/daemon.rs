@@ -194,15 +194,11 @@ impl Daemon {
         }
     }
 
-    /// Logs that a server's tool was left out, once per tool.
-    pub(crate) fn left_out(&self, server: &str, tool: &str) {
-        let key = format!("{server}{SEPARATOR}{tool}");
+    /// Logs that a server's tool was left out, once per tool and reason.
+    pub(crate) fn left_out(&self, server: &str, tool: &str, why: &crate::session::LeftOut) {
+        let key = format!("{server}{SEPARATOR}{tool}: {why}");
         if self.left_out.lock().unwrap().insert(key) {
-            self.event(
-                server,
-                format!("left out the tool {tool}: its name is too long or unusual"),
-                true,
-            );
+            self.event(server, format!("left out the tool {tool}: {why}"), true);
         }
     }
 

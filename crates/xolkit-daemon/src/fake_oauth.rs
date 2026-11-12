@@ -32,6 +32,10 @@ impl crate::oauth::Vault for MemoryVault {
 /// The access token it hands out, and the only one its MCP endpoint takes.
 pub(crate) const TOKEN: &str = "fake-access-token";
 
+/// A tool of the server whose name is too long for agents as it is. Calling a tool gives back
+/// the name it was called by.
+pub(crate) const LONG_TOOL: &str = "fake_tool_with_a_name_too_long_for_agents_to_accept_as_it_is";
+
 pub(crate) struct FakeServer {
     /// Its MCP endpoint.
     pub(crate) url: String,
@@ -176,7 +180,13 @@ fn answer(
                     "serverInfo": {"name": "fake", "version": "1"},
                 }),
                 Some("tools/list") => json!({
-                    "tools": [{"name": "hello", "inputSchema": {"type": "object"}}],
+                    "tools": [
+                        {"name": "hello", "inputSchema": {"type": "object"}},
+                        {"name": LONG_TOOL, "inputSchema": {"type": "object"}},
+                    ],
+                }),
+                Some("tools/call") => json!({
+                    "content": [{"type": "text", "text": message["params"]["name"]}],
                 }),
                 // Notifications get no answer.
                 _ => return ("202 Accepted", Vec::new(), String::new()),
