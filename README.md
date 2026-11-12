@@ -104,9 +104,8 @@ native installs and keep profile switches. Use **Reload** to check again.
 Add a server by the command that starts it or by its URL. xolkit starts local servers itself and
 keeps one connection to each remote server, shared by every session. Agents see a server's tools
 as `<server>__<tool>`; in Claude Code that reads `mcp__xolkit__github__create_issue`. A name too
-long for agents to accept is shortened. Servers
-you already set up in Claude Code or Codex stay there; **Copy from agents** adds copies to xolkit,
-moving their values into the OS keyring.
+long for agents to accept is shortened. Servers you already set up in Claude Code or Codex stay
+there; **Copy from agents** adds copies to xolkit, moving their values into the OS keyring.
 
 Remote servers take headers, such as `Authorization: Bearer …`, or a sign-in in a browser
 (OAuth). A remote server without secrets that asks for a sign-in shows **needs sign-in**;

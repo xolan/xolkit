@@ -2,10 +2,10 @@
 //! Nothing secret is written to `~/.xolkit`, so the folder can be backed up or kept in a
 //! dotfiles repository.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow};
 use keyring_core::{Entry, Error};
 
 const SERVICE: &str = "xolkit";
@@ -17,32 +17,39 @@ pub const GITHUB_TOKEN: &str = "github-token";
 /// starts or comes back after xolkit did is found without restarting xolkit.
 enum Keyring {
     Unreached,
-    /// It failed, for the reason `why`, and is not tried again before `until`.
-    Failed {
+    /// It took long to fail, for the reason `why`, and is not tried again before `until`.
+    Hung {
         until: Instant,
         why: String,
     },
     Reached,
 }
 
+/// Held for the whole of each use, so uses take turns and one that waited on a keyring that
+/// hung sees that it did.
 static KEYRING: Mutex<Keyring> = Mutex::new(Keyring::Unreached);
 
-/// The least time a failure of the keyring stands before it is tried again.
-const RETRY_AFTER: Duration = Duration::from_secs(3);
+/// How long a use of the keyring may take to fail before the keyring counts as hung.
+const SLOW: Duration = Duration::from_secs(1);
 
 impl Keyring {
-    /// The keyring having failed for the reason `why`, in an attempt begun at `started`. The
-    /// failure stands for as long as the attempt took, if that is longer than [`RETRY_AFTER`]:
-    /// a keyring that hangs takes many seconds to fail, callers ask for one secret after
-    /// another, and they should not spend most of their time waiting on it.
-    fn failed(why: String, started: Instant) -> Self {
-        let until = Instant::now() + started.elapsed().max(RETRY_AFTER);
-        Keyring::Failed { until, why }
+    /// The keyring after a use begun at `started` failed for the reason `why`. The next use
+    /// reaches for it anew, as the connection may be lost: a Secret Service provider that was
+    /// restarted, say. That is at once if the failure came quickly, so a caller can still undo
+    /// what it half did. A keyring that hangs takes many seconds to fail and callers ask for
+    /// one secret after another, so after a slow failure it is left alone for as long as the
+    /// failure took.
+    fn after_failure(why: String, started: Instant) -> Self {
+        let took = started.elapsed();
+        if took < SLOW {
+            Keyring::Unreached
+        } else {
+            Keyring::Hung {
+                until: Instant::now() + took,
+                why,
+            }
+        }
     }
-}
-
-fn keyring() -> MutexGuard<'static, Keyring> {
-    KEYRING.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -61,67 +68,66 @@ fn store() -> keyring_core::Result<Arc<keyring_core::CredentialStore>> {
     Ok(store)
 }
 
-fn entry(key: &str) -> Result<Entry> {
+/// What `op` gives for the keyring entry of `key`, or `None` if there is no such entry. An
+/// error says `what` could not be done.
+fn with_entry<T>(
+    key: &str,
+    what: &'static str,
+    op: impl FnOnce(&Entry) -> keyring_core::Result<T>,
+) -> Result<Option<T>> {
+    let mut keyring = KEYRING.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Keyring::Hung { until, why } = &*keyring
+        && Instant::now() < *until
     {
-        let mut keyring = keyring();
-        match &*keyring {
-            Keyring::Reached => {}
-            Keyring::Failed { until, why } if Instant::now() < *until => bail!("{why}"),
-            _ => {
-                let started = Instant::now();
-                match store() {
-                    Ok(store) => {
-                        keyring_core::set_default_store(store);
-                        *keyring = Keyring::Reached;
-                    }
-                    Err(e) => {
-                        let why = format!("{UNREACHABLE}: {e}");
-                        *keyring = Keyring::failed(why.clone(), started);
-                        bail!(why);
-                    }
-                }
+        return Err(anyhow!("it hung a moment ago: {why}")).context(what);
+    }
+    let started = Instant::now();
+    if !matches!(*keyring, Keyring::Reached) {
+        match store() {
+            Ok(store) => {
+                keyring_core::set_default_store(store);
+                *keyring = Keyring::Reached;
+            }
+            Err(e) => {
+                let why = format!("{UNREACHABLE}: {e}");
+                *keyring = Keyring::after_failure(why.clone(), started);
+                return Err(anyhow!(why)).context(what);
             }
         }
     }
-    Entry::new(SERVICE, key).context("could not open the OS keyring")
-}
-
-/// Has the keyring reached for anew, after a while, when the `error` of a use begun at `started`
-/// may mean the connection to it was lost, as when the Secret Service provider was restarted.
-/// A keyring that is locked is still connected.
-fn lost(error: &Error, started: Instant) {
-    if matches!(error, Error::PlatformFailure(_)) {
-        *keyring() = Keyring::failed(format!("the OS keyring failed: {error}"), started);
+    match Entry::new(SERVICE, key).and_then(|entry| op(&entry)) {
+        Ok(value) => Ok(Some(value)),
+        Err(Error::NoEntry) => Ok(None),
+        Err(e) => {
+            // A keyring that is locked, or that refuses one entry, is still connected.
+            if matches!(e, Error::PlatformFailure(_)) {
+                *keyring = Keyring::after_failure(e.to_string(), started);
+            }
+            Err(e).context(what)
+        }
     }
 }
 
 /// The secret saved under `key`, or `None` when there is none.
 pub fn get_secret(key: &str) -> Result<Option<String>> {
-    let (entry, started) = (entry(key)?, Instant::now());
-    match entry.get_password() {
-        Ok(secret) => Ok(Some(secret)),
-        Err(Error::NoEntry) => Ok(None),
-        Err(e) => {
-            lost(&e, started);
-            Err(e).context("could not read from the OS keyring")
-        }
-    }
+    with_entry(
+        key,
+        "could not read from the OS keyring",
+        Entry::get_password,
+    )
 }
 
 /// Saves `secret` under `key`, or deletes it when `None`.
 pub fn set_secret(key: &str, secret: Option<&str>) -> Result<()> {
-    let (entry, started) = (entry(key)?, Instant::now());
     match secret {
-        Some(secret) => entry
-            .set_password(secret)
-            .inspect_err(|e| lost(e, started))
-            .context("could not save to the OS keyring"),
-        None => match entry.delete_credential() {
-            Ok(()) | Err(Error::NoEntry) => Ok(()),
-            Err(e) => {
-                lost(&e, started);
-                Err(e).context("could not delete from the OS keyring")
-            }
-        },
+        Some(secret) => with_entry(key, "could not save to the OS keyring", |entry| {
+            entry.set_password(secret)
+        }),
+        None => with_entry(
+            key,
+            "could not delete from the OS keyring",
+            Entry::delete_credential,
+        ),
     }
+    .map(drop)
 }

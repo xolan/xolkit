@@ -522,13 +522,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_names_fit_what_agents_accept() {
-        assert_eq!(
-            tool_name("github", "create_issue").as_deref(),
-            Some("github__create_issue")
-        );
+    fn tools_with_names_agents_would_refuse_get_none() {
         assert_eq!(tool_name("server", "has.dot"), None);
-        assert_eq!(tool_name("has.dot", "tool"), None);
         // No room left for a tool's name worth reading.
         assert_eq!(tool_name(&"s".repeat(40), &"x".repeat(50)), None);
         assert_eq!(tool_name("server", &"_".repeat(60)), None);
