@@ -77,12 +77,16 @@ pub(crate) fn listen(env: &Env) -> Result<(Listener, Instance)> {
     #[cfg(windows)]
     std::fs::write(run.join("pipe"), new_pipe_name())?;
     let options = ListenerOptions::new().name(name(env)?);
+    // A socket left by a daemon that crashed is replaced; the lock rules out a live one.
     #[cfg(unix)]
+    let options = options.try_overwrite(true);
+    #[cfg(all(unix, not(target_os = "macos")))]
     let options = {
         use interprocess::os::unix::local_socket::ListenerOptionsExt;
-        // A socket left by a daemon that crashed is replaced; the lock rules out a live one.
-        options.try_overwrite(true).mode(0o600)
+        options.mode(0o600)
     };
+    // macOS rejects the pre-bind fchmod used by mode(). Its socket is protected by the
+    // owner-only run directory above, which prevents other users from reaching it.
     #[cfg(windows)]
     let options = {
         use interprocess::os::windows::local_socket::ListenerOptionsExt;
