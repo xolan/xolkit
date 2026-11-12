@@ -93,9 +93,10 @@ fn archive_name(version: &str) -> String {
     }
 }
 
-/// Whether a package manager installed `exe`, so it updates through that and not by itself.
+/// Linux packages install under `/usr` and must update through their package manager.
+/// macOS installs are standalone binaries, including when the user chooses `/usr/local/bin`.
 pub fn installed_by_package_manager(exe: &Path) -> bool {
-    cfg!(unix) && exe.starts_with("/usr")
+    cfg!(target_os = "linux") && exe.starts_with("/usr")
 }
 
 /// Downloads the release, checks it against its checksum, and puts its binary in place of `exe`.
@@ -367,7 +368,11 @@ mod tests {
     fn package_installs_are_left_alone() {
         assert_eq!(
             installed_by_package_manager(Path::new("/usr/bin/xolkit")),
-            cfg!(unix)
+            cfg!(target_os = "linux")
+        );
+        assert_eq!(
+            installed_by_package_manager(Path::new("/usr/local/bin/xolkit")),
+            cfg!(target_os = "linux")
         );
         assert!(!installed_by_package_manager(Path::new(
             "/home/me/.local/bin/xolkit"
