@@ -103,7 +103,8 @@ native installs and keep profile switches. Use **Reload** to check again.
 
 Add a server by the command that starts it or by its URL. xolkit starts local servers itself and
 keeps one connection to each remote server, shared by every session. Agents see a server's tools
-as `<server>__<tool>`; in Claude Code that reads `mcp__xolkit__github__create_issue`. Servers
+as `<server>__<tool>`; in Claude Code that reads `mcp__xolkit__github__create_issue`. A name too
+long for agents to accept is shortened. Servers
 you already set up in Claude Code or Codex stay there; **Copy from agents** adds copies to xolkit,
 moving their values into the OS keyring.
 
@@ -213,7 +214,7 @@ is `x86_64` if `dpkg --print-architecture` says `amd64`, or `aarch64` if it says
 folder you downloaded them to, set `version` and `arch` to the ones you picked and run:
 
 ```bash
-version=3.2.6
+version=3.2.7
 arch=x86_64
 name=xolkit-$version-$arch-unknown-linux-gnu.deb
 sha256sum -c "$name.sha256" && sudo apt install "./$name"

@@ -200,7 +200,7 @@ impl Daemon {
         if self.left_out.lock().unwrap().insert(key) {
             self.event(
                 server,
-                format!("left out the tool {tool}: its name is too long or unusual"),
+                format!("left out the tool {tool}: agents would not accept its name"),
                 true,
             );
         }

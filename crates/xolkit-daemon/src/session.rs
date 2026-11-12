@@ -74,13 +74,49 @@ fn prompts(catalogue: &Catalogue) -> Vec<(String, Item<'_>)> {
         .collect()
 }
 
-/// Whether agents accept `name` for a tool of xolkit's: Claude Code names it
-/// `mcp__xolkit__<name>`, and tool names are limited to 64 letters, digits, `_` and `-`.
-fn usable_tool_name(name: &str) -> bool {
-    "mcp__xolkit__".len() + name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+/// The longest name agents accept for a tool of xolkit's: tool names are limited to 64
+/// characters, and Claude Code names it `mcp__xolkit__<name>`.
+const MAX_TOOL_NAME: usize = 64 - "mcp__xolkit__".len();
+
+/// The fewest characters of a tool's own name kept when shortening it.
+const MIN_KEPT: usize = 8;
+
+/// The name agents see for `tool` of `server`: `<server>__<tool>`, or `None` if agents would
+/// not accept it, as tool names are letters, digits, `_` and `-`. One that would be too long is
+/// shortened: first by dropping the server's name from the front of the tool's
+/// (`planetscale__planetscale_list_x` to `planetscale__list_x`), then by cutting the end and
+/// closing with a few characters that tell it from other tools cut at the same place.
+fn tool_name(server: &str, tool: &str) -> Option<String> {
+    let usable = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    if !usable(server) || !usable(tool) {
+        return None;
+    }
+    let room = MAX_TOOL_NAME.checked_sub(server.len() + SEPARATOR.len())?;
+    if tool.len() <= room {
+        return Some(format!("{server}{SEPARATOR}{tool}"));
+    }
+    let short = tool
+        .strip_prefix(server)
+        .map(|rest| rest.trim_start_matches(['_', '-']))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(tool);
+    if short.len() <= room {
+        return Some(format!("{server}{SEPARATOR}{short}"));
+    }
+    // FNV-1a, so a tool keeps its name from one version of xolkit to the next.
+    let hash = tool.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    });
+    let kept = room.checked_sub(5).filter(|kept| *kept >= MIN_KEPT)?;
+    Some(format!(
+        "{server}{SEPARATOR}{}_{:04x}",
+        short[..kept].trim_end_matches(['_', '-']),
+        hash & 0xffff
+    ))
 }
 
 fn schema(value: serde_json::Value) -> Arc<JsonObject> {
@@ -271,14 +307,17 @@ impl ServerHandler for Session {
     ) -> Result<ListToolsResult, McpError> {
         self.note_client(&context);
         let mut tools = Session::own_tools();
+        let mut taken = std::collections::HashSet::new();
         for server in self.catalogue().servers {
             for tool in self.daemon.gateway().tools(&server.name) {
-                let name = format!("{}{SEPARATOR}{}", server.name, tool.name);
-                // Agents refuse a whole request over one bad tool name, so leave such tools out.
-                if !usable_tool_name(&name) {
+                // Agents refuse a whole request over one bad tool name, or over two tools with
+                // one name, so leave such tools out.
+                let Some(name) =
+                    tool_name(&server.name, &tool.name).filter(|name| taken.insert(name.clone()))
+                else {
                     self.daemon.left_out(&server.name, &tool.name);
                     continue;
-                }
+                };
                 let mut tool = tool.clone();
                 tool.name = name.into();
                 tools.push(tool);
@@ -320,10 +359,18 @@ impl ServerHandler for Session {
                         None,
                     ));
                 }
+                // The server's own name for the tool, which the one agents see may shorten.
+                let tool = self
+                    .daemon
+                    .gateway()
+                    .tools(server)
+                    .into_iter()
+                    .find(|t| tool_name(server, &t.name).as_deref() == Some(name.as_str()))
+                    .map_or_else(|| tool.to_owned(), |t| t.name.to_string());
                 match self
                     .daemon
                     .gateway()
-                    .call(server, tool, request.arguments.clone())
+                    .call(server, &tool, request.arguments.clone())
                     .await
                 {
                     Ok(result) => result.into(),
@@ -423,9 +470,38 @@ mod tests {
 
     #[test]
     fn tool_names_fit_what_agents_accept() {
-        assert!(usable_tool_name("github__create_issue"));
-        assert!(!usable_tool_name(&format!("server__{}", "x".repeat(50))));
-        assert!(!usable_tool_name("server__has.dot"));
+        assert_eq!(
+            tool_name("github", "create_issue").as_deref(),
+            Some("github__create_issue")
+        );
+        assert_eq!(tool_name("server", "has.dot"), None);
+        assert_eq!(tool_name("has.dot", "tool"), None);
+        // No room left for a tool's name worth reading.
+        assert_eq!(tool_name(&"s".repeat(40), &"x".repeat(50)), None);
+    }
+
+    #[test]
+    fn long_tool_names_are_shortened() {
+        // A name that fits is left alone, even with the server's name in it.
+        assert_eq!(
+            tool_name("planetscale", "planetscale_get_branch").as_deref(),
+            Some("planetscale__planetscale_get_branch")
+        );
+        assert_eq!(
+            tool_name("planetscale", "planetscale_list_schema_recommendations").as_deref(),
+            Some("planetscale__list_schema_recommendations")
+        );
+        let long = "planetscale_get_organization_billing_payment_method";
+        let name = tool_name("planetscale", long).unwrap();
+        assert!(name.starts_with("planetscale__get_organization_billing_payment_"));
+        assert!(name.len() <= MAX_TOOL_NAME);
+        assert_eq!(tool_name("planetscale", long).unwrap(), name);
+        // Two tools cut at the same place keep names of their own.
+        let (a, b) = (
+            format!("{}_a", "x".repeat(60)),
+            format!("{}_b", "x".repeat(60)),
+        );
+        assert_ne!(tool_name("server", &a), tool_name("server", &b));
     }
 
     #[test]

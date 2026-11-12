@@ -2,22 +2,52 @@
 //! Nothing secret is written to `~/.xolkit`, so the folder can be backed up or kept in a
 //! dotfiles repository.
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 use anyhow::{Context, Result};
+use keyring_core::{Entry, Error};
 
 const SERVICE: &str = "xolkit";
 
 /// The keyring entry for the GitHub token typed under Settings.
 pub const GITHUB_TOKEN: &str = "github-token";
 
-fn entry(key: &str) -> Result<keyring::Entry> {
-    keyring::Entry::new(SERVICE, key).context("could not open the OS keyring")
+/// Whether the OS keyring has been reached. Until it has, every use tries again, so a keyring
+/// that starts after xolkit does is found without restarting xolkit.
+static CONNECTED: Mutex<bool> = Mutex::new(false);
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const UNREACHABLE: &str = "could not reach the OS keyring: is a Secret Service provider, such as \
+                           GNOME Keyring, KWallet or KeePassXC, running?";
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+const UNREACHABLE: &str = "could not reach the OS keyring";
+
+fn store() -> keyring_core::Result<Arc<keyring_core::CredentialStore>> {
+    #[cfg(windows)]
+    let store = windows_native_keyring_store::Store::new()?;
+    #[cfg(target_os = "macos")]
+    let store = apple_native_keyring_store::keychain::Store::new()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let store = zbus_secret_service_keyring_store::Store::new()?;
+    Ok(store)
+}
+
+fn entry(key: &str) -> Result<Entry> {
+    {
+        let mut connected = CONNECTED.lock().unwrap_or_else(PoisonError::into_inner);
+        if !*connected {
+            keyring_core::set_default_store(store().context(UNREACHABLE)?);
+            *connected = true;
+        }
+    }
+    Entry::new(SERVICE, key).context("could not open the OS keyring")
 }
 
 /// The secret saved under `key`, or `None` when there is none.
 pub fn get_secret(key: &str) -> Result<Option<String>> {
     match entry(key)?.get_password() {
         Ok(secret) => Ok(Some(secret)),
-        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(Error::NoEntry) => Ok(None),
         Err(e) => Err(e).context("could not read from the OS keyring"),
     }
 }
@@ -30,7 +60,7 @@ pub fn set_secret(key: &str, secret: Option<&str>) -> Result<()> {
             .set_password(secret)
             .context("could not save to the OS keyring"),
         None => match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Ok(()) | Err(Error::NoEntry) => Ok(()),
             Err(e) => Err(e).context("could not delete from the OS keyring"),
         },
     }
