@@ -86,6 +86,8 @@ fn archive_name(version: &str) -> String {
     let arch = std::env::consts::ARCH;
     if cfg!(windows) {
         format!("xolkit-{version}-{arch}-pc-windows-msvc.zip")
+    } else if cfg!(target_os = "macos") {
+        format!("xolkit-{version}-{arch}-apple-darwin.tar.gz")
     } else {
         format!("xolkit-{version}-{arch}-unknown-linux-gnu.tar.gz")
     }
@@ -149,7 +151,7 @@ fn verify(archive: &[u8], checksum: &str) -> Result<()> {
     Ok(())
 }
 
-/// The binary inside a Linux tarball: `xolkit-<version>-<target>/xolkit`.
+/// The binary inside a Linux or macOS tarball: `xolkit-<version>-<target>/xolkit`.
 #[cfg(not(windows))]
 fn extract_binary(archive: &[u8], version: &str) -> Result<Vec<u8>> {
     use std::io::Read;
@@ -313,6 +315,28 @@ mod tests {
         assert!(verify(b"hello", "").is_err());
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn extracts_only_the_expected_binary() {
+        use flate2::{Compression, write::GzEncoder};
+        let pack = |path: &str| {
+            let mut tar = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+            let mut header = tar::Header::new_gnu();
+            header.set_size(6);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, path, &b"binary"[..]).unwrap();
+            tar.into_inner().unwrap().finish().unwrap()
+        };
+        let folder = archive_name("9.0.0");
+        let folder = folder.trim_end_matches(".tar.gz");
+        assert_eq!(
+            extract_binary(&pack(&format!("{folder}/xolkit")), "9.0.0").unwrap(),
+            b"binary"
+        );
+        assert!(extract_binary(&pack("elsewhere/xolkit"), "9.0.0").is_err());
+    }
+
     #[test]
     fn replaces_the_program() {
         let dir = tempfile::tempdir().unwrap();
@@ -373,7 +397,13 @@ mod tests {
         fs::write(&exe, "old").unwrap();
         install_update(&release, &exe).unwrap();
         let binary = fs::read(&exe).unwrap();
-        let magic: &[u8] = if cfg!(windows) { b"MZ" } else { b"\x7fELF" };
+        let magic: &[u8] = if cfg!(windows) {
+            b"MZ"
+        } else if cfg!(target_os = "macos") {
+            b"\xcf\xfa\xed\xfe" // 64-bit little-endian Mach-O (Intel and Apple Silicon).
+        } else {
+            b"\x7fELF"
+        };
         assert!(binary.starts_with(magic));
     }
 }

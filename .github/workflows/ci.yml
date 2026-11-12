@@ -30,3 +30,37 @@ jobs:
       - uses: jdx/mise-action@v5
       - uses: Swatinem/rust-cache@v2
       - run: mise run ci
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - uses: actions/checkout@v7
+      # GPUI compiles Metal shaders, so it needs full Xcode, not just Command Line Tools.
+      - run: xcrun --sdk macosx metal --version
+      - uses: jdx/mise-action@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: mise run ci
+      # Exercise packaging on PRs too, before a version bump tries to publish it.
+      - run: mise run package ${{ matrix.target }}
+      - name: Smoke test the packaged binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          (cd dist && shasum -a 256 -c *.sha256)
+          mkdir -p smoke
+          tar -xzf dist/xolkit-*-$TARGET.tar.gz -C smoke
+          smoke/xolkit-*-$TARGET/xolkit --help
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-${{ matrix.target }}
+          path: dist/*.tar.gz*

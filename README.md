@@ -34,7 +34,7 @@ and plugins that only work as native installs.
 > follow and run. xolkit downloads, unpacks and installs them as they are, as with any software
 > you install, so take them only from repositories and people you trust.
 
-Runs on Linux and Windows. There is no macOS build.
+Builds for Linux, Windows and macOS (Intel and Apple Silicon).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/design/architecture.png">
@@ -133,6 +133,7 @@ where, before anything is downloaded, and adds it as a new profile.
   later), a Wayland or X11 session, and working GPU drivers. Secrets go to the Secret Service, so
   you need a provider such as GNOME Keyring or KeePassXC running.
 - Windows: Windows 10 or 11, x64 or Arm64. Secrets go to the Credential Manager.
+- macOS: macOS 15 or newer, Intel or Apple Silicon. Secrets go to the login Keychain.
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`), [Codex
   CLI](https://github.com/openai/codex) (`codex`), or both, on your `PATH`, for the agents you
   register with. xolkit runs them to register itself and for native plugins.
@@ -149,11 +150,11 @@ xolkit talks to `skills.sh`, `api.github.com`, `codeload.github.com` and
 
 ## Install
 
-Each release holds a Linux tarball, a Debian package (from 3.2.3 on) and a Windows zip for x86_64
-and aarch64, and a `PKGBUILD` for Arch Linux, each with a `.sha256` checksum file.
+Each release holds Linux and macOS tarballs, a Debian package (from 3.2.3 on) and a Windows zip
+for x86_64 and aarch64, and a `PKGBUILD` for Arch Linux, each with a `.sha256` checksum file.
 
-On Arch Linux, Debian, Ubuntu and distributions based on them, the simplest way is to run
-`scripts/install.sh` in a clone of this repository. It installs the package for your system from
+On macOS, Arch Linux, Debian, Ubuntu and distributions based on them, the simplest way is to run
+`scripts/install.sh` in a clone of this repository. It installs the package (or macOS binary) for your system from
 the release matching the checked-out version (the latest release if that one isn't out yet, or
 has no package for your system), after checking it against its `.sha256`, and needs neither mise
 nor Rust. The sections below say what it does on each system. If you have the development tools
@@ -239,6 +240,33 @@ when it starts.
 xolkit finds `claude`, `codex` and `gh` on your `PATH`, including the `.cmd` files npm
 installs.
 
+### macOS
+
+In a clone of this repository, run:
+
+```bash
+scripts/install.sh
+# Or, with the development tools set up:
+mise run install
+```
+
+The installer picks the Intel or Apple Silicon tarball, verifies its `.sha256` with macOS's
+`shasum`, and installs `xolkit` into `~/.local/bin`. Add that folder to your shell's `PATH`, then
+run `xolkit` to open the app. You can choose another binary directory with
+`scripts/install.sh /path/to/bin`. No Rust, Homebrew or administrator access is needed.
+It uses the checked-out version, falling back to the latest release if necessary, like the
+Linux installers. macOS assets will first appear in the next release after this support lands.
+
+For a manual install, download `xolkit-<version>-<arch>-apple-darwin.tar.gz` and its `.sha256`
+from [Releases](https://github.com/xolan/xolkit/releases), where `<arch>` is `aarch64` on Apple
+Silicon or `x86_64` on Intel. Check with `shasum -a 256 -c <archive>.sha256`, extract it,
+and run the `xolkit` binary inside.
+
+These builds have no Developer ID signature or Apple notarization; macOS may ask you to allow
+one in System Settings → Privacy & Security after a blocked launch. This initial distribution
+is a terminal-launched binary; it doesn't install an app bundle or register `xolkit://` links.
+Paste shared profile codes into the app instead.
+
 ### First run
 
 Open Settings, **Register** xolkit with the agents you use, and turn them on under "Served by
@@ -313,8 +341,10 @@ On Windows, delete the folder you extracted (an update may leave `xolkit.exe.old
 it from Start, delete `%USERPROFILE%\.xolkit`, and delete the `HKEY_CURRENT_USER\Software\Classes\xolkit`
 registry key that handles `xolkit://` links.
 
+On macOS, delete `~/.local/bin/xolkit` (or the binary directory you chose) and `~/.xolkit`.
+
 xolkit's secrets stay in the OS keyring under the service name `xolkit`; remove them with your
-keyring's own tool (Seahorse, KeePassXC, or the Windows Credential Manager).
+keyring's own tool (Seahorse, KeePassXC, the Windows Credential Manager, or macOS Keychain Access).
 
 ## Keyboard
 
@@ -353,6 +383,8 @@ You also need:
 
   On other distributions, install the development packages for fontconfig, wayland,
   libxkbcommon-x11 and libx11-xcb.
+- On macOS, full Xcode with the Metal compiler (`xcrun --sdk macosx metal --version`),
+  not only Command Line Tools. CI and releases target macOS 15 or newer.
 - On Windows, the Visual Studio Build Tools with the "Desktop development with C++" workload and a
   Windows SDK (gpui compiles its shaders with the SDK's `fxc.exe`), and Git for Windows (mise runs
   the bash tasks with its bash).
@@ -380,9 +412,9 @@ command line).
 | `mise run ci` | Lint, tests and the licenses check, as CI runs them |
 | `mise run fmt` | Format the code |
 | `mise run build` | Build a release binary |
-| `mise run install` | Install xolkit as a system package from the release matching the checked-out version |
+| `mise run install` | Install xolkit from the release matching the checked-out version |
 | `mise run deb <target>` | Build a Debian package for a Linux target into `dist/` (on Debian or Ubuntu, with the libraries above and `dpkg-dev` installed) |
-| `mise run package <target>` | Build a release archive into `dist/` for the host's own platform: a tarball on Linux, a zip on Windows |
+| `mise run package <target>` | Build a release archive into `dist/` for the host's own platform: a tarball on Linux/macOS, a zip on Windows |
 | `mise run licenses` | Regenerate `THIRD_PARTY_LICENSES.md` and the app's `licenses.json` after changing dependencies |
 | `mise run icon` | Render the Windows app icon from the SVGs in `assets/brand/` |
 | `mise run diagram` | Redraw the architecture diagram in `assets/design/` (needs [resvg](https://github.com/linebender/resvg)) |
@@ -402,10 +434,16 @@ version on `main` publishes a release.
 
 ## Releases
 
-Pushing to `main` with a new `version` in `Cargo.toml` runs CI, builds Linux and Windows binaries
+Pushing to `main` with a new `version` in `Cargo.toml` runs CI, builds Linux, Windows and macOS binaries
 (x86_64 and aarch64) and Debian packages (with [cargo-deb](https://github.com/kornelski/cargo-deb),
 from `[package.metadata.deb]` in `crates/xolkit/Cargo.toml`), writes the Arch Linux `PKGBUILD` from
 `assets/arch/PKGBUILD` with the tarballs' checksums, and publishes a GitHub release `v<version>`.
+
+The standard GitHub-hosted macOS runners (`macos-15-intel` and `macos-15`) build and test both
+architectures without local Mac hardware. Standard runners are
+[free for public repositories](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+macOS CI also packages each build, smoke tests its command line, and uploads archives for testing
+before a release. Publishing still waits for all CI jobs and release builds to pass.
 
 ## License
 

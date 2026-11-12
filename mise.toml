@@ -51,7 +51,7 @@ depends="$(dpkg-deb -f "dist/$name" Depends)"
 '''
 
 [tasks.install]
-description = "Install xolkit as a system package from its release"
+description = "Install xolkit from its release (system package on Linux, user binary on macOS)"
 run = "scripts/install.sh"
 
 [tasks.ci]
@@ -79,7 +79,7 @@ run = "python3 -I scripts/diagram.py"
 run_windows = "python -I scripts/diagram.py"
 
 [tasks.package]
-description = "Build a release archive for a target into dist/: a tarball, or a zip for Windows"
+description = "Build a release archive for a target into dist/: a tarball for Linux/macOS, or a zip for Windows"
 usage = 'arg "<target>" help="Rust target triple, e.g. x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc"'
 # On Windows, mise runs this with Git for Windows' bash.
 run = '''
@@ -104,6 +104,11 @@ case "$target" in
   # Windows' own tar (bsdtar) writes zip files; Git's GNU tar can't.
   (cd dist && "$(cygpath "$SYSTEMROOT")/System32/tar.exe" -a -cf "$archive" "$name")
   ;;
+*-apple-darwin)
+  cp "target/$target/release/xolkit" "dist/$name/"
+  archive="$name.tar.gz"
+  tar -C dist -czf "dist/$archive" "$name"
+  ;;
 *)
   cp "target/$target/release/xolkit" "dist/$name/"
   cp -r assets/linux/. "dist/$name/"
@@ -116,6 +121,11 @@ case "$target" in
   tar -C dist -czf "dist/$archive" "$name"
   ;;
 esac
-(cd dist && sha256sum "$archive" > "$archive.sha256")
+# macOS ships shasum rather than GNU sha256sum; both write the same checksum format.
+if [[ "$target" == *-apple-darwin ]]; then
+  (cd dist && shasum -a 256 "$archive" > "$archive.sha256")
+else
+  (cd dist && sha256sum "$archive" > "$archive.sha256")
+fi
 echo "dist/$archive"
 '''
