@@ -909,8 +909,15 @@ mod tests {
 
         gateway.restart("fake").unwrap();
         assert_eq!(settle(&gateway).await, ServerState::Running);
-        assert_eq!(gateway.tools("fake").len(), 1);
+        assert_eq!(gateway.tools("fake").len(), 2);
         assert!(gateway.status()[0].signed_in);
+        // A call by the shortened name agents see reaches the server under the tool's own.
+        let called = gateway
+            .call("fake", "tool_with_a_name_too_long_for_agents_to_1e80", None)
+            .await
+            .unwrap();
+        let called = serde_json::to_string(&called).unwrap();
+        assert!(called.contains(crate::fake_oauth::LONG_TOOL), "{called}");
 
         // Tokens are for the URL they were got for, not for one the server moves to.
         gateway.sync(vec![server(&format!("{}?moved", fake.url))]);

@@ -15,7 +15,7 @@ pub const GITHUB_TOKEN: &str = "github-token";
 
 /// Whether the OS keyring has been reached. While it has not, uses try again, so a keyring that
 /// starts or comes back after xolkit did is found without restarting xolkit.
-enum Keyring {
+enum Connection {
     Unreached,
     /// It was slow to say, with `why`, that it cannot be reached, and is not tried again
     /// before `until`.
@@ -29,7 +29,7 @@ enum Keyring {
 /// Held for the whole of each use, so uses take turns across the process. A use that waits on
 /// the keyring, for the user to unlock it or for a provider that never answers, keeps every
 /// other use waiting with it.
-static KEYRING: Mutex<Keyring> = Mutex::new(Keyring::Unreached);
+static KEYRING: Mutex<Connection> = Mutex::new(Connection::Unreached);
 
 /// How long reaching the keyring may take to fail before it is left alone for a while, and the
 /// longest it is left alone. A provider that fails to start can take many seconds to say so,
@@ -63,24 +63,24 @@ fn with_entry<T>(
     op: impl FnOnce(&Entry) -> keyring_core::Result<T>,
 ) -> Result<Option<T>> {
     let mut keyring = KEYRING.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Keyring::Unreachable { until, why } = &*keyring
+    if let Connection::Unreachable { until, why } = &*keyring
         && Instant::now() < *until
     {
         return Err(anyhow!("{why}")).context(what);
     }
-    if !matches!(*keyring, Keyring::Reached) {
+    if !matches!(*keyring, Connection::Reached) {
         let started = Instant::now();
         match store() {
             Ok(store) => {
                 keyring_core::set_default_store(store);
-                *keyring = Keyring::Reached;
+                *keyring = Connection::Reached;
             }
             Err(e) => {
                 let (why, took) = (format!("{UNREACHABLE}: {e}"), started.elapsed());
                 *keyring = if took < SLOW {
-                    Keyring::Unreached
+                    Connection::Unreached
                 } else {
-                    Keyring::Unreachable {
+                    Connection::Unreachable {
                         until: Instant::now() + took.min(LONGEST_PAUSE),
                         why: why.clone(),
                     }
@@ -96,7 +96,7 @@ fn with_entry<T>(
             // The connection may be lost, as when a Secret Service provider was restarted, so
             // the next use reaches for the keyring anew. One that is locked is still connected.
             if matches!(e, Error::PlatformFailure(_)) {
-                *keyring = Keyring::Unreached;
+                *keyring = Connection::Unreached;
             }
             Err(e).context(what)
         }

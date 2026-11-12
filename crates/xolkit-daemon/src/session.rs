@@ -155,9 +155,11 @@ pub(crate) fn own_tool_name<'a>(
 
 /// The name agents see for `tool` of `server`: `<server>__<tool>`, or `None` if agents would
 /// not accept it, as tool names are letters, digits, `_` and `-`. One that would be too long is
-/// shortened: first by dropping the server's name from the front of the tool's
-/// (`planetscale__planetscale_list_x` to `planetscale__list_x`), then by cutting the end and
-/// closing with a few characters that tell it from other tools cut at the same place.
+/// shortened: the server's name is dropped from the front of the tool's, the end is cut if it
+/// must be, and a few characters made from the tool's whole name close it
+/// (`planetscale__planetscale_list_x` to `planetscale__list_x_8311`). Those tell it from other
+/// tools shortened alike, and from a tool the server may add later under the shorter name, so
+/// a name an agent was allowed to call does not come to mean another tool.
 fn tool_name(server: &str, tool: &str) -> Option<String> {
     let usable = |s: &str| {
         s.chars()
@@ -177,15 +179,12 @@ fn tool_name(server: &str, tool: &str) -> Option<String> {
         .map(|rest| rest.trim_start_matches(['_', '-']))
         .filter(|rest| !rest.is_empty())
         .unwrap_or(tool);
-    if short.len() <= room {
-        return Some(format!("{server}{SEPARATOR}{short}"));
-    }
     // FNV-1a, so a tool keeps its name from one version of xolkit to the next.
     let hash = tool.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
     });
     let kept = room.checked_sub(5).filter(|kept| *kept >= MIN_KEPT)?;
-    let kept = short[..kept].trim_end_matches(['_', '-']);
+    let kept = short[..kept.min(short.len())].trim_end_matches(['_', '-']);
     (!kept.is_empty()).then(|| format!("{server}{SEPARATOR}{kept}_{:04x}", hash & 0xffff))
 }
 
@@ -539,16 +538,11 @@ mod tests {
 
     #[test]
     fn long_tool_names_are_shortened() {
-        // A name that fits is left alone, even with the server's name in it.
-        assert_eq!(
-            tool_name("planetscale", "planetscale_get_branch").as_deref(),
-            Some("planetscale__planetscale_get_branch")
-        );
+        // The exact names, as agents keep them in their settings from one version to the next.
         assert_eq!(
             tool_name("planetscale", "planetscale_list_schema_recommendations").as_deref(),
-            Some("planetscale__list_schema_recommendations")
+            Some("planetscale__list_schema_recommendations_8311")
         );
-        // The exact name, as agents keep it in their settings from one version to the next.
         assert_eq!(
             tool_name(
                 "planetscale",
@@ -568,9 +562,9 @@ mod tests {
     fn a_shortened_name_never_takes_one_that_fits() {
         let (long, fits) = (
             "planetscale_list_schema_recommendations",
-            "list_schema_recommendations",
+            "list_schema_recommendations_8311",
         );
-        let seen = "planetscale__list_schema_recommendations";
+        let seen = "planetscale__list_schema_recommendations_8311";
         for tools in [[long, fits], [fits, long]] {
             let names = tool_names("planetscale", tools);
             let of = |tool| &names[tools.iter().position(|t| *t == tool).unwrap()];
@@ -584,13 +578,14 @@ mod tests {
 
     #[test]
     fn a_shortened_name_goes_to_the_same_tool_in_any_order() {
-        let (dash, underscore) = (
-            format!("ps-{}", "x".repeat(46)),
-            format!("ps_{}", "x".repeat(46)),
+        // Two names cut at the same place whose closing characters come out the same.
+        let (first, second) = (
+            format!("{}_22", "x".repeat(60)),
+            format!("{}_800", "x".repeat(60)),
         );
-        let seen = format!("ps__{}", "x".repeat(46));
-        for tools in [[&*dash, &*underscore], [&*underscore, &*dash]] {
-            assert_eq!(own_tool_name("ps", tools, &seen), Some(&*dash));
+        let seen = format!("server__{}_b782", "x".repeat(38));
+        for tools in [[&*first, &*second], [&*second, &*first]] {
+            assert_eq!(own_tool_name("server", tools, &seen), Some(&*first));
         }
     }
 
