@@ -56,11 +56,15 @@ fn store() -> keyring_core::Result<Arc<keyring_core::CredentialStore>> {
 }
 
 /// What `op` gives for the keyring entry of `key`, or `None` if there is no such entry. An
-/// error says `what` could not be done.
+/// error says `what` could not be done. With `again`, an `op` that fails as it would on a lost
+/// connection is tried once more on a new one, so that the first use after a Secret Service
+/// provider was restarted works. That is for reads only: a save fails the same way when the
+/// user turns down a prompt, and must not ask twice.
 fn with_entry<T>(
     key: &str,
     what: &'static str,
-    op: impl FnOnce(&Entry) -> keyring_core::Result<T>,
+    mut again: bool,
+    op: impl Fn(&Entry) -> keyring_core::Result<T>,
 ) -> Result<Option<T>> {
     let mut keyring = KEYRING.lock().unwrap_or_else(PoisonError::into_inner);
     if let Connection::Unreachable { until, why } = &*keyring
@@ -68,37 +72,43 @@ fn with_entry<T>(
     {
         return Err(anyhow!("{why}")).context(what);
     }
-    if !matches!(*keyring, Connection::Reached) {
-        let started = Instant::now();
-        match store() {
-            Ok(store) => {
-                keyring_core::set_default_store(store);
-                *keyring = Connection::Reached;
-            }
-            Err(e) => {
-                let (why, took) = (format!("{UNREACHABLE}: {e}"), started.elapsed());
-                *keyring = if took < SLOW {
-                    Connection::Unreached
-                } else {
-                    Connection::Unreachable {
-                        until: Instant::now() + took.min(LONGEST_PAUSE),
-                        why: why.clone(),
-                    }
-                };
-                return Err(anyhow!(why)).context(what);
+    loop {
+        if !matches!(*keyring, Connection::Reached) {
+            let started = Instant::now();
+            match store() {
+                Ok(store) => {
+                    keyring_core::set_default_store(store);
+                    *keyring = Connection::Reached;
+                }
+                Err(e) => {
+                    let (why, took) = (format!("{UNREACHABLE}: {e}"), started.elapsed());
+                    *keyring = if took < SLOW {
+                        Connection::Unreached
+                    } else {
+                        Connection::Unreachable {
+                            until: Instant::now() + took.min(LONGEST_PAUSE),
+                            why: why.clone(),
+                        }
+                    };
+                    return Err(anyhow!(why)).context(what);
+                }
             }
         }
-    }
-    match Entry::new(SERVICE, key).and_then(|entry| op(&entry)) {
-        Ok(value) => Ok(Some(value)),
-        Err(Error::NoEntry) => Ok(None),
-        Err(e) => {
-            // The connection may be lost, as when a Secret Service provider was restarted, so
-            // the next use reaches for the keyring anew. One that is locked is still connected.
-            if matches!(e, Error::PlatformFailure(_)) {
-                *keyring = Connection::Unreached;
+        match Entry::new(SERVICE, key).and_then(|entry| op(&entry)) {
+            Ok(value) => return Ok(Some(value)),
+            Err(Error::NoEntry) => return Ok(None),
+            // The connection may be lost, so the keyring is reached for anew: now if this
+            // use may try again, and by the next use if not. A keyring that is locked is
+            // still connected.
+            Err(Error::PlatformFailure(_)) if again => {
+                (*keyring, again) = (Connection::Unreached, false);
             }
-            Err(e).context(what)
+            Err(e) => {
+                if matches!(e, Error::PlatformFailure(_)) {
+                    *keyring = Connection::Unreached;
+                }
+                return Err(e).context(what);
+            }
         }
     }
 }
@@ -108,6 +118,7 @@ pub fn get_secret(key: &str) -> Result<Option<String>> {
     with_entry(
         key,
         "could not read from the OS keyring",
+        true,
         Entry::get_password,
     )
 }
@@ -115,12 +126,13 @@ pub fn get_secret(key: &str) -> Result<Option<String>> {
 /// Saves `secret` under `key`, or deletes it when `None`.
 pub fn set_secret(key: &str, secret: Option<&str>) -> Result<()> {
     match secret {
-        Some(secret) => with_entry(key, "could not save to the OS keyring", |entry| {
+        Some(secret) => with_entry(key, "could not save to the OS keyring", false, |entry| {
             entry.set_password(secret)
         }),
         None => with_entry(
             key,
             "could not delete from the OS keyring",
+            false,
             Entry::delete_credential,
         ),
     }
