@@ -78,9 +78,6 @@ fn prompts(catalogue: &Catalogue) -> Vec<(String, Item<'_>)> {
 /// characters, and Claude Code names it `mcp__xolkit__<name>`.
 const MAX_TOOL_NAME: usize = 64 - "mcp__xolkit__".len();
 
-/// The fewest characters of a tool's own name kept when shortening it.
-const MIN_KEPT: usize = 8;
-
 /// Why a server's tool is left out of what agents see.
 #[derive(Debug, PartialEq)]
 pub(crate) enum LeftOut {
@@ -170,6 +167,7 @@ fn tool_name(server: &str, tool: &str) -> Option<String> {
     if !usable(server) || !usable(tool) {
         return None;
     }
+    // A server's name is 32 characters at most, which leaves room for 17 or more.
     let room = MAX_TOOL_NAME.checked_sub(server.len() + SEPARATOR.len())?;
     if tool.len() <= room {
         return Some(format!("{server}{SEPARATOR}{tool}"));
@@ -185,7 +183,7 @@ fn tool_name(server: &str, tool: &str) -> Option<String> {
     let hash = tool.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
     });
-    let kept = room.checked_sub(5).filter(|kept| *kept >= MIN_KEPT)?;
+    let kept = room.checked_sub(5)?;
     let kept = short[..kept.min(short.len())].trim_end_matches(['_', '-']);
     (!kept.is_empty()).then(|| format!("{server}{SEPARATOR}{kept}_{:04x}", hash & 0xffff))
 }
@@ -533,8 +531,7 @@ mod tests {
     #[test]
     fn tools_with_names_agents_would_refuse_get_none() {
         assert_eq!(tool_name("server", "has.dot"), None);
-        // No room left for a tool's name worth reading.
-        assert_eq!(tool_name(&"s".repeat(40), &"x".repeat(50)), None);
+        // Nothing of its own name would be left once it was cut.
         assert_eq!(tool_name("server", &"_".repeat(60)), None);
     }
 

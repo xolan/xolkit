@@ -61,13 +61,18 @@ fn store() -> keyring_core::Result<Arc<keyring_core::CredentialStore>> {
     Ok(store)
 }
 
+/// Whether a use that failed may be down to a lost connection, which a new one would mend. Only
+/// the Secret Service has a connection to lose: it goes when the provider is restarted.
+const CONNECTION_CAN_BE_LOST: bool = cfg!(all(unix, not(target_os = "macos")));
+
 /// What `op` gives for the keyring entry of `key`, or `None` if there is no such entry. An
 /// error says `what` could not be done. With `again`, an `op` that fails as it would on a lost
 /// connection is tried once more on a new one, so that the first use after a Secret Service
 /// provider was restarted works. That is for reads and deletes, not for saves: a save fails
 /// the same way when the user turns down a prompt, and must not ask twice. And only after a
 /// quick failure, which a lost connection is: a keyring that was slow to fail would be as slow
-/// again.
+/// again. A provider that answers a refusal with an error of its own, not the one the Secret
+/// Service has for it, can still be asked twice if the user refuses within that second.
 fn with_entry<T>(
     key: &str,
     what: &'static str,
@@ -75,6 +80,7 @@ fn with_entry<T>(
     op: impl Fn(&Entry) -> keyring_core::Result<T>,
 ) -> Result<Option<T>> {
     let mut keyring = KEYRING.lock().unwrap_or_else(PoisonError::into_inner);
+    again &= CONNECTION_CAN_BE_LOST;
     if let Connection::Unreachable { until, why } = &*keyring
         && Instant::now() < *until
     {
