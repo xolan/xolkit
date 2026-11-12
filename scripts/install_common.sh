@@ -91,7 +91,11 @@ download_verified() {
     echo "$file.sha256 from release $tag isn't a checksum of $file" >&2
     return 1
   }
-  (cd "$dir" && sha256sum --quiet -c "$file.sha256") || {
+  local checker=(sha256sum --quiet)
+  if [[ "$(uname -s)" == Darwin ]]; then
+    checker=(shasum -a 256)
+  fi
+  (cd "$dir" && "${checker[@]}" -c "$file.sha256") || {
     echo "$file from release $tag doesn't match $file.sha256; not installing it" >&2
     return 1
   }

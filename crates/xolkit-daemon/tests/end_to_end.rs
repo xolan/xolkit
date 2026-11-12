@@ -71,7 +71,7 @@ async fn serves_an_agent_session() {
 
     let daemon = {
         let env = env.clone();
-        std::thread::spawn(move || xolkit_daemon::run_daemon(env))
+        std::thread::spawn(move || xolkit_daemon::run_daemon(env).expect("daemon failed"))
     };
     wait_for("the daemon", async || {
         xolkit_daemon::connect(&env).await.is_ok()
@@ -334,6 +334,6 @@ async fn serves_an_agent_session() {
         .await
         .unwrap();
     assert_eq!(answer.trim(), r#"{"response":"stopping"}"#);
-    daemon.join().unwrap().unwrap();
+    daemon.join().unwrap();
     assert!(!env.run_dir().join("daemon.pid").exists());
 }

@@ -56,7 +56,13 @@ jobs:
             os: windows-latest
           - target: aarch64-pc-windows-msvc
             os: windows-11-arm
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-15
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
     steps:
       - uses: actions/checkout@v7
       - name: Install system libraries
@@ -65,6 +71,9 @@ jobs:
           sudo apt-get update
           # dpkg-dev's dpkg-shlibdeps fills in the .deb's library dependencies.
           sudo apt-get install -y dpkg-dev libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev
+      - name: Check the Metal compiler
+        if: runner.os == 'macOS'
+        run: xcrun --sdk macosx metal --version
       - uses: jdx/mise-action@v5
       - uses: Swatinem/rust-cache@v2
         with:
@@ -75,8 +84,8 @@ jobs:
         run: mise run deb ${{ matrix.target }}
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.target }}
-          # A tarball and a .deb for Linux, a zip for Windows, each with its .sha256.
+          name: release-${{ matrix.target }}
+          # Tarballs for Linux/macOS, .deb for Linux, zip for Windows, each with its .sha256.
           path: |
             dist/*.tar.gz*
             dist/*.deb*
@@ -92,7 +101,10 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: dist
+          pattern: release-*
           merge-multiple: true
+      - name: Verify release checksums
+        run: cd dist && sha256sum -c ./*.sha256
       - name: Write the Arch Linux PKGBUILD
         env:
           VERSION: ${{ needs.check.outputs.version }}
