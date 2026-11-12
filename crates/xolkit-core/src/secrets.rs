@@ -64,9 +64,10 @@ fn store() -> keyring_core::Result<Arc<keyring_core::CredentialStore>> {
 /// What `op` gives for the keyring entry of `key`, or `None` if there is no such entry. An
 /// error says `what` could not be done. With `again`, an `op` that fails as it would on a lost
 /// connection is tried once more on a new one, so that the first use after a Secret Service
-/// provider was restarted works. That is for reads only: a save fails the same way when the
-/// user turns down a prompt, and must not ask twice. And only after a quick failure, which a
-/// lost connection is: a keyring that was slow to fail would be as slow again.
+/// provider was restarted works. That is for reads and deletes, not for saves: a save fails
+/// the same way when the user turns down a prompt, and must not ask twice. And only after a
+/// quick failure, which a lost connection is: a keyring that was slow to fail would be as slow
+/// again.
 fn with_entry<T>(
     key: &str,
     what: &'static str,
@@ -142,7 +143,7 @@ pub fn set_secret(key: &str, secret: Option<&str>) -> Result<()> {
         None => with_entry(
             key,
             "could not delete from the OS keyring",
-            false,
+            true,
             Entry::delete_credential,
         )
         .map(drop),
