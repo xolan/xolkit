@@ -11,7 +11,8 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  linux:
+    name: Linux
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
@@ -24,6 +25,7 @@ jobs:
       - run: mise run ci
 
   windows:
+    name: Windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -32,13 +34,16 @@ jobs:
       - run: mise run ci
 
   macos:
+    name: macOS (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15-intel
+          - arch: Intel
+            os: macos-15-intel
             target: x86_64-apple-darwin
-          - os: macos-15
+          - arch: Apple Silicon
+            os: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     env:
