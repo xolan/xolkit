@@ -883,7 +883,11 @@ impl Shelf {
     }
 
     /// Column titles over the per-row controls.
-    fn column_header(&self, columns: &[impl AsRef<str>], cx: &mut Context<Self>) -> impl IntoElement {
+    fn column_header(
+        &self,
+        columns: &[impl AsRef<str>],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         h_flex()
             .px_4()
             .py_1()

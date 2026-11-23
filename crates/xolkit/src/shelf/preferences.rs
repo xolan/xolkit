@@ -203,24 +203,15 @@ impl Shelf {
         });
     }
 
-    fn set_router(
-        &mut self,
-        agent: Agent,
-        on: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_router(&mut self, agent: Agent, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         let mut settings = self.settings().clone();
         settings.router.retain(|a| a != &agent);
         if on {
             let order = settings.known_agents();
             settings.router.push(agent);
-            settings.router.sort_by_key(|a| {
-                order
-                    .iter()
-                    .position(|o| o == a)
-                    .unwrap_or(usize::MAX)
-            });
+            settings
+                .router
+                .sort_by_key(|a| order.iter().position(|o| o == a).unwrap_or(usize::MAX));
         }
         self.save_settings(settings, Vec::new(), None, window, cx);
     }
@@ -264,9 +255,7 @@ impl Shelf {
         let can_register = if custom_index.is_some() {
             target.provider == Provider::Antigravity
                 || found.is_some()
-                || self
-                    .found
-                    .contains_key(&Agent::from(target.provider))
+                || self.found.contains_key(&Agent::from(target.provider))
         } else {
             found.is_some()
         };
@@ -392,9 +381,7 @@ impl Shelf {
             .custom_agents
             .iter()
             .enumerate()
-            .map(|(ix, custom)| {
-                self.target_row(Target::custom(&self.env, custom), Some(ix), cx)
-            })
+            .map(|(ix, custom)| self.target_row(Target::custom(&self.env, custom), Some(ix), cx))
             .collect()
     }
 
@@ -409,9 +396,7 @@ impl Shelf {
         if editing.is_some() && existing.is_none() {
             return;
         }
-        let initial_provider = existing
-            .as_ref()
-            .map_or(Provider::Claude, |c| c.provider);
+        let initial_provider = existing.as_ref().map_or(Provider::Claude, |c| c.provider);
         let initial_name = existing
             .as_ref()
             .map(|c| c.name.clone())
@@ -576,7 +561,9 @@ impl Shelf {
                 .map(|ix| {
                     let agent = Agent::Custom(settings.custom_agents[ix].id.clone());
                     let order = settings.known_agents();
-                    settings.active_mut().set_agent_in_order(agent, true, &order);
+                    settings
+                        .active_mut()
+                        .set_agent_in_order(agent, true, &order);
                 }),
         };
         if let Err(e) = result {
@@ -798,7 +785,13 @@ impl Shelf {
                             .when(!custom_rows.is_empty(), |this| {
                                 this.child(v_flex().gap_4().children(custom_rows))
                             })
-                            .child(div().pt_2().text_sm().font_medium().child("Other MCP clients"))
+                            .child(
+                                div()
+                                    .pt_2()
+                                    .text_sm()
+                                    .font_medium()
+                                    .child("Other MCP clients"),
+                            )
                             .child(div().text_sm().text_color(muted).child(
                                 "Any other agent that speaks MCP can use xolkit: add a stdio \
                                  server that runs this command. It gets the Other switches.",

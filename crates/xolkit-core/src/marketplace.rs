@@ -1303,7 +1303,10 @@ mod tests {
             .is_empty()
         );
         // Setting a profile sets every native plugin, so a half-done switch is set right.
-        assert_eq!(native_steps(&env, &settings, &lock, &[plugin], &on).len(), 1);
+        assert_eq!(
+            native_steps(&env, &settings, &lock, &[plugin], &on).len(),
+            1
+        );
     }
 
     #[test]

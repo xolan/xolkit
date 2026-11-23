@@ -798,28 +798,23 @@ impl Shelf {
         window.open_alert_dialog(cx, move |alert, _, cx| {
             let (shelf, found, picked) = (shelf.clone(), found.clone(), picked.clone());
             let danger = cx.theme().danger;
-            let list = v_flex()
-                .gap_2()
-                .children(
-                    errors
-                        .iter()
-                        .map(|e| div().text_sm().text_color(danger).child(e.clone())),
-                )
-                .when(found.is_empty(), |this| {
-                    this.child("No servers to copy: the agents have none that xolkit lacks.")
-                })
-                .children(
-                    found
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, (source_label, name, config))| {
+            let list =
+                v_flex()
+                    .gap_2()
+                    .children(
+                        errors
+                            .iter()
+                            .map(|e| div().text_sm().text_color(danger).child(e.clone())),
+                    )
+                    .when(found.is_empty(), |this| {
+                        this.child("No servers to copy: the agents have none that xolkit lacks.")
+                    })
+                    .children(found.iter().enumerate().map(
+                        |(ix, (source_label, name, config))| {
                             let picked = picked.clone();
                             let checked = picked.read(cx)[ix];
                             Checkbox::new(SharedString::from(format!("copy-{ix}")))
-                                .label(format!(
-                                    "{name} ({}, from {source_label})",
-                                    config.kind(),
-                                ))
+                                .label(format!("{name} ({}, from {source_label})", config.kind(),))
                                 .checked(checked)
                                 .on_change(move |on: &bool, _, cx| {
                                     picked.update(cx, |picked, cx| {
@@ -827,8 +822,8 @@ impl Shelf {
                                         cx.notify();
                                     });
                                 })
-                        }),
-                );
+                        },
+                    ));
             alert
                 .title("Copy servers from agents")
                 .width(px(560.))
