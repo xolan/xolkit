@@ -212,7 +212,7 @@ impl Session {
     }
 
     fn catalogue(&self) -> Catalogue {
-        self.daemon.catalogue(self.agent)
+        self.daemon.catalogue(&self.agent)
     }
 
     fn own_tools() -> Vec<Tool> {

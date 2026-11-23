@@ -10,7 +10,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use xolkit_core::{
-    Agent, Kind, Plugin, PluginUpdate, Provider, Skill, SkillUpdate, check_plugin_update,
+    Kind, Plugin, PluginUpdate, Skill, SkillUpdate, Target, check_plugin_update,
     check_skill_update, fetch_plugin_update, fetch_update,
 };
 
@@ -407,9 +407,9 @@ impl Shelf {
     }
 
     /// The agent columns, then an untitled one for each row's uninstall button.
-    fn installed_columns(&self) -> Vec<&'static str> {
+    fn installed_columns(&self) -> Vec<String> {
         let mut columns = self.agent_columns();
-        columns.push("");
+        columns.push(String::new());
         columns
     }
 
@@ -450,18 +450,20 @@ impl Shelf {
 
     /// Which agents get the item from the active profile, as a line per agent.
     fn served_to(&self, kind: Kind, name: &str, cx: &mut Context<Self>) -> Vec<Div> {
-        let profile = self.settings().active();
-        Agent::ALL
+        let settings = self.settings();
+        let profile = settings.active();
+        settings
+            .known_agents()
             .into_iter()
             .map(|agent| {
-                let state = if !profile.serves(agent) {
+                let state = if !profile.serves(&agent) {
                     "not served by this profile"
-                } else if profile.is_on(kind, name, agent) {
+                } else if profile.is_on(kind, name, &agent) {
                     "on"
                 } else {
                     "off"
                 };
-                fact(agent.label(), state.to_owned(), cx)
+                fact(&settings.agent_label(&agent), state.to_owned(), cx)
             })
             .collect()
     }
@@ -530,27 +532,32 @@ impl Shelf {
             served.join(", ")
         };
         let native_lines: Vec<Div> = if plugin.needs_native() {
-            Provider::ALL
+            self.settings()
+                .native_targets(&self.env)
                 .into_iter()
-                .map(|provider| {
-                    let state = if native.contains(&provider) {
+                .map(|target| {
+                    let installed = native.contains(&target.agent);
+                    let state = if installed {
                         "installed natively"
                     } else {
                         "not installed"
                     };
-                    let install = (!native.contains(&provider)).then(|| {
+                    let label = target.label.clone();
+                    let install = (!installed).then(|| {
                         let id = plugin.id.clone();
-                        Button::new(SharedString::from(format!("native-{}", provider.cli())))
+                        let key = target.agent.key().to_owned();
+                        let target = target.clone();
+                        Button::new(SharedString::from(format!("native-{key}")))
                             .small()
                             .label("Install natively…")
                             .disabled(self.busy)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.confirm_native_install(&id, provider, window, cx)
+                                this.confirm_native_install(&id, target.clone(), window, cx)
                             }))
                     });
                     h_flex()
                         .gap_2()
-                        .child(fact(provider.label(), state.to_owned(), cx).flex_1())
+                        .child(fact(&label, state.to_owned(), cx).flex_1())
                         .children(install)
                 })
                 .collect()
@@ -641,12 +648,12 @@ impl Shelf {
     fn confirm_native_install(
         &mut self,
         id: &str,
-        provider: Provider,
+        target: Target,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(plugin) = self.plugin(id).cloned() {
-            open_change_dialog(self, Change::NativeInstall { plugin, provider }, window, cx);
+            open_change_dialog(self, Change::NativeInstall { plugin, target }, window, cx);
         }
     }
 }

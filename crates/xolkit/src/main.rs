@@ -71,7 +71,7 @@ fn shim(args: &[String]) -> anyhow::Result<()> {
         [flag, name] if flag == "--agent" => {
             Some(Agent::from_key(name).ok_or_else(|| anyhow::anyhow!("unknown agent {name}"))?)
         }
-        _ => anyhow::bail!("usage: xolkit mcp [--agent claude|codex|other]"),
+        _ => anyhow::bail!("usage: xolkit mcp [--agent claude|codex|antigravity|other|<id>]"),
     };
     let exe = std::env::current_exe()?;
     xolkit_daemon::run_shim(Env::detect_dirs()?, &exe, agent)

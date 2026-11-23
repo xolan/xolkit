@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-use crate::Provider;
+use crate::{Provider, Target};
 
 /// Windows `CREATE_NO_WINDOW`: a console program started from a GUI app runs without opening a
 /// console window of its own.
@@ -21,9 +21,14 @@ pub struct Env {
     pub claude_dir: PathBuf,
     /// `~/.codex`, or `$CODEX_HOME`.
     pub codex_dir: PathBuf,
+    /// `~/.gemini/antigravity`: Antigravity's global configuration directory.
+    pub antigravity_dir: PathBuf,
     /// `PATH` for provider tools: this process's `PATH`, then on Unix any extra entries from the
     /// user's login shell, because an app started from a desktop launcher gets a short `PATH`.
     pub path: Option<OsString>,
+    /// Extra environment variables passed when running a provider tool (e.g. `CLAUDE_CONFIG_DIR`
+    /// or `CODEX_HOME` for an alternative config directory).
+    pub tool_env: Vec<(String, OsString)>,
 }
 
 impl Env {
@@ -47,7 +52,9 @@ impl Env {
             xolkit_dir: dir_or("XOLKIT_HOME", ".xolkit"),
             claude_dir: dir_or("CLAUDE_CONFIG_DIR", ".claude"),
             codex_dir: dir_or("CODEX_HOME", ".codex"),
+            antigravity_dir: home.join(".gemini").join("antigravity"),
             path: None,
+            tool_env: Vec::new(),
             home,
         })
     }
@@ -59,7 +66,9 @@ impl Env {
             xolkit_dir: home.join(".xolkit"),
             claude_dir: home.join(".claude"),
             codex_dir: home.join(".codex"),
+            antigravity_dir: home.join(".gemini").join("antigravity"),
             path: None,
+            tool_env: Vec::new(),
         }
     }
 
@@ -108,10 +117,23 @@ impl Env {
         self.xolkit_dir.join("themes")
     }
 
+    /// The default config directory for `provider`.
+    pub fn provider_dir(&self, provider: Provider) -> &Path {
+        match provider {
+            Provider::Claude => &self.claude_dir,
+            Provider::Codex => &self.codex_dir,
+            Provider::Antigravity => &self.antigravity_dir,
+        }
+    }
+
+    fn has_tool_env(&self, key: &str) -> bool {
+        self.tool_env.iter().any(|(k, _)| k == key)
+    }
+
     /// Claude Code's own config, where `claude mcp add --scope user` writes: `~/.claude.json`,
     /// or `.claude.json` inside `$CLAUDE_CONFIG_DIR` when that moves Claude's directory.
     pub fn claude_json(&self) -> PathBuf {
-        if self.claude_dir == self.home.join(".claude") {
+        if self.claude_dir == self.home.join(".claude") && !self.has_tool_env("CLAUDE_CONFIG_DIR") {
             self.home.join(".claude.json")
         } else {
             self.claude_dir.join(".claude.json")
@@ -132,6 +154,56 @@ impl Env {
 
     pub fn codex_plugin_cache(&self) -> PathBuf {
         self.codex_dir.join("plugins").join("cache")
+    }
+
+    /// Antigravity's MCP server configuration file (`~/.gemini/antigravity/mcp_config.json`).
+    pub fn antigravity_mcp_config(&self) -> PathBuf {
+        self.antigravity_dir.join("mcp_config.json")
+    }
+
+    /// Antigravity's skills directory (`~/.gemini/antigravity/skills`).
+    pub fn antigravity_skills(&self) -> PathBuf {
+        self.antigravity_dir.join("skills")
+    }
+
+    /// Expands a leading `~`, `~/`, or `~\` against [`Env::home`], and strips trailing separators.
+    pub fn expand_tilde(&self, path: &Path) -> PathBuf {
+        let raw = path.to_string_lossy();
+        let expanded = if raw == "~" {
+            self.home.clone()
+        } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+            self.home.join(rest)
+        } else {
+            path.to_path_buf()
+        };
+        // Strip trailing path separators (e.g. `~/.claude-two/` -> `~/.claude-two`).
+        expanded.components().collect()
+    }
+
+    /// An environment pointed at an alternative config directory for `provider`, if `custom_dir`
+    /// is `Some`. Sets `CLAUDE_CONFIG_DIR` or `CODEX_HOME` for spawned CLI tools.
+    pub fn for_dir(&self, provider: Provider, custom_dir: Option<&Path>) -> Env {
+        let Some(dir) = custom_dir else {
+            return self.clone();
+        };
+        let dir = self.expand_tilde(dir);
+        let mut env = self.clone();
+        match provider {
+            Provider::Claude => env.claude_dir = dir.clone(),
+            Provider::Codex => env.codex_dir = dir.clone(),
+            Provider::Antigravity => env.antigravity_dir = dir.clone(),
+        }
+        if let Some(var) = provider.config_env_var() {
+            env.tool_env.retain(|(k, _)| k != var);
+            env.tool_env
+                .push((var.to_owned(), dir.as_os_str().to_os_string()));
+        }
+        env
+    }
+
+    /// An environment pointed at `target`'s config directory.
+    pub fn for_target(&self, target: &Target) -> Env {
+        self.for_dir(target.provider, target.custom_dir.as_deref())
     }
 
     /// `path` with the home directory shown as `~`: `~/…`, or `~\…` on Windows.
@@ -161,6 +233,9 @@ impl Env {
             .stdin(Stdio::null());
         if let Some(path) = &self.path {
             command.env("PATH", path);
+        }
+        for (key, value) in &self.tool_env {
+            command.env(key, value);
         }
         // Provider tools are console programs; each would flash a console window over the app.
         #[cfg(windows)]
@@ -232,14 +307,33 @@ impl Env {
 
     /// Where the provider shows it is installed: its directory, or else its tool on `PATH`.
     pub fn locate(&self, provider: Provider) -> Option<PathBuf> {
-        let dir = match provider {
-            Provider::Claude => &self.claude_dir,
-            Provider::Codex => &self.codex_dir,
-        };
+        let dir = self.provider_dir(provider);
         if dir.is_dir() {
-            return Some(dir.clone());
+            return Some(dir.to_path_buf());
+        }
+        if provider == Provider::Antigravity {
+            for candidate in [
+                self.home.join(".gemini").join("antigravity"),
+                self.home.join(".gemini").join("antigravity-cli"),
+            ] {
+                if candidate.is_dir() {
+                    return Some(candidate);
+                }
+            }
+            return self
+                .tool_path("agy")
+                .or_else(|| self.tool_path("antigravity"));
         }
         self.tool_path(provider.cli())
+    }
+
+    /// Where `target` shows it is present: its own folder if it exists, otherwise the provider's
+    /// installation.
+    pub fn locate_target(&self, target: &Target) -> Option<PathBuf> {
+        if target.dir.is_dir() {
+            return Some(target.dir.clone());
+        }
+        self.locate(target.provider)
     }
 }
 

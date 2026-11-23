@@ -88,7 +88,7 @@ fn agents_on(states: Option<&crate::States>) -> Vec<Agent> {
         .into_iter()
         .flatten()
         .filter(|(_, on)| **on)
-        .map(|(agent, _)| *agent)
+        .map(|(agent, _)| agent.clone())
         .collect()
 }
 
@@ -454,14 +454,14 @@ pub fn import_steps(
     ];
     for (kind, items) in lists {
         for (name, item) in items {
-            for &agent in &item.on {
-                profile.set(kind, name, agent, true);
+            for agent in &item.on {
+                profile.set(kind, name, agent.clone(), true);
             }
         }
     }
     for (name, server) in &shared.servers {
-        for &agent in &server.on {
-            profile.set(Kind::Server, name, agent, true);
+        for agent in &server.on {
+            profile.set(Kind::Server, name, agent.clone(), true);
         }
     }
     settings.profiles.push(profile);
@@ -602,8 +602,8 @@ mod tests {
         assert!(imported.servers.contains_key("api"));
         let profile = &imported.settings.profiles[1];
         assert_eq!(profile.name, "Work");
-        assert!(profile.switched_on(Kind::Skill, "mine", Agent::Codex));
-        assert!(profile.switched_on(Kind::Server, "api", Agent::Claude));
+        assert!(profile.switched_on(Kind::Skill, "mine", &Agent::Codex));
+        assert!(profile.switched_on(Kind::Server, "api", &Agent::Claude));
 
         // A code can't bring the local skill.
         assert!(import_steps(&other_env, &empty, &shared, &Downloads::default(), None).is_err());

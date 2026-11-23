@@ -72,6 +72,8 @@ impl Shelf {
         // Only what the edit changes; unrelated edits never touch the agents.
         let native = if ix == settings.active_index() {
             native_changes(
+                &self.env,
+                &settings,
                 &self.library.lock,
                 &self.library.plugins,
                 &before,
@@ -98,7 +100,14 @@ impl Shelf {
         let from = settings.active().clone();
         settings.profile = settings.profiles[ix].name.clone();
         let to = settings.active().clone();
-        let native = native_changes(&self.library.lock, &self.library.plugins, &from, &to);
+        let native = native_changes(
+            &self.env,
+            &settings,
+            &self.library.lock,
+            &self.library.plugins,
+            &from,
+            &to,
+        );
         let done: SharedString = format!("Switched to {}", to.name).into();
         if native.is_empty() {
             self.save_settings(settings, Vec::new(), Some(done), window, cx);
@@ -167,8 +176,15 @@ impl Shelf {
         if self.busy {
             return;
         }
-        let profile = self.settings().active();
-        let steps = native_steps(&self.library.lock, &self.library.plugins, profile);
+        let settings = self.settings();
+        let profile = settings.active();
+        let steps = native_steps(
+            &self.env,
+            settings,
+            &self.library.lock,
+            &self.library.plugins,
+            profile,
+        );
         let done = format!("Set plugins as “{}” has them", profile.name);
         self.run(steps, Some(done.into()), window, cx);
     }
@@ -752,7 +768,7 @@ impl Shelf {
             selected,
             profile.name.clone(),
             tag,
-            summary(profile),
+            summary(self.settings(), profile),
             vec![control],
             cx.listener(move |this, _, _, cx| this.select(Some(selection.clone()), cx)),
             cx,
@@ -762,36 +778,49 @@ impl Shelf {
     /// A switch per agent, turning serving it on or off in profile `ix`.
     pub(super) fn agent_rows(&self, ix: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let muted = cx.theme().muted_foreground;
-        let agents = self.settings().profiles[ix].agents.clone();
-        Agent::ALL
-            .into_iter()
+        let settings = self.settings();
+        let agents = settings.profiles[ix].agents.clone();
+        let order = settings.known_agents();
+        order
+            .iter()
+            .cloned()
             .map(|agent| {
                 let on = agents.contains(&agent);
-                let note = match agent.provider() {
-                    Some(provider) => match self.found.get(&provider) {
+                let name = settings.agent_name(&agent);
+                let note = match settings.target(&self.env, &agent) {
+                    Some(target) => match self.found.get(&agent) {
                         Some(place) => format!("Found at {}", self.env.tilde(place)),
+                        None if target.custom_dir.is_some() => {
+                            format!("{} · {} (folder not created yet)", target.provider.name(), self.env.tilde(&target.dir))
+                        }
                         None => "Not found on this computer".to_owned(),
                     },
                     None => "Any other agent that runs xolkit mcp".to_owned(),
                 };
+                let key = agent.key().to_owned();
+                let order = order.clone();
                 h_flex()
                     .gap_3()
                     .child(
                         gpui_kit::component::switch::Switch::new(SharedString::from(format!(
-                            "agent-{ix}-{}",
-                            agent.key()
+                            "agent-{ix}-{key}"
                         )))
                         .checked(on)
                         .disabled(self.busy)
-                        .on_change(cx.listener(
-                            move |this, on: &bool, window, cx| {
-                                this.edit_profile(ix, |p| p.set_agent(agent, *on), window, cx)
-                            },
-                        )),
+                        .on_change(cx.listener(move |this, on: &bool, window, cx| {
+                            let agent = agent.clone();
+                            let order = order.clone();
+                            this.edit_profile(
+                                ix,
+                                move |p| p.set_agent_in_order(agent, *on, &order),
+                                window,
+                                cx,
+                            )
+                        })),
                     )
                     .child(
                         v_flex()
-                            .child(div().text_sm().child(agent.name()))
+                            .child(div().text_sm().child(name))
                             .child(div().text_xs().text_color(muted).child(note)),
                     )
                     .into_any_element()
@@ -981,6 +1010,7 @@ impl Shelf {
     }
 
     fn item_header(&self, title: &str, agents: &[Agent], cx: &mut Context<Self>) -> AnyElement {
+        let settings = self.settings();
         h_flex()
             .pt_2()
             .gap_3()
@@ -989,7 +1019,8 @@ impl Shelf {
                 cell()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(agent.label())
+                    .truncate()
+                    .child(settings.agent_label(agent))
             }))
             .into_any_element()
     }
@@ -1001,20 +1032,26 @@ impl Shelf {
         name: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let profile = &self.settings().profiles[ix];
-        let active = ix == self.settings().active_index();
-        let switches = profile.agents.iter().map(|&agent| {
+        let settings = self.settings();
+        let profile = &settings.profiles[ix];
+        let active = ix == settings.active_index();
+        let switches = profile.agents.iter().map(|agent| {
             let item = name.to_owned();
+            let label = settings.agent_label(agent);
+            let checked = profile.switched_on(kind, name, agent);
+            let agent = agent.clone();
             self.switch(
                 format!("profile-{ix}-{kind:?}-{}-{name}", agent.key()),
-                profile.switched_on(kind, name, agent),
+                checked,
                 false,
-                agent.label(),
+                label,
                 cx.listener(move |this, on: &bool, window, cx| {
                     if active {
-                        this.set_item(kind, &item, &[agent], *on, window, cx);
+                        this.set_item(kind, &item, std::slice::from_ref(&agent), *on, window, cx);
                     } else {
-                        this.edit_profile(ix, |p| p.set(kind, &item, agent, *on), window, cx);
+                        let item = item.clone();
+                        let agent = agent.clone();
+                        this.edit_profile(ix, move |p| p.set(kind, &item, agent, *on), window, cx);
                     }
                 }),
             )
@@ -1029,7 +1066,7 @@ impl Shelf {
 }
 
 /// "Claude, Codex · 3 skills, 1 plugin and 2 servers on", from what the profile has saved.
-fn summary(profile: &Profile) -> String {
+fn summary(settings: &xolkit_core::Settings, profile: &Profile) -> String {
     if profile.agents.is_empty() {
         return "No agents".to_owned();
     }
@@ -1044,7 +1081,11 @@ fn summary(profile: &Profile) -> String {
             })
             .count()
     };
-    let agents: Vec<&str> = profile.agents.iter().map(|a| a.label()).collect();
+    let agents: Vec<String> = profile
+        .agents
+        .iter()
+        .map(|a| settings.agent_label(a))
+        .collect();
     format!(
         "{} · {}, {} and {} on",
         agents.join(", "),
@@ -1056,14 +1097,15 @@ fn summary(profile: &Profile) -> String {
 
 #[cfg(test)]
 mod tests {
-    use xolkit_core::{Agent, Kind, Profile};
+    use xolkit_core::{Agent, Kind, Profile, Settings};
 
     use super::summary;
 
     #[test]
     fn summarizes_agents_and_what_is_on() {
+        let settings = Settings::default();
         let mut profile = Profile::new("Work", vec![]);
-        assert_eq!(summary(&profile), "No agents");
+        assert_eq!(summary(&settings, &profile), "No agents");
         profile.set_agent(Agent::Claude, true);
         profile.set(Kind::Skill, "a", Agent::Claude, true);
         profile.set(Kind::Skill, "b", Agent::Claude, false);
@@ -1071,7 +1113,7 @@ mod tests {
         profile.set(Kind::Skill, "c", Agent::Codex, true);
         profile.set(Kind::Plugin, "p@m", Agent::Claude, true);
         assert_eq!(
-            summary(&profile),
+            summary(&settings, &profile),
             "Claude · 1 skill, 1 plugin and 0 servers on"
         );
     }

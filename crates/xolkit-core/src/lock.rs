@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::Provider;
+use crate::Agent;
 use crate::config::{read_json, write_json};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -49,7 +49,7 @@ pub struct PluginPin {
     pub version: String,
     /// Agents that installed it from xolkit's marketplace.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub native: BTreeSet<Provider>,
+    pub native: BTreeSet<Agent>,
 }
 
 impl Lock {
@@ -76,7 +76,7 @@ impl Lock {
     }
 
     /// The agents that have plugin `id` installed natively.
-    pub fn native(&self, id: &str) -> BTreeSet<Provider> {
+    pub fn native(&self, id: &str) -> BTreeSet<Agent> {
         self.plugins
             .get(id)
             .map(|p| p.native.clone())
@@ -107,7 +107,7 @@ mod tests {
                 PluginPin {
                     pin: pin.clone(),
                     marketplace: "o/m".into(),
-                    native: BTreeSet::from([Provider::Claude]),
+                    native: BTreeSet::from([Agent::Claude, Agent::Custom("claude-two".into())]),
                     ..PluginPin::default()
                 },
             );
@@ -118,7 +118,10 @@ mod tests {
         assert!(text.contains("\"native\": [\n        \"claude\""), "{text}");
         let lock = Lock::read(&path).unwrap();
         assert_eq!(lock.skills["a"], pin);
-        assert_eq!(lock.native("p@m"), BTreeSet::from([Provider::Claude]));
+        assert_eq!(
+            lock.native("p@m"),
+            BTreeSet::from([Agent::Claude, Agent::Custom("claude-two".into())])
+        );
         assert!(lock.native("other").is_empty());
     }
 }

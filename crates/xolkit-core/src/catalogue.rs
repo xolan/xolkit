@@ -26,7 +26,7 @@ pub enum Item<'a> {
 
 /// What `agent` gets: what the active profile has on for it, without the parts of plugins it
 /// has installed natively, which it reads from its own folders.
-pub fn catalogue(library: &Library, agent: Agent) -> Catalogue {
+pub fn catalogue(library: &Library, agent: &Agent) -> Catalogue {
     let profile = library.settings.active();
     let mut catalogue = Catalogue::default();
     for skill in &library.skills {
@@ -51,9 +51,7 @@ pub fn catalogue(library: &Library, agent: Agent) -> Catalogue {
         } else {
             plugin.name.clone()
         };
-        let native = agent
-            .provider()
-            .is_some_and(|p| library.lock.native(&plugin.id).contains(&p));
+        let native = library.lock.native(&plugin.id).contains(agent);
         if native || !profile.is_on(Kind::Plugin, &plugin.id, agent) {
             continue;
         }
@@ -236,7 +234,7 @@ mod tests {
     use super::*;
     use crate::plugins::write_plugin;
     use crate::skills::write_skill;
-    use crate::{Env, PluginPin, Provider};
+    use crate::{Env, PluginPin};
 
     fn library(home: &std::path::Path) -> Library {
         let env = Env::at(home);
@@ -245,7 +243,7 @@ mod tests {
         write_plugin(&env.plugins_dir(), "p@m", false);
         let mut library = Library::load(&env).unwrap();
         let profile = library.settings.active_mut();
-        profile.agents = Agent::ALL.to_vec();
+        profile.agents = Agent::BUILTIN.to_vec();
         profile.set(Kind::Skill, "deploy", Agent::Claude, true);
         profile.set(Kind::Skill, "tidy", Agent::Codex, true);
         profile.set(Kind::Plugin, "p@m", Agent::Claude, true);
@@ -257,36 +255,36 @@ mod tests {
     fn each_agent_gets_what_is_on_for_it() {
         let home = tempfile::tempdir().unwrap();
         let mut library = library(home.path());
-        let claude = catalogue(&library, Agent::Claude);
+        let claude = catalogue(&library, &Agent::Claude);
         let names: Vec<_> = claude.skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["deploy", "p:helper"]);
         let commands: Vec<_> = claude.commands.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(commands, ["p:git:commit", "p:review"]);
         assert_eq!(claude.servers.len(), 1);
-        assert!(catalogue(&library, Agent::Other).skills.is_empty());
+        assert!(catalogue(&library, &Agent::Other).skills.is_empty());
 
         // Codex has the plugin natively, so xolkit serves it only its own skill.
         library.lock.plugins.insert(
             "p@m".into(),
             PluginPin {
-                native: [Provider::Codex].into(),
+                native: [Agent::Codex].into(),
                 ..PluginPin::default()
             },
         );
-        let codex = catalogue(&library, Agent::Codex);
+        let codex = catalogue(&library, &Agent::Codex);
         let names: Vec<_> = codex.skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["tidy"]);
         assert!(codex.servers.is_empty() && codex.commands.is_empty());
 
         // An agent the profile doesn't serve gets nothing.
         library.settings.active_mut().agents = vec![Agent::Codex];
-        assert!(catalogue(&library, Agent::Claude).skills.is_empty());
+        assert!(catalogue(&library, &Agent::Claude).skills.is_empty());
     }
 
     #[test]
     fn instructions_list_skills_within_the_budget() {
         let home = tempfile::tempdir().unwrap();
-        let claude = catalogue(&library(home.path()), Agent::Claude);
+        let claude = catalogue(&library(home.path()), &Agent::Claude);
         let text = claude.instructions();
         assert!(text.contains("- deploy: Does deploy.\n"), "{text}");
         let many = Catalogue {
@@ -314,7 +312,7 @@ mod tests {
     #[test]
     fn finds_by_name_before_description() {
         let home = tempfile::tempdir().unwrap();
-        let claude = catalogue(&library(home.path()), Agent::Claude);
+        let claude = catalogue(&library(home.path()), &Agent::Claude);
         let found = claude.find("review deploy");
         let names: Vec<_> = found
             .iter()
@@ -330,7 +328,7 @@ mod tests {
     #[test]
     fn router_skill_digest_fits_the_limit() {
         let home = tempfile::tempdir().unwrap();
-        let claude = catalogue(&library(home.path()), Agent::Claude);
+        let claude = catalogue(&library(home.path()), &Agent::Claude);
         let text = router_skill(&claude);
         let front = crate::skills::frontmatter(&text);
         assert_eq!(front.name.as_deref(), Some("xolkit"));
