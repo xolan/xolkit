@@ -94,10 +94,11 @@ impl Shelf {
                             .as_ref()
                             .map(|c| c.display().to_string())
                             .unwrap_or_default();
+                        let agent_name = self.settings().agent_name(&s.agent);
                         matches(
                             &filter,
                             &[
-                                s.agent.name(),
+                                &agent_name,
                                 s.client.as_deref().unwrap_or_default(),
                                 &cwd,
                                 &parent_label(s).unwrap_or_default(),
@@ -310,7 +311,7 @@ impl Shelf {
             rows.push(self.row(
                 format!("session-{}", session.id),
                 selected,
-                session.agent.name().to_owned(),
+                self.settings().agent_name(&session.agent),
                 session.client.as_deref(),
                 parts.join(" · "),
                 vec![self.state_pill(session.idle, cx)],
@@ -442,8 +443,9 @@ impl Shelf {
                     cx,
                 )
             }));
+        let agent_name = self.settings().agent_name(&session.agent);
         let mut facts = vec![
-            fact("Agent", session.agent.name().to_owned(), cx),
+            fact("Agent", agent_name.clone(), cx),
             fact(
                 "State",
                 if session.idle {
@@ -475,7 +477,7 @@ impl Shelf {
         }
         Some(self.event_detail(
             format!("Session {id}"),
-            session.agent.name().to_owned(),
+            agent_name,
             disconnect,
             facts,
             events,

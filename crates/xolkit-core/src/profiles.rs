@@ -61,21 +61,21 @@ impl Profile {
         }
     }
 
-    pub fn serves(&self, agent: Agent) -> bool {
-        self.agents.contains(&agent)
+    pub fn serves(&self, agent: &Agent) -> bool {
+        self.agents.contains(agent)
     }
 
     /// Whether the item is switched on for `agent`, whether or not the profile serves the agent.
-    pub fn switched_on(&self, kind: Kind, name: &str, agent: Agent) -> bool {
+    pub fn switched_on(&self, kind: Kind, name: &str, agent: &Agent) -> bool {
         self.items(kind)
             .get(name)
-            .and_then(|states| states.get(&agent))
+            .and_then(|states| states.get(agent))
             .copied()
             .unwrap_or(false)
     }
 
     /// Whether `agent` gets the item: the profile serves the agent and has the item on for it.
-    pub fn is_on(&self, kind: Kind, name: &str, agent: Agent) -> bool {
+    pub fn is_on(&self, kind: Kind, name: &str, agent: &Agent) -> bool {
         self.serves(agent) && self.switched_on(kind, name, agent)
     }
 
@@ -91,18 +91,46 @@ impl Profile {
         self.items_mut(kind).remove(name);
     }
 
-    /// Turns serving `agent` on or off, keeping the agents in display order.
-    pub fn set_agent(&mut self, agent: Agent, on: bool) {
-        self.agents = Agent::ALL
-            .into_iter()
-            .filter(|&a| {
-                if a == agent {
+    /// Drops an agent (e.g. a removed alternative config path) from this profile.
+    pub fn forget_agent(&mut self, agent: &Agent) {
+        self.agents.retain(|a| a != agent);
+        for items in [&mut self.skills, &mut self.plugins, &mut self.servers] {
+            for states in items.values_mut() {
+                states.remove(agent);
+            }
+            items.retain(|_, states| !states.is_empty());
+        }
+    }
+
+    /// Turns serving `agent` on or off, keeping agents in `order`.
+    pub fn set_agent_in_order(&mut self, agent: Agent, on: bool, order: &[Agent]) {
+        self.agents = order
+            .iter()
+            .filter(|a| {
+                if **a == agent {
                     on
                 } else {
-                    self.agents.contains(&a)
+                    self.agents.contains(a)
                 }
             })
+            .cloned()
             .collect();
+    }
+
+    /// Turns serving `agent` on or off, keeping built-in agents in display order with any custom
+    /// agents before `Other`.
+    pub fn set_agent(&mut self, agent: Agent, on: bool) {
+        let mut order: Vec<Agent> = vec![Agent::Claude, Agent::Codex, Agent::Antigravity];
+        for existing in &self.agents {
+            if matches!(existing, Agent::Custom(_)) && !order.contains(existing) {
+                order.push(existing.clone());
+            }
+        }
+        if matches!(&agent, Agent::Custom(_)) && !order.contains(&agent) {
+            order.push(agent.clone());
+        }
+        order.push(Agent::Other);
+        self.set_agent_in_order(agent, on, &order);
     }
 }
 
@@ -113,36 +141,59 @@ mod tests {
     #[test]
     fn items_are_off_until_turned_on_for_a_served_agent() {
         let mut profile = Profile::new("Work", vec![Agent::Claude]);
-        assert!(!profile.is_on(Kind::Skill, "s", Agent::Claude));
+        assert!(!profile.is_on(Kind::Skill, "s", &Agent::Claude));
         profile.set(Kind::Skill, "s", Agent::Claude, true);
         profile.set(Kind::Skill, "s", Agent::Codex, true);
-        assert!(profile.is_on(Kind::Skill, "s", Agent::Claude));
+        assert!(profile.is_on(Kind::Skill, "s", &Agent::Claude));
         // Codex isn't served, so it gets nothing, but the switch is kept for when it is.
-        assert!(!profile.is_on(Kind::Skill, "s", Agent::Codex));
-        assert!(profile.switched_on(Kind::Skill, "s", Agent::Codex));
-        assert!(!profile.is_on(Kind::Server, "s", Agent::Claude));
+        assert!(!profile.is_on(Kind::Skill, "s", &Agent::Codex));
+        assert!(profile.switched_on(Kind::Skill, "s", &Agent::Codex));
+        assert!(!profile.is_on(Kind::Server, "s", &Agent::Claude));
         profile.forget(Kind::Skill, "s");
-        assert!(!profile.switched_on(Kind::Skill, "s", Agent::Claude));
+        assert!(!profile.switched_on(Kind::Skill, "s", &Agent::Claude));
     }
 
     #[test]
     fn agents_stay_in_display_order() {
         let mut profile = Profile::new("p", vec![]);
         profile.set_agent(Agent::Other, true);
+        profile.set_agent(Agent::Custom("claude-two".into()), true);
+        profile.set_agent(Agent::Antigravity, true);
         profile.set_agent(Agent::Claude, true);
-        assert_eq!(profile.agents, [Agent::Claude, Agent::Other]);
+        assert_eq!(
+            profile.agents,
+            [
+                Agent::Claude,
+                Agent::Antigravity,
+                Agent::Custom("claude-two".into()),
+                Agent::Other
+            ]
+        );
         profile.set_agent(Agent::Claude, false);
-        assert_eq!(profile.agents, [Agent::Other]);
+        assert_eq!(
+            profile.agents,
+            [
+                Agent::Antigravity,
+                Agent::Custom("claude-two".into()),
+                Agent::Other
+            ]
+        );
     }
 
     #[test]
     fn saves_agents_by_name() {
         let mut profile = Profile::new("p", vec![Agent::Codex]);
         profile.set(Kind::Plugin, "p@m", Agent::Other, true);
+        profile.set(Kind::Skill, "s", Agent::Custom("claude-two".into()), true);
         let json = serde_json::to_value(&profile).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"name": "p", "agents": ["codex"], "plugins": {"p@m": {"other": true}}})
+            serde_json::json!({
+                "name": "p",
+                "agents": ["codex"],
+                "skills": {"s": {"claude-two": true}},
+                "plugins": {"p@m": {"other": true}}
+            })
         );
         assert_eq!(serde_json::from_value::<Profile>(json).unwrap(), profile);
     }

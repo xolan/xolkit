@@ -183,13 +183,21 @@ pub fn agent_servers(env: &Env, provider: Provider) -> Result<BTreeMap<String, S
                 }
             }
         }
+        Provider::Antigravity => {
+            let json = read_json(&env.antigravity_mcp_config())?;
+            for (name, entry) in json["mcpServers"].as_object().into_iter().flatten() {
+                if let Some(config) = from_json(entry, None) {
+                    servers.insert(name.clone(), config);
+                }
+            }
+        }
     }
     servers.remove(XOLKIT);
     Ok(servers)
 }
 
-/// A server entry in the shape Claude Code's `.mcp.json` and settings use. `root` replaces
-/// `${CLAUDE_PLUGIN_ROOT}`, for servers a plugin brings.
+/// A server entry in the shape Claude Code's `.mcp.json`, Antigravity's `mcp_config.json`, and
+/// settings use. `root` replaces `${CLAUDE_PLUGIN_ROOT}`, for servers a plugin brings.
 pub(crate) fn from_json(entry: &Value, root: Option<&Path>) -> Option<ServerConfig> {
     let expand = |text: &str| match root {
         Some(root) => text.replace("${CLAUDE_PLUGIN_ROOT}", &root.to_string_lossy()),
@@ -203,7 +211,10 @@ pub(crate) fn from_json(entry: &Value, root: Option<&Path>) -> Option<ServerConf
             .filter_map(|(k, v)| Some((k.clone(), expand(v.as_str()?))))
             .collect()
     };
-    let config = if let Some(url) = entry["url"].as_str() {
+    let url = entry["url"]
+        .as_str()
+        .or_else(|| entry["serverUrl"].as_str());
+    let config = if let Some(url) = url {
         ServerConfig {
             url: Some(expand(url)),
             headers: strings(&entry["headers"]),
@@ -311,11 +322,22 @@ mod tests {
             "[mcp_servers.docs]\nurl = \"https://x/mcp\"\nhttp_headers = { Authorization = \"Bearer t\" }\n[mcp_servers.xolkit]\ncommand = \"x\"\n",
         )
         .unwrap();
+        fs::create_dir_all(&env.antigravity_dir).unwrap();
+        fs::write(
+            env.antigravity_mcp_config(),
+            r#"{"mcpServers": {"xolkit": {"command": "xolkit"}, "remote": {"serverUrl": "https://ag.example/mcp", "headers": {"Authorization": "Bearer a"}}, "local": {"command": "node", "args": ["srv.js"]}}}"#,
+        )
+        .unwrap();
         let claude = agent_servers(&env, Provider::Claude).unwrap();
         assert_eq!(claude.keys().collect::<Vec<_>>(), ["fs"]);
         let codex = agent_servers(&env, Provider::Codex).unwrap();
         assert_eq!(codex["docs"].url.as_deref(), Some("https://x/mcp"));
         assert_eq!(codex["docs"].headers["Authorization"], "Bearer t");
         assert_eq!(codex.len(), 1);
+        let ag = agent_servers(&env, Provider::Antigravity).unwrap();
+        assert_eq!(ag.keys().collect::<Vec<_>>(), ["local", "remote"]);
+        assert_eq!(ag["remote"].url.as_deref(), Some("https://ag.example/mcp"));
+        assert_eq!(ag["remote"].headers["Authorization"], "Bearer a");
+        assert_eq!(ag["local"].command.as_deref(), Some("node"));
     }
 }

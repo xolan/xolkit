@@ -12,7 +12,7 @@ use toml_edit::DocumentMut;
 use crate::config::{forget_codex_hooks, read_toml, set_codex_plugin, write_atomic, write_toml};
 use crate::lock::{Lock, Pin, PluginPin};
 use crate::servers::{read_servers, write_servers};
-use crate::{Env, Provider, ServerConfig, Settings};
+use crate::{Agent, Env, Provider, ServerConfig, Settings};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "camelCase")]
@@ -54,7 +54,7 @@ pub enum Action {
     /// Records whether an agent has a plugin installed natively.
     SetNative {
         id: String,
-        provider: Provider,
+        agent: Agent,
         installed: bool,
     },
     /// Adds, replaces or removes a server in `servers.toml`.
@@ -68,25 +68,49 @@ pub enum Action {
     SetCodexPlugin {
         id: String,
         enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<PathBuf>,
     },
     ForgetCodexHooks {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<PathBuf>,
     },
     /// Runs an agent's command-line tool.
     Run {
         provider: Provider,
         args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<PathBuf>,
     },
     /// Turns a plugin on or off in Claude Code. Claude refuses to turn on what is on already, so
     /// a failure counts as done when the plugin is as wanted, or no longer installed.
     SetClaudePlugin {
         id: String,
         enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<PathBuf>,
+    },
+    /// Writes xolkit's MCP server entry directly into a provider's JSON config (Antigravity).
+    SetMcpEntry {
+        provider: Provider,
+        agent: Agent,
+        exe: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<PathBuf>,
+    },
+    /// Removes xolkit's MCP server entry directly from a provider's JSON config (Antigravity).
+    RemoveMcpEntry {
+        provider: Provider,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<PathBuf>,
     },
     /// Takes xolkit's router skill out of an agent's skills folder: its own files only, checked
     /// when it runs, and the folder if nothing else is left in it.
     RemoveRouter {
         provider: Provider,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<PathBuf>,
     },
     /// Runs an agent's tool to take something out. A failure counts as done when the agent no
     /// longer has `gone`: it was removed there already, which mustn't block removing it here.
@@ -94,6 +118,8 @@ pub enum Action {
         provider: Provider,
         args: Vec<String>,
         gone: Gone,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -133,6 +159,14 @@ impl Gone {
 fn agent_absent(env: &Env, provider: Provider) -> bool {
     // A missing folder proves nothing either: a fresh install may not have made it yet.
     env.tool_gone(provider.cli())
+}
+
+fn describe_command(env: &Env, provider: Provider, args: &[String], dir: Option<&Path>) -> String {
+    let prefix = match (dir, provider.config_env_var()) {
+        (Some(dir), Some(var)) => format!("{var}={} ", env.tilde(dir)),
+        _ => String::new(),
+    };
+    format!("{prefix}{} {}", provider.cli(), args.join(" "))
 }
 
 impl Action {
@@ -175,11 +209,11 @@ impl Action {
             }
             Action::SetNative {
                 id,
-                provider,
+                agent,
                 installed,
             } => format!(
                 "Record that {} {} {id}",
-                provider.name(),
+                agent.name(),
                 if *installed { "has" } else { "no longer has" }
             ),
             Action::SaveServer {
@@ -190,28 +224,72 @@ impl Action {
                 format!("Remove server {name} from {}", show(&env.servers_file()))
             }
             Action::SaveSettings { .. } => format!("Save {}", show(&env.settings_file())),
-            Action::RemoveRouter { provider } => {
-                format!("Remove the router skill from {}", provider.name())
+            Action::RemoveRouter { provider, dir } => {
+                let target_env = env.for_dir(*provider, dir.as_deref());
+                format!(
+                    "Remove the router skill from {}",
+                    show(&crate::registration::router_dir(&target_env, *provider))
+                )
             }
-            Action::SetClaudePlugin { id, enabled } => {
-                format!("Turn {} plugin {id} in Claude Code", on_off(enabled))
+            Action::SetClaudePlugin { id, enabled, dir } => match dir {
+                Some(dir) => format!(
+                    "Turn {} plugin {id} in Claude Code ({})",
+                    on_off(enabled),
+                    show(dir)
+                ),
+                None => format!("Turn {} plugin {id} in Claude Code", on_off(enabled)),
+            },
+            Action::SetCodexPlugin { id, enabled, dir } => {
+                let target_env = env.for_dir(Provider::Codex, dir.as_deref());
+                format!(
+                    "Turn {} plugin {id} in {}",
+                    on_off(enabled),
+                    show(&target_env.codex_config())
+                )
             }
-            Action::SetCodexPlugin { id, enabled } => format!(
-                "Turn {} plugin {id} in {}",
-                on_off(enabled),
-                show(&env.codex_config())
-            ),
-            Action::ForgetCodexHooks { id } => format!(
-                "Remove hook trust entries for {id} from {}",
-                show(&env.codex_config())
-            ),
-            Action::Run { provider, args } => {
-                format!("Run `{} {}`", provider.cli(), args.join(" "))
+            Action::ForgetCodexHooks { id, dir } => {
+                let target_env = env.for_dir(Provider::Codex, dir.as_deref());
+                format!(
+                    "Remove hook trust entries for {id} from {}",
+                    show(&target_env.codex_config())
+                )
             }
-            Action::Undo { provider, args, .. } => format!(
-                "Run `{} {}`, if it's still there",
-                provider.cli(),
-                args.join(" ")
+            Action::SetMcpEntry { provider, dir, .. } => {
+                let target_env = env.for_dir(*provider, dir.as_deref());
+                let path = match provider {
+                    Provider::Antigravity => target_env.antigravity_mcp_config(),
+                    Provider::Claude => target_env.claude_json(),
+                    Provider::Codex => target_env.codex_config(),
+                };
+                format!("Add xolkit to {}", show(&path))
+            }
+            Action::RemoveMcpEntry { provider, dir } => {
+                let target_env = env.for_dir(*provider, dir.as_deref());
+                let path = match provider {
+                    Provider::Antigravity => target_env.antigravity_mcp_config(),
+                    Provider::Claude => target_env.claude_json(),
+                    Provider::Codex => target_env.codex_config(),
+                };
+                format!("Remove xolkit from {}", show(&path))
+            }
+            Action::Run {
+                provider,
+                args,
+                dir,
+            } => {
+                format!(
+                    "Run `{}`",
+                    describe_command(env, *provider, args, dir.as_deref())
+                )
+            }
+            Action::Undo {
+                provider,
+                args,
+                dir,
+                ..
+            } => format!(
+                "Run `{}`, if it's still there",
+                describe_command(env, *provider, args, dir.as_deref())
             ),
         }
     }
@@ -292,14 +370,14 @@ fn run(env: &Env, action: &Action) -> Result<()> {
         }),
         Action::SetNative {
             id,
-            provider,
+            agent,
             installed,
         } => Lock::edit(&env.lock_file(), |lock| {
             let entry = lock.plugins.entry(id.clone()).or_default();
             if *installed {
-                entry.native.insert(*provider);
+                entry.native.insert(agent.clone());
             } else {
-                entry.native.remove(provider);
+                entry.native.remove(agent);
             }
         }),
         Action::SaveServer { name, config } => {
@@ -315,49 +393,85 @@ fn run(env: &Env, action: &Action) -> Result<()> {
             write_servers(&env.servers_file(), &servers)
         }
         Action::SaveSettings { settings } => settings.save(&env.settings_file()),
-        Action::SetCodexPlugin { id, enabled } => edit_toml(&env.codex_config(), |doc| {
-            set_codex_plugin(doc, id, *enabled)
-        }),
-        Action::ForgetCodexHooks { id } => edit_toml(&env.codex_config(), |doc| {
-            forget_codex_hooks(doc, id);
-            Ok(())
-        }),
-        Action::Run { provider, args } => env.run(provider.cli(), args).map(drop),
-        Action::RemoveRouter { provider } => crate::write_router(env, *provider, None),
-        Action::SetClaudePlugin { id, enabled } => {
+        Action::SetCodexPlugin { id, enabled, dir } => {
+            let target_env = env.for_dir(Provider::Codex, dir.as_deref());
+            edit_toml(&target_env.codex_config(), |doc| {
+                set_codex_plugin(doc, id, *enabled)
+            })
+        }
+        Action::ForgetCodexHooks { id, dir } => {
+            let target_env = env.for_dir(Provider::Codex, dir.as_deref());
+            edit_toml(&target_env.codex_config(), |doc| {
+                forget_codex_hooks(doc, id);
+                Ok(())
+            })
+        }
+        Action::SetMcpEntry {
+            provider,
+            agent,
+            exe,
+            dir,
+        } => {
+            let target_env = env.for_dir(*provider, dir.as_deref());
+            crate::registration::write_entry_to_config(&target_env, *provider, agent, exe)
+        }
+        Action::RemoveMcpEntry { provider, dir } => {
+            let target_env = env.for_dir(*provider, dir.as_deref());
+            crate::registration::remove_entry_from_config(&target_env, *provider)
+        }
+        Action::Run {
+            provider,
+            args,
+            dir,
+        } => env
+            .for_dir(*provider, dir.as_deref())
+            .run(provider.cli(), args)
+            .map(drop),
+        Action::RemoveRouter { provider, dir } => {
+            let target_env = env.for_dir(*provider, dir.as_deref());
+            crate::write_router(&target_env, *provider, None)
+        }
+        Action::SetClaudePlugin { id, enabled, dir } => {
+            let target_env = env.for_dir(Provider::Claude, dir.as_deref());
             let verb = if *enabled { "enable" } else { "disable" };
             let args = ["plugin", verb, id, "--scope", "user"].map(String::from);
-            match env.run(Provider::Claude.cli(), &args) {
+            match target_env.run(Provider::Claude.cli(), &args) {
                 Ok(_) => Ok(()),
                 // Claude Code is gone; nothing of it runs to switch.
-                Err(_) if agent_absent(env, Provider::Claude) => Ok(()),
-                Err(error) => match crate::marketplace::native_state(env, Provider::Claude, id) {
-                    // Already as wanted; or off and not installed at all.
-                    Ok(Some(on)) if on == *enabled => Ok(()),
-                    Ok(None) if !*enabled => Ok(()),
-                    Ok(None) => Err(anyhow::anyhow!(
-                        "Claude Code no longer has the plugin {id}; install it natively again"
-                    )),
-                    _ => Err(error),
-                },
+                Err(_) if agent_absent(&target_env, Provider::Claude) => Ok(()),
+                Err(error) => {
+                    match crate::marketplace::native_state(&target_env, Provider::Claude, id) {
+                        // Already as wanted; or off and not installed at all.
+                        Ok(Some(on)) if on == *enabled => Ok(()),
+                        Ok(None) if !*enabled => Ok(()),
+                        Ok(None) => Err(anyhow::anyhow!(
+                            "Claude Code no longer has the plugin {id}; install it natively again"
+                        )),
+                        _ => Err(error),
+                    }
+                }
             }
         }
         Action::Undo {
             provider,
             args,
             gone,
-        } => match env.run(provider.cli(), args) {
-            Ok(_) => Ok(()),
-            Err(_) if gone.is_gone(env, *provider) => Ok(()),
-            // The agent's tool couldn't take xolkit's own entry out; take it out of the config.
-            Err(error) if *gone == Gone::McpEntry => {
-                crate::registration::remove_entry_from_config(env, *provider)
-                    .with_context(|| format!("{error:#}"))?;
-                anyhow::ensure!(gone.is_gone(env, *provider), error);
-                Ok(())
+            dir,
+        } => {
+            let target_env = env.for_dir(*provider, dir.as_deref());
+            match target_env.run(provider.cli(), args) {
+                Ok(_) => Ok(()),
+                Err(_) if gone.is_gone(&target_env, *provider) => Ok(()),
+                // The agent's tool couldn't take xolkit's own entry out; take it out of the config.
+                Err(error) if *gone == Gone::McpEntry => {
+                    crate::registration::remove_entry_from_config(&target_env, *provider)
+                        .with_context(|| format!("{error:#}"))?;
+                    anyhow::ensure!(gone.is_gone(&target_env, *provider), error);
+                    Ok(())
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        },
+        }
     }
 }
 
@@ -448,6 +562,7 @@ mod tests {
             Action::Run {
                 provider: Provider::Codex,
                 args: vec!["plugin".into()],
+                dir: None,
             },
         ];
         let json = serde_json::to_string(&actions).unwrap();
@@ -510,7 +625,7 @@ mod tests {
                 },
                 Action::SetNative {
                     id: "p@m".into(),
-                    provider: Provider::Claude,
+                    agent: Agent::Claude,
                     installed: true,
                 },
                 Action::SaveSettings {
@@ -521,7 +636,7 @@ mod tests {
         .unwrap();
         assert_eq!(read_servers(&env.servers_file()).unwrap()["a"], config);
         let lock = Lock::read(&env.lock_file()).unwrap();
-        assert!(lock.native("p@m").contains(&Provider::Claude));
+        assert!(lock.native("p@m").contains(&Agent::Claude));
         assert_eq!(Settings::load(&env.settings_file()).unwrap(), settings);
         execute(
             &env,

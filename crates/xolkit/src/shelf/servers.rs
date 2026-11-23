@@ -17,8 +17,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use xolkit_core::{
-    Action as Step, Kind, Provider, Server, ServerConfig, agent_servers, secret_key,
-    valid_server_name,
+    Action as Step, Kind, Server, ServerConfig, agent_servers, secret_key, valid_server_name,
 };
 use xolkit_daemon::{Client, Request, ServerState, ServerStatus};
 
@@ -266,7 +265,7 @@ impl Shelf {
         let rows: Vec<_> = servers.iter().map(|s| self.server_row(s, cx)).collect();
         let empty = rows.is_empty() && self.filter_text(cx).is_empty();
         let mut columns = self.agent_columns();
-        columns.push("");
+        columns.push(String::new());
         v_flex()
             .size_full()
             .child(
@@ -276,7 +275,7 @@ impl Shelf {
                             .small()
                             .icon(IconName::Copy)
                             .label("Copy from agents…")
-                            .tooltip("Copy servers set up in Claude Code or Codex")
+                            .tooltip("Copy servers set up in Claude Code, Codex, or Antigravity")
                             .disabled(self.busy)
                             .on_click(
                                 cx.listener(|this, _, window, cx| {
@@ -773,12 +772,17 @@ impl Shelf {
     /// Lists the servers set up in the agents' own configs, to copy some into xolkit. Their
     /// values become secrets, since agent configs keep tokens in plain text.
     fn open_copy_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut found: Vec<(Provider, String, ServerConfig)> = Vec::new();
+        let mut found: Vec<(String, String, ServerConfig)> = Vec::new();
         let mut errors = Vec::new();
-        for provider in Provider::ALL {
-            match agent_servers(&self.env, provider) {
-                Ok(servers) => found.extend(servers.into_iter().map(|(n, c)| (provider, n, c))),
-                Err(e) => errors.push(format!("{}: {e:#}", provider.name())),
+        for target in self.settings().targets(&self.env) {
+            let target_env = self.env.for_target(&target);
+            match agent_servers(&target_env, target.provider) {
+                Ok(servers) => found.extend(
+                    servers
+                        .into_iter()
+                        .map(|(n, c)| (target.label.clone(), n, c)),
+                ),
+                Err(e) => errors.push(format!("{}: {e:#}", target.name)),
             }
         }
         let taken: Vec<String> = self
@@ -808,14 +812,13 @@ impl Shelf {
                     found
                         .iter()
                         .enumerate()
-                        .map(|(ix, (provider, name, config))| {
+                        .map(|(ix, (source_label, name, config))| {
                             let picked = picked.clone();
                             let checked = picked.read(cx)[ix];
                             Checkbox::new(SharedString::from(format!("copy-{ix}")))
                                 .label(format!(
-                                    "{name} ({}, from {})",
+                                    "{name} ({}, from {source_label})",
                                     config.kind(),
-                                    provider.label()
                                 ))
                                 .checked(checked)
                                 .on_change(move |on: &bool, _, cx| {

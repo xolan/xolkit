@@ -16,8 +16,8 @@ use rmcp::ServiceExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::sync::watch;
 use xolkit_core::{
-    Agent, Catalogue, Env, Library, Provider, catalogue, execute, router_is_ours, router_skill,
-    set_secret, write_router,
+    Agent, Catalogue, Env, Library, catalogue, execute, router_is_ours, router_skill, set_secret,
+    write_router,
 };
 
 use crate::gateway::{Gateway, Notice};
@@ -157,7 +157,7 @@ impl Daemon {
         self.library.read().unwrap().clone()
     }
 
-    pub(crate) fn catalogue(&self, agent: Agent) -> Catalogue {
+    pub(crate) fn catalogue(&self, agent: &Agent) -> Catalogue {
         catalogue(&self.library(), agent)
     }
 
@@ -274,8 +274,8 @@ impl Daemon {
             }
         }
         let mut wanted = Vec::new();
-        for agent in Agent::ALL {
-            for server in catalogue(&library, agent).servers {
+        for agent in library.settings.known_agents() {
+            for server in catalogue(&library, &agent).servers {
                 if !wanted
                     .iter()
                     .any(|s: &xolkit_core::Server| s.name == server.name)
@@ -285,16 +285,17 @@ impl Daemon {
             }
         }
         self.gateway().sync(wanted);
-        for provider in Provider::ALL {
-            let on = library.settings.router.contains(&provider);
-            let skill = on.then(|| router_skill(&catalogue(&library, Agent::from(provider))));
-            if !on && !router_is_ours(&self.env, provider) {
+        for target in library.settings.targets(&self.env) {
+            let target_env = self.env.for_target(&target);
+            let on = library.settings.router.contains(&target.agent);
+            let skill = on.then(|| router_skill(&catalogue(&library, &target.agent)));
+            if !on && !router_is_ours(&target_env, target.provider) {
                 continue;
             }
-            if let Err(e) = write_router(&self.env, provider, skill.as_deref()) {
+            if let Err(e) = write_router(&target_env, target.provider, skill.as_deref()) {
                 self.event(
                     "daemon",
-                    format!("router skill for {}: {e:#}", provider.name()),
+                    format!("router skill for {}: {e:#}", target.name),
                     true,
                 );
             }
@@ -687,7 +688,7 @@ impl Daemon {
                 Some(status) => {
                     status.idle = false;
                     status.since = now();
-                    status.agent = agent;
+                    status.agent = agent.clone();
                     status.cwd = cwd.clone();
                     status.parent = parent.clone();
                     (status.id, true)
@@ -696,7 +697,7 @@ impl Daemon {
                     let id = self.next_session.fetch_add(1, Ordering::SeqCst);
                     let status = SessionStatus {
                         id,
-                        agent,
+                        agent: agent.clone(),
                         client: None,
                         pid,
                         cwd: cwd.clone(),
@@ -722,7 +723,8 @@ impl Daemon {
             let place = cwd
                 .map(|c| format!(" in {}", self.env.tilde(&c)))
                 .unwrap_or_default();
-            self.event(&source, format!("{} connected{place}", agent.name()), false);
+            let name = self.library().settings.agent_name(&agent);
+            self.event(&source, format!("{name} connected{place}"), false);
         }
         let session = Session {
             daemon: self.clone(),

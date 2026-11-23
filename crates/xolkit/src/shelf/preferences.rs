@@ -1,8 +1,9 @@
 //! The Settings page: the agents xolkit is registered with, GitHub access, the daemon, the
 //! theme, and about.
 
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, IconName, Sizable, StyledExt, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, WindowExt,
     button::{Button, ButtonVariant, ButtonVariants},
     h_flex,
     input::Input,
@@ -17,8 +18,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use xolkit_core::{
-    GITHUB_TOKEN, GitHubAccess, Provider, Registration, get_secret, github_rate_limit, register,
-    unregister,
+    Action as Step, Agent, GITHUB_TOKEN, GitHubAccess, Provider, Registration, Target, get_secret,
+    github_rate_limit, register, unregister,
 };
 use xolkit_daemon::Request;
 
@@ -130,19 +131,19 @@ impl Shelf {
         self.check_access(cx);
     }
 
-    /// Asks to register xolkit with an agent, or to take everything xolkit wrote out of it.
+    /// Asks to register xolkit with an agent target, or to take everything xolkit wrote out of it.
     fn confirm_registration(
         &mut self,
-        provider: Provider,
+        target: Target,
         on: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let exe = self.exe(cx);
         let steps = if on {
-            register(&self.env, provider, &exe)
+            register(&self.env, &target, &exe)
         } else {
-            unregister(&self.env, provider, &self.library.lock, self.settings())
+            unregister(&self.env, &target, &self.library.lock, self.settings())
         };
         if steps.is_empty() {
             return;
@@ -150,15 +151,15 @@ impl Shelf {
         let lines: Vec<String> = steps.iter().map(|s| s.describe(&self.env)).collect();
         let (title, ok, done) = if on {
             (
-                format!("Register xolkit with {}?", provider.name()),
+                format!("Register xolkit with {}?", target.name),
                 "Register",
-                format!("Registered with {}", provider.name()),
+                format!("Registered with {}", target.name),
             )
         } else {
             (
-                format!("Unregister xolkit from {}?", provider.name()),
+                format!("Unregister xolkit from {}?", target.name),
                 "Unregister",
-                format!("Unregistered from {}", provider.name()),
+                format!("Unregistered from {}", target.name),
             )
         };
         let note = if on {
@@ -204,123 +205,452 @@ impl Shelf {
 
     fn set_router(
         &mut self,
-        provider: Provider,
+        agent: Agent,
         on: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let mut settings = self.settings().clone();
-        settings.router.retain(|p| *p != provider);
+        settings.router.retain(|a| a != &agent);
         if on {
-            settings.router.push(provider);
-            settings.router.sort();
+            let order = settings.known_agents();
+            settings.router.push(agent);
+            settings.router.sort_by_key(|a| {
+                order
+                    .iter()
+                    .position(|o| o == a)
+                    .unwrap_or(usize::MAX)
+            });
         }
         self.save_settings(settings, Vec::new(), None, window, cx);
     }
 
-    /// Registration, router skill and where it was found, for each agent xolkit registers with.
-    fn registration_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// One registration + router-skill row for a built-in provider or an alternative config path.
+    fn target_row(
+        &self,
+        target: Target,
+        custom_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().clone();
-        Provider::ALL
-            .into_iter()
-            .map(|provider| {
-                let found = self.found.get(&provider);
-                let state = self
-                    .registrations
-                    .get(&provider)
-                    .cloned()
-                    .unwrap_or(Registration::Missing);
-                let (text, color) = match &state {
-                    Registration::Current => ("Registered".to_owned(), theme.success),
-                    Registration::Missing => ("Not registered".to_owned(), theme.muted_foreground),
-                    Registration::Other(command) => (
-                        format!("Registered to start {command}; register again to use this copy"),
-                        theme.warning,
-                    ),
-                };
-                let place = match found {
-                    Some(place) => format!("Found at {}", self.env.tilde(place)),
-                    None => "Not found on this computer".to_owned(),
-                };
-                let registered = state != Registration::Missing;
-                let router_on = self.settings().router.contains(&provider);
-                v_flex()
+        let found = self.found.get(&target.agent);
+        let state = self
+            .registrations
+            .get(&target.agent)
+            .cloned()
+            .unwrap_or(Registration::Missing);
+        let (text, color) = match &state {
+            Registration::Current => ("Registered".to_owned(), theme.success),
+            Registration::Missing => ("Not registered".to_owned(), theme.muted_foreground),
+            Registration::Other(command) => (
+                format!("Registered to start {command}; register again to use this copy"),
+                theme.warning,
+            ),
+        };
+        let place = match (found, custom_index) {
+            (Some(place), Some(_)) => format!(
+                "{} · Found at {}",
+                target.provider.name(),
+                self.env.tilde(place)
+            ),
+            (None, Some(_)) => format!(
+                "{} · {} (folder not created yet)",
+                target.provider.name(),
+                self.env.tilde(&target.dir)
+            ),
+            (Some(place), None) => format!("Found at {}", self.env.tilde(place)),
+            (None, None) => "Not found on this computer".to_owned(),
+        };
+        let can_register = if custom_index.is_some() {
+            target.provider == Provider::Antigravity
+                || found.is_some()
+                || self
+                    .found
+                    .contains_key(&Agent::from(target.provider))
+        } else {
+            found.is_some()
+        };
+        let registered = state != Registration::Missing;
+        let router_on = self.settings().router.contains(&target.agent);
+        let key = target.agent.key().to_owned();
+        let router_agent = target.agent.clone();
+        let register_target = target.clone();
+        let unregister_target = target.clone();
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
                     .gap_2()
                     .child(
-                        h_flex()
-                            .gap_3()
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().font_medium().child(target.name.clone()))
                             .child(
-                                v_flex()
-                                    .flex_1()
-                                    .child(div().font_medium().child(provider.name()))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(place),
-                                    )
-                                    .child(div().text_sm().text_color(color).child(text)),
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .truncate()
+                                    .child(place),
                             )
-                            .when(state != Registration::Current, |this| {
-                                this.child(
-                                    Button::new(SharedString::from(format!(
-                                        "register-{}",
-                                        provider.cli()
-                                    )))
-                                    .small()
-                                    .primary()
-                                    .label("Register…")
-                                    .disabled(self.busy || found.is_none())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.confirm_registration(provider, true, window, cx)
-                                    })),
-                                )
-                            })
-                            .when(registered, |this| {
-                                this.child(
-                                    Button::new(SharedString::from(format!(
-                                        "unregister-{}",
-                                        provider.cli()
-                                    )))
-                                    .small()
-                                    .ghost()
-                                    .label("Unregister…")
-                                    .disabled(self.busy)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.confirm_registration(provider, false, window, cx)
-                                    })),
-                                )
-                            }),
+                            .child(div().text_sm().text_color(color).child(text)),
                     )
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .pl_4()
-                            .child(
-                                Switch::new(SharedString::from(format!(
-                                    "router-{}",
-                                    provider.cli()
-                                )))
+                    .when(state != Registration::Current, |this| {
+                        this.child(
+                            Button::new(SharedString::from(format!("register-{key}")))
                                 .small()
-                                .checked(router_on)
+                                .primary()
+                                .label("Register…")
+                                .disabled(self.busy || !can_register)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.confirm_registration(
+                                        register_target.clone(),
+                                        true,
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        )
+                    })
+                    .when(registered, |this| {
+                        this.child(
+                            Button::new(SharedString::from(format!("unregister-{key}")))
+                                .small()
+                                .ghost()
+                                .label("Unregister…")
                                 .disabled(self.busy)
-                                .on_change(cx.listener(
-                                    move |this, on: &bool, window, cx| {
-                                        this.set_router(provider, *on, window, cx)
-                                    },
-                                )),
-                            )
-                            .child(v_flex().child(div().text_sm().child("Router skill")).child(
-                                div().text_xs().text_color(theme.muted_foreground).child(
-                                    "One xolkit skill in the agent's skills folder whose \
-                                         description lists what your skills are for. Turn it on \
-                                         if the agent misses skills it should use.",
-                                ),
-                            )),
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.confirm_registration(
+                                        unregister_target.clone(),
+                                        false,
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        )
+                    })
+                    .when_some(custom_index, |this, ix| {
+                        this.child(
+                            Button::new(SharedString::from(format!("edit-custom-{key}")))
+                                .small()
+                                .ghost()
+                                .icon(Icon::new(Lucide::Pencil))
+                                .tooltip("Edit config path")
+                                .disabled(self.busy)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_custom_agent_dialog(Some(ix), window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("remove-custom-{key}")))
+                                .small()
+                                .ghost()
+                                .icon(Lucide::Trash)
+                                .tooltip("Remove config path")
+                                .disabled(self.busy)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.confirm_remove_custom_agent(ix, window, cx)
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .pl_4()
+                    .child(
+                        Switch::new(SharedString::from(format!("router-{key}")))
+                            .small()
+                            .checked(router_on)
+                            .disabled(self.busy)
+                            .on_change(cx.listener(move |this, on: &bool, window, cx| {
+                                this.set_router(router_agent.clone(), *on, window, cx)
+                            })),
                     )
-                    .into_any_element()
+                    .child(v_flex().child(div().text_sm().child("Router skill")).child(
+                        div().text_xs().text_color(theme.muted_foreground).child(
+                            "One xolkit skill in the agent's skills folder whose \
+                             description lists what your skills are for. Turn it on \
+                             if the agent misses skills it should use.",
+                        ),
+                    )),
+            )
+            .into_any_element()
+    }
+
+    /// Registration, router skill and where it was found, for each built-in provider.
+    fn registration_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        Provider::ALL
+            .into_iter()
+            .map(|provider| self.target_row(Target::builtin(&self.env, provider), None, cx))
+            .collect()
+    }
+
+    /// Registration, router skill and actions for each user-configured alternative config path.
+    fn custom_agent_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        self.settings()
+            .custom_agents
+            .iter()
+            .enumerate()
+            .map(|(ix, custom)| {
+                self.target_row(Target::custom(&self.env, custom), Some(ix), cx)
             })
             .collect()
+    }
+
+    /// Opens the dialog to add an alternative config path, or edit an existing one.
+    fn open_custom_agent_dialog(
+        &mut self,
+        editing: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = editing.and_then(|ix| self.settings().custom_agents.get(ix).cloned());
+        if editing.is_some() && existing.is_none() {
+            return;
+        }
+        let initial_provider = existing
+            .as_ref()
+            .map_or(Provider::Claude, |c| c.provider);
+        let initial_name = existing
+            .as_ref()
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let initial_dir = existing
+            .as_ref()
+            .map(|c| c.dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        let name_input = self.custom_agent_name.clone();
+        let dir_input = self.custom_agent_dir.clone();
+        name_input.update(cx, |input, cx| input.set_value(initial_name, window, cx));
+        dir_input.update(cx, |input, cx| input.set_value(initial_dir, window, cx));
+
+        let selected_provider = cx.new(|_| initial_provider);
+        let title = if editing.is_some() {
+            "Edit config path"
+        } else {
+            "Add alternative config path"
+        };
+        let ok_text = if editing.is_some() { "Save" } else { "Add" };
+        let shelf = cx.entity();
+        let env = self.env.clone();
+
+        window.open_alert_dialog(cx, {
+            let name_input = name_input.clone();
+            let dir_input = dir_input.clone();
+            move |alert, _, cx| {
+                let muted = cx.theme().muted_foreground;
+                let provider = *selected_provider.read(cx);
+                let selected_ix = Provider::ALL.iter().position(|p| *p == provider);
+                let dir_hint = match provider {
+                    Provider::Claude => {
+                        "Set CLAUDE_CONFIG_DIR to this folder when launching Claude Code (e.g. ~/.claude-work)."
+                    }
+                    Provider::Codex => {
+                        "Set CODEX_HOME to this folder when launching Codex CLI (e.g. ~/.codex-work)."
+                    }
+                    Provider::Antigravity => {
+                        "An alternative Antigravity directory containing mcp_config.json and skills/."
+                    }
+                };
+                let (name_input, dir_input, selected_provider, shelf, env) = (
+                    name_input.clone(),
+                    dir_input.clone(),
+                    selected_provider.clone(),
+                    shelf.clone(),
+                    env.clone(),
+                );
+                let browse_input = dir_input.clone();
+                let browse_env = env.clone();
+                alert
+                    .title(title)
+                    .width(px(560.))
+                    .description(
+                        v_flex()
+                            .gap_3()
+                            .child(div().text_sm().font_medium().child("Agent"))
+                            .child(
+                                RadioGroup::horizontal("custom-agent-provider")
+                                    .children(Provider::ALL.map(|p| {
+                                        let label = p.name();
+                                        Radio::new(label)
+                                            .accessibility_label(label)
+                                            .child(div().line_height(icon_line()).child(label))
+                                    }))
+                                    .selected_index(selected_ix)
+                                    .on_change({
+                                        let selected_provider = selected_provider.clone();
+                                        move |ix: &usize, _, cx| {
+                                            selected_provider.update(cx, |state, cx| {
+                                                *state = Provider::ALL[*ix];
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(div().text_sm().font_medium().child("Name"))
+                            .child(Input::new(&name_input))
+                            .child(div().text_sm().font_medium().child("Config folder"))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(div().flex_1().child(Input::new(&dir_input)))
+                                    .child(
+                                        Button::new("browse-custom-dir")
+                                            .small()
+                                            .icon(IconName::FolderOpen)
+                                            .label("Browse…")
+                                            .on_click(move |_, window, cx| {
+                                                let paths = cx.prompt_for_paths(PathPromptOptions {
+                                                    files: false,
+                                                    directories: true,
+                                                    multiple: false,
+                                                    prompt: Some("Select config folder".into()),
+                                                });
+                                                let browse_input = browse_input.clone();
+                                                let browse_env = browse_env.clone();
+                                                window
+                                                    .spawn(cx, async move |cx| {
+                                                        let Ok(Ok(Some(paths))) = paths.await
+                                                        else {
+                                                            return;
+                                                        };
+                                                        let Some(path) = paths.into_iter().next()
+                                                        else {
+                                                            return;
+                                                        };
+                                                        let display = browse_env.tilde(&path);
+                                                        let _ = cx.update(|window, cx| {
+                                                            browse_input.update(cx, |input, cx| {
+                                                                input.set_value(
+                                                                    display, window, cx,
+                                                                );
+                                                            });
+                                                        });
+                                                    })
+                                                    .detach();
+                                            }),
+                                    ),
+                            )
+                            .child(div().text_xs().text_color(muted).child(dir_hint)),
+                    )
+                    .show_cancel(true)
+                    .ok_text(ok_text)
+                    .on_ok(move |_, window, cx| {
+                        let name = name_input.read(cx).value().to_string();
+                        let dir_text = dir_input.read(cx).value().trim().to_owned();
+                        let provider = *selected_provider.read(cx);
+                        shelf.update(cx, |shelf, cx| {
+                            shelf.save_custom_agent(
+                                editing,
+                                &name,
+                                provider,
+                                &dir_text,
+                                window,
+                                cx,
+                            )
+                        })
+                    })
+            }
+        });
+        window.defer(cx, move |window, cx| {
+            name_input.update(cx, |input, cx| input.focus(window, cx))
+        });
+    }
+
+    fn save_custom_agent(
+        &mut self,
+        editing: Option<usize>,
+        name: &str,
+        provider: Provider,
+        dir: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut settings = self.settings().clone();
+        let result = match editing {
+            Some(ix) => settings.update_custom_agent(&self.env, ix, name, provider, dir),
+            None => settings
+                .add_custom_agent(&self.env, name, provider, dir)
+                .map(|ix| {
+                    let agent = Agent::Custom(settings.custom_agents[ix].id.clone());
+                    let order = settings.known_agents();
+                    settings.active_mut().set_agent_in_order(agent, true, &order);
+                }),
+        };
+        if let Err(e) = result {
+            window.push_notification(Notification::error(format!("{e:#}")), cx);
+            return false;
+        }
+        let done = if editing.is_some() {
+            format!("Updated {}", name.trim())
+        } else {
+            format!("Added {}", name.trim())
+        };
+        self.save_settings(settings, Vec::new(), Some(done.into()), window, cx);
+        true
+    }
+
+    fn confirm_remove_custom_agent(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(custom) = self.settings().custom_agents.get(ix).cloned() else {
+            return;
+        };
+        let target = Target::custom(&self.env, &custom);
+        let mut steps = unregister(&self.env, &target, &self.library.lock, self.settings());
+        // Replace any intermediate SaveSettings from unregister with the final settings that also
+        // remove the custom agent entry and its profile switches.
+        steps.retain(|step| !matches!(step, Step::SaveSettings { .. }));
+        let mut next_settings = self.settings().clone();
+        if next_settings.remove_custom_agent(ix).is_none() {
+            return;
+        }
+        steps.push(Step::SaveSettings {
+            settings: Box::new(next_settings),
+        });
+        let lines: Vec<String> = steps.iter().map(|s| s.describe(&self.env)).collect();
+        let title = format!("Remove “{}”?", custom.name);
+        let done = format!("Removed {}", custom.name);
+        let shelf = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let theme = cx.theme();
+            let (shelf, steps, done) = (shelf.clone(), steps.clone(), done.clone());
+            alert
+                .title(title.clone())
+                .width(px(640.))
+                .description(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            "Removes this alternative config path from xolkit and takes out \
+                             anything xolkit wrote there.",
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .p_2()
+                                .rounded(theme.radius)
+                                .bg(theme.muted)
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .children(lines.clone()),
+                        ),
+                )
+                .show_cancel(true)
+                .ok_text("Remove")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    shelf.update(cx, |shelf, cx| {
+                        shelf.run(steps.clone(), Some(done.clone().into()), window, cx)
+                    });
+                    true
+                })
+        });
     }
 
     fn set_idle(&mut self, minutes: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -399,6 +729,7 @@ impl Shelf {
                             .on_click(|_, _, cx| cx.open_url(NEW_TOKEN_URL)),
                     ),
                 );
+        let custom_rows = self.custom_agent_rows(cx);
         v_flex()
             .size_full()
             .child(
@@ -431,13 +762,43 @@ impl Shelf {
                             .max_w(px(680.))
                             .child(section("Agents"))
                             .child(div().text_sm().text_color(muted).child(
-                                "Registering adds one MCP server entry to the agent's own config, \
-                                 through its own tool. Skills, plugins and servers then reach the \
-                                 agent through xolkit; nothing else in its folders changes, \
-                                 unless you turn on the router skill or install a plugin natively.",
+                                "Registering adds one MCP server entry to the agent's own config. \
+                                 Skills, plugins and servers then reach the agent through xolkit; \
+                                 nothing else in its folders changes, unless you turn on the \
+                                 router skill or install a plugin natively.",
                             ))
                             .child(v_flex().gap_4().children(self.registration_rows(cx)))
-                            .child(div().text_sm().font_medium().child("Other MCP clients"))
+                            .child(
+                                h_flex()
+                                    .pt_2()
+                                    .justify_between()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_medium()
+                                            .child("Alternative config paths"),
+                                    )
+                                    .child(
+                                        Button::new("add-custom-agent")
+                                            .small()
+                                            .icon(IconName::Plus)
+                                            .label("Add config path…")
+                                            .disabled(self.busy)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.open_custom_agent_dialog(None, window, cx)
+                                            })),
+                                    ),
+                            )
+                            .child(div().text_sm().text_color(muted).child(
+                                "Point xolkit at additional config directories for Claude Code \
+                                 (CLAUDE_CONFIG_DIR), Codex CLI (CODEX_HOME), or Antigravity. \
+                                 Each path gets its own switches, registration and router skill.",
+                            ))
+                            .when(!custom_rows.is_empty(), |this| {
+                                this.child(v_flex().gap_4().children(custom_rows))
+                            })
+                            .child(div().pt_2().text_sm().font_medium().child("Other MCP clients"))
                             .child(div().text_sm().text_color(muted).child(
                                 "Any other agent that speaks MCP can use xolkit: add a stdio \
                                  server that runs this command. It gets the Other switches.",
@@ -475,6 +836,7 @@ impl Shelf {
                             )
                             .child(
                                 div()
+                                    .pt_2()
                                     .text_sm()
                                     .font_medium()
                                     .child("Served by the active profile"),

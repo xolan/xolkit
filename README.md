@@ -9,10 +9,10 @@
 
 One library of skills, plugins and MCP servers, served to every coding agent you use.
 
-xolkit keeps everything in `~/.xolkit` and serves it to Claude Code, Codex CLI and any other
-agent that speaks [MCP](https://modelcontextprotocol.io). You install a skill once. Profiles
-decide which agent gets what, and switching profiles takes effect at once, even in sessions
-that are already open.
+xolkit keeps everything in `~/.xolkit` and serves it to Claude Code, Codex CLI, Antigravity and
+any other agent that speaks [MCP](https://modelcontextprotocol.io). You install a skill once.
+Profiles decide which agent gets what, and switching profiles takes effect at once, even in
+sessions that are already open.
 
 The agents' own folders stay as they are. xolkit adds one MCP server entry to each agent you
 register it with, and writes anything else there only when you ask: an optional router skill,
@@ -38,7 +38,7 @@ Builds for Linux, Windows and macOS (Intel and Apple Silicon).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/design/architecture.png">
-  <img src="assets/design/architecture-light.png" alt="How xolkit fits together: agent sessions start the xolkit mcp shim, which connects to the xolkit daemon. The daemon serves skills and prompts, passes on tools of MCP servers, keeps a log, and installs native plugins through the agents' own tools. Everything lives in ~/.xolkit; xolkit writes only an MCP server entry, an optional router skill and native plugins into ~/.claude and ~/.codex.">
+  <img src="assets/design/architecture-light.png" alt="How xolkit fits together: agent sessions start the xolkit mcp shim, which connects to the xolkit daemon. The daemon serves skills and prompts, passes on tools of MCP servers, keeps a log, and installs native plugins through the agents' own tools. Everything lives in ~/.xolkit; xolkit writes only an MCP server entry, an optional router skill and native plugins into ~/.claude, ~/.codex, and ~/.gemini/antigravity.">
 </picture>
 
 ## How it works
@@ -71,10 +71,17 @@ How a skill reaches an agent:
 
 ### Agents
 
-Under Settings → Agents, **Register** adds xolkit to an agent, with the agent's own tool:
-`claude mcp add --scope user xolkit -- <xolkit> mcp --agent claude`, and `codex mcp add` for
-Codex. **Unregister** takes out everything xolkit wrote there: that entry, the router skill and
-the plugins it installed natively.
+Under Settings → Agents, **Register** adds xolkit to an agent: `claude mcp add --scope user
+xolkit -- <xolkit> mcp --agent claude` for Claude Code, `codex mcp add` for Codex CLI, and an
+entry in `~/.gemini/antigravity/mcp_config.json` for Antigravity. **Unregister** takes out
+everything xolkit wrote there: that entry, the router skill and any plugins it installed
+natively.
+
+If you run multiple accounts or configurations with custom folders (such as
+`CLAUDE_CONFIG_DIR=~/.claude-work`, `CODEX_HOME=~/.codex-work`, or another Antigravity folder),
+add them under **Alternative config paths** in Settings → Agents. Each entry gets its own
+switches, registration, router skill, and (for Claude Code and Codex CLI) native plugin
+installs.
 
 Any other agent that speaks MCP can use xolkit too: add a stdio server that runs `xolkit mcp`.
 Its sessions get the **Other** switches.
@@ -104,8 +111,9 @@ native installs and keep profile switches. Use **Reload** to check again.
 Add a server by the command that starts it or by its URL. xolkit starts local servers itself and
 keeps one connection to each remote server, shared by every session. Agents see a server's tools
 as `<server>__<tool>`; in Claude Code that reads `mcp__xolkit__github__create_issue`. A name too
-long for agents to accept is shortened. Servers you already set up in Claude Code or Codex stay
-there; **Copy from agents** adds copies to xolkit, moving their values into the OS keyring.
+long for agents to accept is shortened. Servers you already set up in Claude Code, Codex or
+Antigravity stay there; **Copy from agents** adds copies to xolkit, moving their values into the
+OS keyring.
 
 Remote servers take headers, such as `Authorization: Bearer …`, or a sign-in in a browser
 (OAuth). A remote server without secrets that asks for a sign-in shows **needs sign-in**;
@@ -214,7 +222,7 @@ is `x86_64` if `dpkg --print-architecture` says `amd64`, or `aarch64` if it says
 folder you downloaded them to, set `version` and `arch` to the ones you picked and run:
 
 ```bash
-version=3.2.8
+version=3.3.0
 arch=x86_64
 name=xolkit-$version-$arch-unknown-linux-gnu.deb
 sha256sum -c "$name.sha256" && sudo apt install "./$name"

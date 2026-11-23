@@ -10,9 +10,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use xolkit_core::{
-    Action as Step, Agent, Env, FetchedPlugin, FetchedSkill, Kind, Lock, Plugin, Provider,
-    Settings, Skill, install_plugin, install_skill, native_install, native_toggle,
-    uninstall_plugin, uninstall_skill, update_plugin, update_skill,
+    Action as Step, Agent, Env, FetchedPlugin, FetchedSkill, Kind, Lock, Plugin, Settings, Skill,
+    Target, install_plugin, install_skill, native_install, native_toggle, uninstall_plugin,
+    uninstall_skill, update_plugin, update_skill,
 };
 
 use super::discover::is_code;
@@ -32,7 +32,7 @@ pub(super) enum Change {
     /// Installs an installed plugin natively in one more agent.
     NativeInstall {
         plugin: Plugin,
-        provider: Provider,
+        target: Target,
     },
 }
 
@@ -80,15 +80,15 @@ pub(super) struct ChangeForm {
 
 impl ChangeForm {
     fn steps(&self) -> Result<Vec<Step>> {
-        let chosen: Vec<Agent> = self.chosen.iter().copied().collect();
+        let chosen: Vec<Agent> = self.chosen.iter().cloned().collect();
         Ok(match &self.change {
             Change::InstallSkill(skill) => {
                 let mut steps = install_skill(&self.env, skill)?;
                 let mut settings = self.settings.clone();
-                for &agent in &chosen {
+                for agent in &chosen {
                     settings
                         .active_mut()
-                        .set(Kind::Skill, &skill.name, agent, true);
+                        .set(Kind::Skill, &skill.name, agent.clone(), true);
                 }
                 steps.push(Step::SaveSettings {
                     settings: Box::new(settings),
@@ -108,16 +108,15 @@ impl ChangeForm {
             Change::UninstallPlugin(plugin) => {
                 uninstall_plugin(&self.env, &self.settings, &self.lock, plugin)
             }
-            Change::NativeInstall { plugin, provider } => {
-                let mut steps = native_install(&self.env, &self.lock, plugin, *provider)?;
+            Change::NativeInstall { plugin, target } => {
+                let mut steps = native_install(&self.env, &self.lock, plugin, target)?;
                 // Installed natively, it is on there; match what the profile has.
-                let agent = Agent::from(*provider);
                 if !self
                     .settings
                     .active()
-                    .is_on(Kind::Plugin, &plugin.id, agent)
+                    .is_on(Kind::Plugin, &plugin.id, &target.agent)
                 {
-                    steps.push(native_toggle(plugin, *provider, false));
+                    steps.push(native_toggle(plugin, target, false));
                 }
                 steps
             }
@@ -154,20 +153,27 @@ impl Render for ChangeForm {
                 } else {
                     "Turn it on in the active profile for:"
                 };
-                this.child(div().text_sm().child(note))
-                    .child(h_flex().gap_4().children(self.agents.iter().map(|&agent| {
-                        Checkbox::new(SharedString::from(format!("change-{}", agent.key())))
-                            .label(agent.label())
-                            .checked(self.chosen.contains(&agent))
-                            .on_change(cx.listener(move |this, on: &bool, _, cx| {
-                                if *on {
-                                    this.chosen.insert(agent);
-                                } else {
-                                    this.chosen.remove(&agent);
-                                }
-                                cx.notify();
-                            }))
-                    })))
+                this.child(div().text_sm().child(note)).child(
+                    h_flex()
+                        .gap_4()
+                        .flex_wrap()
+                        .children(self.agents.iter().map(|agent| {
+                            let label = self.settings.agent_label(agent);
+                            let checked = self.chosen.contains(agent);
+                            let agent = agent.clone();
+                            Checkbox::new(SharedString::from(format!("change-{}", agent.key())))
+                                .label(label)
+                                .checked(checked)
+                                .on_change(cx.listener(move |this, on: &bool, _, cx| {
+                                    if *on {
+                                        this.chosen.insert(agent.clone());
+                                    } else {
+                                        this.chosen.remove(&agent);
+                                    }
+                                    cx.notify();
+                                }))
+                        })),
+                )
             })
             .when_some(native_note, |this, note| {
                 this.child(div().text_sm().text_color(theme.warning).child(note))
@@ -226,10 +232,9 @@ pub(super) fn open_change_dialog(
         Change::UpdateSkill { .. } | Change::UpdatePlugin(_) => {
             ("Update", format!("Updated {name}"))
         }
-        Change::NativeInstall { provider, .. } => (
-            "Install",
-            format!("Installed {name} in {}", provider.name()),
-        ),
+        Change::NativeInstall { target, .. } => {
+            ("Install", format!("Installed {name} in {}", target.name))
+        }
         _ if installs => ("Install", format!("Installed {name}")),
         _ => ("Uninstall", format!("Uninstalled {name}")),
     };
@@ -240,7 +245,7 @@ pub(super) fn open_change_dialog(
         change,
         settings: shelf.library.settings.clone(),
         lock: shelf.library.lock.clone(),
-        chosen: agents.iter().copied().collect(),
+        chosen: agents.iter().cloned().collect(),
         agents,
     });
     let shelf = cx.entity();

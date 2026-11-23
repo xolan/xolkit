@@ -1,17 +1,21 @@
 //! `~/.xolkit/settings.json`: the profiles, the active one, and the app's choices. Secrets are
 //! never here, so the file can live in a dotfiles repository.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::config::{read_json, write_json};
-use crate::{Agent, Profile, Provider};
+use crate::{
+    Agent, CustomAgent, Env, Profile, Provider, Target, slug_agent_id, valid_custom_agent_id,
+};
 
 pub const DEFAULT_PROFILE: &str = "Default";
 const MAX_NAME: usize = 40;
+const MAX_CUSTOM_AGENT_NAME: usize = 32;
 const DEFAULT_IDLE_MINUTES: u64 = 5;
 const DEFAULT_SESSION_IDLE_MINUTES: u64 = 10;
 
@@ -26,7 +30,10 @@ pub struct Settings {
     pub profile: String,
     /// Agents that get the router skill in their own skills folder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub router: Vec<Provider>,
+    pub router: Vec<Agent>,
+    /// Additional provider config directories, each served as its own agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_agents: Vec<CustomAgent>,
     /// Plugin marketplaces to browse, as GitHub `owner/repo`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub marketplaces: Vec<String>,
@@ -103,13 +110,21 @@ impl Settings {
             .filter_map(|p| serde_json::from_value::<Profile>(p.clone()).ok())
             .filter(|p| !p.name.trim().is_empty())
             .collect();
+        let custom_agents: Vec<CustomAgent> = json["customAgents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| serde_json::from_value::<CustomAgent>(a.clone()).ok())
+            .collect();
         json["profiles"] = Value::Array(Vec::new());
+        json["customAgents"] = Value::Array(Vec::new());
         let mut settings: Settings = serde_json::from_value(json.clone()).unwrap_or_else(|_| {
             let other = json.as_object().cloned().unwrap_or_default();
             Settings {
                 profiles: Vec::new(),
                 profile: String::new(),
                 router: Vec::new(),
+                custom_agents: Vec::new(),
                 marketplaces: Vec::new(),
                 idle_minutes: DEFAULT_IDLE_MINUTES,
                 session_idle_minutes: DEFAULT_SESSION_IDLE_MINUTES,
@@ -118,6 +133,7 @@ impl Settings {
             }
         });
         settings.profiles = profiles;
+        settings.custom_agents = custom_agents;
         settings.normalize();
         settings
     }
@@ -132,10 +148,21 @@ impl Settings {
                 .profiles
                 .insert(0, Profile::new(DEFAULT_PROFILE, Vec::new())),
         }
+        let mut seen_ids = HashSet::new();
+        self.custom_agents.retain(|a| {
+            valid_custom_agent_id(&a.id)
+                && !a.name.trim().is_empty()
+                && !a.dir.as_os_str().is_empty()
+                && seen_ids.insert(a.id.clone())
+        });
+        let known = self.known_agents();
+        self.router
+            .retain(|a| *a != Agent::Other && known.contains(a));
         for profile in &mut self.profiles {
-            profile.agents = Agent::ALL
-                .into_iter()
+            profile.agents = known
+                .iter()
                 .filter(|a| profile.agents.contains(a))
+                .cloned()
                 .collect();
         }
         if self.position(&self.profile).is_none() {
@@ -172,6 +199,197 @@ impl Settings {
 
     pub fn set(&mut self, key: &str, value: impl Into<Value>) {
         self.other.insert(key.to_owned(), value.into());
+    }
+
+    /// Every agent known to this configuration, in display order: built-in providers, then
+    /// configured alternative config paths, then `Other`.
+    pub fn known_agents(&self) -> Vec<Agent> {
+        let mut agents: Vec<Agent> = Provider::ALL.into_iter().map(Agent::from).collect();
+        agents.extend(
+            self.custom_agents
+                .iter()
+                .map(|a| Agent::Custom(a.id.clone())),
+        );
+        agents.push(Agent::Other);
+        agents
+    }
+
+    /// Every provider target: the built-in providers, then any configured alternative paths.
+    pub fn targets(&self, env: &Env) -> Vec<Target> {
+        let mut targets: Vec<Target> = Provider::ALL
+            .into_iter()
+            .map(|p| Target::builtin(env, p))
+            .collect();
+        targets.extend(self.custom_agents.iter().map(|c| Target::custom(env, c)));
+        targets
+    }
+
+    /// Every target that supports Claude-format native plugins.
+    pub fn native_targets(&self, env: &Env) -> Vec<Target> {
+        self.targets(env)
+            .into_iter()
+            .filter(|t| t.provider.supports_native())
+            .collect()
+    }
+
+    /// The provider target for `agent`, if it is a built-in provider or configured alternative.
+    pub fn target(&self, env: &Env, agent: &Agent) -> Option<Target> {
+        if let Some(provider) = agent.provider() {
+            return Some(Target::builtin(env, provider));
+        }
+        if let Agent::Custom(id) = agent {
+            return self
+                .custom_agents
+                .iter()
+                .find(|c| c.id == *id)
+                .map(|c| Target::custom(env, c));
+        }
+        None
+    }
+
+    /// Short display label for `agent` (e.g. "Claude", "Antigravity", "Claude (two)", "Other").
+    pub fn agent_label(&self, agent: &Agent) -> String {
+        if let Agent::Custom(id) = agent
+            && let Some(custom) = self.custom_agents.iter().find(|c| c.id == *id)
+        {
+            return custom.name.clone();
+        }
+        agent.label().to_owned()
+    }
+
+    /// Full display name for `agent` (e.g. "Claude Code", "Claude (two)", "Other MCP clients").
+    pub fn agent_name(&self, agent: &Agent) -> String {
+        if let Agent::Custom(id) = agent
+            && let Some(custom) = self.custom_agents.iter().find(|c| c.id == *id)
+        {
+            return custom.name.clone();
+        }
+        agent.name().to_owned()
+    }
+
+    /// Checks a name and config folder for an alternative provider config path.
+    pub fn check_custom_agent(
+        &self,
+        env: &Env,
+        name: &str,
+        provider: Provider,
+        dir: &str,
+        editing: Option<usize>,
+    ) -> Result<(String, PathBuf)> {
+        let name = name.trim();
+        ensure!(!name.is_empty(), "Give this config path a name.");
+        ensure!(
+            !name.chars().any(char::is_control),
+            "Keep the name to one line."
+        );
+        ensure!(
+            name.chars().count() <= MAX_CUSTOM_AGENT_NAME,
+            "Keep the name to {MAX_CUSTOM_AGENT_NAME} characters."
+        );
+        let lower = name.to_lowercase();
+        let reserved = Agent::BUILTIN.iter().any(|a| {
+            a.label().to_lowercase() == lower
+                || a.name().to_lowercase() == lower
+                || a.key() == lower
+        });
+        ensure!(!reserved, "“{name}” is already used by a built-in agent.");
+        if let Some(ix) = self
+            .custom_agents
+            .iter()
+            .position(|a| a.name.to_lowercase() == lower)
+            && Some(ix) != editing
+        {
+            bail!(
+                "There is an alternative config named “{}” already.",
+                self.custom_agents[ix].name
+            );
+        }
+
+        let dir_str = dir.trim();
+        ensure!(!dir_str.is_empty(), "Enter a config folder path.");
+        ensure!(
+            !dir_str.chars().any(char::is_control),
+            "Keep the folder path to one line."
+        );
+        let raw_dir = PathBuf::from(dir_str);
+        let starts_with_tilde =
+            dir_str == "~" || dir_str.starts_with("~/") || dir_str.starts_with("~\\");
+        ensure!(
+            starts_with_tilde || raw_dir.is_absolute(),
+            "Use an absolute path, or one starting with ~/."
+        );
+        let expanded = env.expand_tilde(&raw_dir);
+        let default_dir = env.expand_tilde(env.provider_dir(provider));
+        ensure!(
+            expanded != default_dir,
+            "{} is already the default folder for {}.",
+            env.tilde(&default_dir),
+            provider.name()
+        );
+        if let Some(ix) = self.custom_agents.iter().position(|a| {
+            a.provider == provider && env.expand_tilde(&a.dir) == expanded
+        }) && Some(ix) != editing
+        {
+            bail!(
+                "“{}” already uses {}.",
+                self.custom_agents[ix].name,
+                env.tilde(&expanded)
+            );
+        }
+        // Keep `~/…` as typed when inside home so settings.json stays portable.
+        let stored_dir: PathBuf = raw_dir.components().collect();
+        Ok((name.to_owned(), stored_dir))
+    }
+
+    /// Adds an alternative provider config path and returns its index in `custom_agents`.
+    pub fn add_custom_agent(
+        &mut self,
+        env: &Env,
+        name: &str,
+        provider: Provider,
+        dir: &str,
+    ) -> Result<usize> {
+        let (name, dir) = self.check_custom_agent(env, name, provider, dir, None)?;
+        let taken: Vec<String> = self.custom_agents.iter().map(|a| a.id.clone()).collect();
+        let id = slug_agent_id(provider, &name, &taken);
+        self.custom_agents.push(CustomAgent {
+            id,
+            name,
+            provider,
+            dir,
+        });
+        Ok(self.custom_agents.len() - 1)
+    }
+
+    /// Updates an existing alternative provider config path in place, keeping its `id`.
+    pub fn update_custom_agent(
+        &mut self,
+        env: &Env,
+        ix: usize,
+        name: &str,
+        provider: Provider,
+        dir: &str,
+    ) -> Result<()> {
+        ensure!(ix < self.custom_agents.len(), "config path not found");
+        let (name, dir) = self.check_custom_agent(env, name, provider, dir, Some(ix))?;
+        self.custom_agents[ix].name = name;
+        self.custom_agents[ix].provider = provider;
+        self.custom_agents[ix].dir = dir;
+        Ok(())
+    }
+
+    /// Removes an alternative provider config path, dropping it from `router` and every profile.
+    pub fn remove_custom_agent(&mut self, ix: usize) -> Option<CustomAgent> {
+        if ix >= self.custom_agents.len() {
+            return None;
+        }
+        let removed = self.custom_agents.remove(ix);
+        let agent = Agent::Custom(removed.id.clone());
+        self.router.retain(|a| a != &agent);
+        for profile in &mut self.profiles {
+            profile.forget_agent(&agent);
+        }
+        Some(removed)
     }
 
     /// The trimmed name, if no other profile than the one at `renaming` has it.
@@ -262,7 +480,7 @@ impl Settings {
 
     /// Every agent some profile serves, in display order.
     pub fn all_agents(&self) -> Vec<Agent> {
-        Agent::ALL
+        self.known_agents()
             .into_iter()
             .filter(|a| self.profiles.iter().any(|p| p.agents.contains(a)))
             .collect()
@@ -301,10 +519,14 @@ mod tests {
     fn loads_the_default_first_and_the_saved_active_one() {
         let settings = Settings::from_json(json!({
             "profiles": [
-                {"name": "Work", "agents": ["other", "claude"]},
+                {"name": "Work", "agents": ["other", "claude-two", "claude", "antigravity"]},
                 {"name": "Default", "agents": ["codex"]},
                 {"name": "  "}
             ],
+            "customAgents": [
+                {"id": "claude-two", "name": "Claude (two)", "provider": "claude", "dir": "~/.claude-two"}
+            ],
+            "router": ["claude", "claude-two", "antigravity"],
             "profile": "Work",
             "theme": "xolkit Dark",
             "github": "token"
@@ -312,7 +534,17 @@ mod tests {
         let names: Vec<_> = settings.profiles.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["Default", "Work"]);
         assert_eq!(settings.active().name, "Work");
-        assert_eq!(settings.active().agents, [Agent::Claude, Agent::Other]);
+        assert_eq!(
+            settings.active().agents,
+            [
+                Agent::Claude,
+                Agent::Antigravity,
+                Agent::Custom("claude-two".into()),
+                Agent::Other
+            ]
+        );
+        assert_eq!(settings.agent_label(&Agent::Custom("claude-two".into())), "Claude (two)");
+        assert_eq!(settings.router.len(), 3);
         assert_eq!(settings.get("theme"), Some("xolkit Dark"));
         assert_eq!(settings.github, GitHubAccess::Token);
         assert_eq!(settings.idle_minutes, DEFAULT_IDLE_MINUTES);
@@ -331,7 +563,7 @@ mod tests {
             .set(Kind::Skill, "s", Agent::Claude, true);
         let ix = settings.add(" Work ").unwrap();
         assert_eq!(settings.profiles[ix].name, "Work");
-        assert!(settings.profiles[ix].switched_on(Kind::Skill, "s", Agent::Claude));
+        assert!(settings.profiles[ix].switched_on(Kind::Skill, "s", &Agent::Claude));
         assert!(settings.add("work").is_err());
         assert!(settings.rename(0, "x").is_err());
         settings.profile = "Work".into();
@@ -343,5 +575,57 @@ mod tests {
         assert_eq!(settings.profiles.len(), 1);
         assert_eq!(settings.free_name("Default"), "Default 2");
         assert_eq!(settings.free_name("New"), "New");
+    }
+
+    #[test]
+    fn validates_and_manages_custom_agents() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::at(home.path());
+        let mut settings = Settings::default();
+        // Cannot replace the default directory or use a built-in name or relative path.
+        assert!(
+            settings
+                .add_custom_agent(&env, "Claude (two)", Provider::Claude, "~/.claude")
+                .is_err()
+        );
+        assert!(
+            settings
+                .add_custom_agent(&env, "Claude", Provider::Claude, "~/.claude-two")
+                .is_err()
+        );
+        assert!(
+            settings
+                .add_custom_agent(&env, "Work", Provider::Claude, "relative/dir")
+                .is_err()
+        );
+        let ix = settings
+            .add_custom_agent(&env, "Claude (two)", Provider::Claude, "~/.claude-two")
+            .unwrap();
+        assert_eq!(settings.custom_agents[ix].id, "claude-two");
+        // Duplicate folder for same provider is rejected.
+        assert!(
+            settings
+                .add_custom_agent(
+                    &env,
+                    "Another",
+                    Provider::Claude,
+                    &home.path().join(".claude-two").display().to_string()
+                )
+                .is_err()
+        );
+        let agent = Agent::Custom("claude-two".into());
+        settings.router.push(agent.clone());
+        settings.active_mut().set_agent(agent.clone(), true);
+        settings.active_mut().set(Kind::Skill, "s", agent.clone(), true);
+        settings
+            .update_custom_agent(&env, ix, "Claude Work", Provider::Claude, "~/.claude-work")
+            .unwrap();
+        assert_eq!(settings.custom_agents[ix].id, "claude-two");
+        assert_eq!(settings.custom_agents[ix].name, "Claude Work");
+        settings.remove_custom_agent(ix).unwrap();
+        assert!(settings.custom_agents.is_empty());
+        assert!(settings.router.is_empty());
+        assert!(!settings.active().serves(&agent));
+        assert!(!settings.active().switched_on(Kind::Skill, "s", &agent));
     }
 }

@@ -14,7 +14,7 @@ use crate::discover::{
 };
 use crate::lock::{Lock, Pin, PluginPin};
 use crate::ops::Gone;
-use crate::{Action, Agent, Env, Kind, Plugin, Profile, Provider, Settings};
+use crate::{Action, Agent, Env, Kind, Plugin, Profile, Provider, Settings, Target};
 
 /// The name of xolkit's local marketplace in the agents.
 pub const MARKETPLACE: &str = "xolkit";
@@ -276,14 +276,19 @@ pub fn update_plugin(
     let old = env.staging_dir().join(format!("{}-old", unique()));
     let mut actions = Vec::new();
     let mut after = lock.clone();
-    for provider in &installed.native {
-        actions.extend(native_uninstall(env, &after, &previous, *provider));
+    for agent in &installed.native {
+        if let Some(target) = settings
+            .target(env, agent)
+            .filter(|t| t.provider.supports_native())
+        {
+            actions.extend(native_uninstall(env, &after, &previous, &target));
+        }
         after
             .plugins
             .get_mut(&plugin.id)
             .unwrap()
             .native
-            .remove(provider);
+            .remove(agent);
     }
     let mut pin = fetched.pin.clone();
     pin.pin.installed_at = installed.pin.installed_at.clone();
@@ -298,38 +303,42 @@ pub fn update_plugin(
             dir: target.clone(),
             ..plugin.clone()
         };
-        let mut providers = installed.native.clone();
-        for provider in Provider::ALL {
+        let mut agents = installed.native.clone();
+        for target in settings.native_targets(env) {
             if settings
                 .active()
-                .is_on(Kind::Plugin, &plugin.id, Agent::from(provider))
+                .is_on(Kind::Plugin, &plugin.id, &target.agent)
             {
-                providers.insert(provider);
+                agents.insert(target.agent);
             }
         }
-        for provider in providers {
+        for agent in agents {
+            let Some(target) = settings
+                .target(env, &agent)
+                .filter(|t| t.provider.supports_native())
+            else {
+                continue;
+            };
             // Record intent before invoking a new provider: a CLI can install successfully
             // and still report failure. Retry and uninstall must own that possible install.
-            if !installed.native.contains(&provider) {
+            if !installed.native.contains(&agent) {
                 actions.push(Action::SetNative {
                     id: plugin.id.clone(),
-                    provider,
+                    agent: agent.clone(),
                     installed: true,
                 });
             }
-            actions.extend(native_install(env, &after, &updated, provider)?);
+            actions.extend(native_install(env, &after, &updated, &target)?);
             after
                 .plugins
                 .get_mut(&plugin.id)
                 .unwrap()
                 .native
-                .insert(provider);
+                .insert(agent.clone());
             actions.push(native_toggle(
                 &updated,
-                provider,
-                settings
-                    .active()
-                    .is_on(Kind::Plugin, &plugin.id, Agent::from(provider)),
+                &target,
+                settings.active().is_on(Kind::Plugin, &plugin.id, &agent),
             ));
         }
     }
@@ -444,10 +453,10 @@ pub fn install_plugin(
         pin.version = plugin.version.clone();
     }
     let mut settings = settings.clone();
-    for &agent in agents {
+    for agent in agents {
         settings
             .active_mut()
-            .set(Kind::Plugin, &plugin.id, agent, true);
+            .set(Kind::Plugin, &plugin.id, agent.clone(), true);
     }
     let mut actions = vec![
         Action::Rename {
@@ -459,7 +468,7 @@ pub fn install_plugin(
             pin: Some(pin),
         },
         Action::SaveSettings {
-            settings: Box::new(settings),
+            settings: Box::new(settings.clone()),
         },
     ];
     if plugin.needs_native() {
@@ -469,13 +478,19 @@ pub fn install_plugin(
         };
         let mut lock = lock.clone();
         lock.plugins.entry(plugin.id.clone()).or_default();
-        for provider in agents.iter().filter_map(|a| a.provider()) {
-            actions.extend(native_install(env, &lock, &installed, provider)?);
+        for agent in agents {
+            let Some(target) = settings
+                .target(env, agent)
+                .filter(|t| t.provider.supports_native())
+            else {
+                continue;
+            };
+            actions.extend(native_install(env, &lock, &installed, &target)?);
             lock.plugins
                 .entry(plugin.id.clone())
                 .or_default()
                 .native
-                .insert(provider);
+                .insert(agent.clone());
         }
     }
     Ok(actions)
@@ -510,14 +525,19 @@ fn native_names(lock: &Lock) -> BTreeSet<String> {
         .collect()
 }
 
-/// Steps that install an installed plugin natively in `provider`: through xolkit's marketplace,
+/// Steps that install an installed plugin natively in `target`: through xolkit's marketplace,
 /// which is added to the agent the first time.
 pub fn native_install(
     env: &Env,
     lock: &Lock,
     plugin: &Plugin,
-    provider: Provider,
+    target: &Target,
 ) -> Result<Vec<Action>> {
+    ensure!(
+        target.provider.supports_native(),
+        "{} does not support native Claude-format plugins",
+        target.name
+    );
     let clash = lock.plugins.iter().any(|(id, pin)| {
         id != &plugin.id
             && !pin.native.is_empty()
@@ -535,7 +555,7 @@ pub fn native_install(
     let added = lock
         .plugins
         .values()
-        .any(|pin| pin.native.contains(&provider));
+        .any(|pin| pin.native.contains(&target.agent));
     let mut actions = Vec::new();
     if lock.native(&plugin.id).is_empty() {
         actions.push(Action::Remove { path: copy.clone() });
@@ -550,11 +570,12 @@ pub fn native_install(
     });
     let dir = marketplace.to_string_lossy().into_owned();
     let run = |args: &[&str]| Action::Run {
-        provider,
+        provider: target.provider,
         args: args.iter().map(|a| (*a).to_owned()).collect(),
+        dir: target.custom_dir.clone(),
     };
     let id = native_id(plugin);
-    match provider {
+    match target.provider {
         Provider::Claude => {
             actions.push(if added {
                 run(&["plugin", "marketplace", "update", MARKETPLACE])
@@ -569,21 +590,31 @@ pub fn native_install(
             }
             actions.push(run(&["plugin", "add", &id]));
         }
+        Provider::Antigravity => unreachable!(),
     }
     actions.push(Action::SetNative {
         id: plugin.id.clone(),
-        provider,
+        agent: target.agent.clone(),
         installed: true,
     });
     Ok(actions)
 }
 
-/// Turns a native plugin on or off in `provider`.
-pub fn native_toggle(plugin: &Plugin, provider: Provider, enabled: bool) -> Action {
+/// Turns a native plugin on or off in `target`.
+pub fn native_toggle(plugin: &Plugin, target: &Target, enabled: bool) -> Action {
     let id = native_id(plugin);
-    match provider {
-        Provider::Claude => Action::SetClaudePlugin { id, enabled },
-        Provider::Codex => Action::SetCodexPlugin { id, enabled },
+    match target.provider {
+        Provider::Claude => Action::SetClaudePlugin {
+            id,
+            enabled,
+            dir: target.custom_dir.clone(),
+        },
+        Provider::Codex => Action::SetCodexPlugin {
+            id,
+            enabled,
+            dir: target.custom_dir.clone(),
+        },
+        Provider::Antigravity => unreachable!("Antigravity has no native plugins"),
     }
 }
 
@@ -591,6 +622,9 @@ pub fn native_toggle(plugin: &Plugin, provider: Provider, enabled: bool) -> Acti
 /// whether it is on: `None` when it isn't installed. Fails when the agent's list can't be read
 /// in full, so a partial answer never passes for "not installed".
 pub(crate) fn native_state(env: &Env, provider: Provider, id: &str) -> Result<Option<bool>> {
+    if !provider.supports_native() {
+        return Ok(None);
+    }
     let args = ["plugin", "list", "--json"].map(String::from);
     let list: Value = serde_json::from_str(&env.run(provider.cli(), &args)?)
         .context("the agent's plugin list isn't valid JSON")?;
@@ -598,6 +632,7 @@ pub(crate) fn native_state(env: &Env, provider: Provider, id: &str) -> Result<Op
         Provider::Claude => (list.as_array(), "id"),
         // Codex lists what it offers under `available`; only `installed` counts.
         Provider::Codex => (list["installed"].as_array(), "pluginId"),
+        Provider::Antigravity => unreachable!(),
     };
     let entries = entries.context("unexpected plugin list from the agent")?;
     // Every entry must say what it is, so a malformed one can't hide the plugin.
@@ -614,6 +649,7 @@ pub(crate) fn native_state(env: &Env, provider: Provider, id: &str) -> Result<Op
                     == "user"
             }
             Provider::Codex => true,
+            Provider::Antigravity => unreachable!(),
         };
         if listed == id && user {
             let on = entry["enabled"]
@@ -625,39 +661,44 @@ pub(crate) fn native_state(env: &Env, provider: Provider, id: &str) -> Result<Op
     Ok(found)
 }
 
-/// Steps that uninstall a native plugin from `provider`, and take xolkit's marketplace out of
+/// Steps that uninstall a native plugin from `target`, and take xolkit's marketplace out of
 /// the agent when it was the last.
-fn native_uninstall(env: &Env, lock: &Lock, plugin: &Plugin, provider: Provider) -> Vec<Action> {
+fn native_uninstall(env: &Env, lock: &Lock, plugin: &Plugin, target: &Target) -> Vec<Action> {
     let id = native_id(plugin);
     let run = |args: &[&str], gone: Gone| Action::Undo {
-        provider,
+        provider: target.provider,
         args: args.iter().map(|a| (*a).to_owned()).collect(),
         gone,
+        dir: target.custom_dir.clone(),
     };
     let gone = || Gone::Plugin { id: id.clone() };
-    let mut actions = match provider {
+    let mut actions = match target.provider {
         Provider::Claude => vec![run(
             &["plugin", "uninstall", &id, "--scope", "user"],
             gone(),
         )],
         Provider::Codex => vec![
             run(&["plugin", "remove", &id], gone()),
-            Action::ForgetCodexHooks { id: id.clone() },
+            Action::ForgetCodexHooks {
+                id: id.clone(),
+                dir: target.custom_dir.clone(),
+            },
         ],
+        Provider::Antigravity => return Vec::new(),
     };
     actions.push(Action::SetNative {
         id: plugin.id.clone(),
-        provider,
+        agent: target.agent.clone(),
         installed: false,
     });
     let mut after = lock.clone();
     if let Some(pin) = after.plugins.get_mut(&plugin.id) {
-        pin.native.remove(&provider);
+        pin.native.remove(&target.agent);
     }
     if !after
         .plugins
         .values()
-        .any(|pin| pin.native.contains(&provider))
+        .any(|pin| pin.native.contains(&target.agent))
     {
         actions.push(run(
             &["plugin", "marketplace", "remove", MARKETPLACE],
@@ -686,10 +727,15 @@ pub fn uninstall_plugin(
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     let mut lock = lock.clone();
-    for provider in lock.native(&plugin.id) {
-        actions.extend(native_uninstall(env, &lock, plugin, provider));
+    for agent in lock.native(&plugin.id) {
+        if let Some(target) = settings
+            .target(env, &agent)
+            .filter(|t| t.provider.supports_native())
+        {
+            actions.extend(native_uninstall(env, &lock, plugin, &target));
+        }
         if let Some(pin) = lock.plugins.get_mut(&plugin.id) {
-            pin.native.remove(&provider);
+            pin.native.remove(&agent);
         }
     }
     let mut settings = settings.clone();
@@ -712,6 +758,8 @@ pub fn uninstall_plugin(
 /// The native plugin toggles a switch from `from` to `to` changes, to show before it runs.
 /// Served plugins need none: the daemon serves the new profile at once.
 pub fn native_changes(
+    env: &Env,
+    settings: &Settings,
     lock: &Lock,
     plugins: &[Plugin],
     from: &Profile,
@@ -719,11 +767,16 @@ pub fn native_changes(
 ) -> Vec<Action> {
     let mut steps = Vec::new();
     for plugin in plugins {
-        for provider in lock.native(&plugin.id) {
-            let agent = Agent::from(provider);
-            let want = to.is_on(Kind::Plugin, &plugin.id, agent);
-            if want != from.is_on(Kind::Plugin, &plugin.id, agent) {
-                steps.push(native_toggle(plugin, provider, want));
+        for agent in lock.native(&plugin.id) {
+            let Some(target) = settings
+                .target(env, &agent)
+                .filter(|t| t.provider.supports_native())
+            else {
+                continue;
+            };
+            let want = to.is_on(Kind::Plugin, &plugin.id, &agent);
+            if want != from.is_on(Kind::Plugin, &plugin.id, &agent) {
+                steps.push(native_toggle(plugin, &target, want));
             }
         }
     }
@@ -732,12 +785,24 @@ pub fn native_changes(
 
 /// Steps that set every native plugin as `to` has it, changed or not: the toggles are
 /// idempotent, so a switch that failed halfway is set right by the next.
-pub fn native_steps(lock: &Lock, plugins: &[Plugin], to: &Profile) -> Vec<Action> {
+pub fn native_steps(
+    env: &Env,
+    settings: &Settings,
+    lock: &Lock,
+    plugins: &[Plugin],
+    to: &Profile,
+) -> Vec<Action> {
     let mut steps = Vec::new();
     for plugin in plugins {
-        for provider in lock.native(&plugin.id) {
-            let want = to.is_on(Kind::Plugin, &plugin.id, Agent::from(provider));
-            steps.push(native_toggle(plugin, provider, want));
+        for agent in lock.native(&plugin.id) {
+            let Some(target) = settings
+                .target(env, &agent)
+                .filter(|t| t.provider.supports_native())
+            else {
+                continue;
+            };
+            let want = to.is_on(Kind::Plugin, &plugin.id, &agent);
+            steps.push(native_toggle(plugin, &target, want));
         }
     }
     steps
@@ -805,7 +870,7 @@ mod tests {
         flattened(actions)
             .iter()
             .filter_map(|a| match a {
-                Action::Run { provider, args } | Action::Undo { provider, args, .. } => {
+                Action::Run { provider, args, .. } | Action::Undo { provider, args, .. } => {
                     Some(format!("{} {}", provider.cli(), args.join(" ")))
                 }
                 _ => None,
@@ -876,7 +941,7 @@ mod tests {
         lock.plugins.insert(
             "p@m".into(),
             PluginPin {
-                native: BTreeSet::from(Provider::ALL),
+                native: BTreeSet::from([Agent::Claude, Agent::Codex]),
                 ..PluginPin::default()
             },
         );
@@ -897,11 +962,13 @@ mod tests {
         }
         assert!(flattened(&actions).contains(&Action::SetClaudePlugin {
             id: "p@xolkit".into(),
-            enabled: true
+            enabled: true,
+            dir: None,
         }));
         assert!(flattened(&actions).contains(&Action::SetCodexPlugin {
             id: "p@xolkit".into(),
-            enabled: false
+            enabled: false,
+            dir: None,
         }));
         assert_eq!(
             flattened(&actions)
@@ -921,7 +988,7 @@ mod tests {
         lock.plugins.insert(
             "p@m".into(),
             PluginPin {
-                native: BTreeSet::from([Provider::Claude]),
+                native: BTreeSet::from([Agent::Claude]),
                 ..PluginPin::default()
             },
         );
@@ -944,11 +1011,12 @@ mod tests {
     #[test]
     fn failed_native_refresh_keeps_old_pin_and_all_providers_for_retry() {
         use std::os::unix::fs::PermissionsExt;
+        let both = || BTreeSet::from([Agent::Claude, Agent::Codex]);
         for (original_native, failing_provider, failing_verb) in [
-            (BTreeSet::from(Provider::ALL), "codex", "remove"),
-            (BTreeSet::from(Provider::ALL), "claude", "install"),
+            (both(), "codex", "remove"),
+            (both(), "claude", "install"),
             (BTreeSet::new(), "codex", "add"),
-            (BTreeSet::from([Provider::Claude]), "codex", "add"),
+            (BTreeSet::from([Agent::Claude]), "codex", "add"),
         ] {
             let home = tempfile::tempdir().unwrap();
             let mut env = Env::at(home.path());
@@ -977,7 +1045,7 @@ mod tests {
             settings
                 .active_mut()
                 .set(Kind::Plugin, "p@m", Agent::Claude, true);
-            let codex_on = !original_native.contains(&Provider::Codex);
+            let codex_on = !original_native.contains(&Agent::Codex);
             settings.active_mut().set_agent(Agent::Codex, true);
             settings
                 .active_mut()
@@ -1000,10 +1068,7 @@ mod tests {
             assert!(crate::execute(&env, &actions).is_err());
             let interrupted = Lock::read(&env.lock_file()).unwrap();
             assert_eq!(interrupted.plugins["p@m"].pin.tree, "old-tree");
-            assert_eq!(
-                interrupted.plugins["p@m"].native,
-                BTreeSet::from(Provider::ALL)
-            );
+            assert_eq!(interrupted.plugins["p@m"].native, both());
             let current = Plugin::read(&env.plugins_dir().join("p@m")).unwrap();
             let cleanup = uninstall_plugin(&env, &settings, &interrupted, &current);
             assert!(
@@ -1033,7 +1098,7 @@ mod tests {
             }
             crate::execute(&env, &retry).unwrap();
             let updated = Lock::read(&env.lock_file()).unwrap();
-            assert_eq!(updated.plugins["p@m"].native, BTreeSet::from(Provider::ALL));
+            assert_eq!(updated.plugins["p@m"].native, both());
             assert_eq!(updated.plugins["p@m"].pin.tree, "new-tree");
             let codex = crate::config::read_toml(&env.codex_config()).unwrap();
             assert_eq!(
@@ -1113,7 +1178,11 @@ mod tests {
         let env = Env::at(home.path());
         let plugin = installed(&env, true);
         let lock = Lock::default();
-        let claude = native_install(&env, &lock, &plugin, Provider::Claude).unwrap();
+        let claude_target = Target::builtin(&env, Provider::Claude);
+        let codex_target = Target::builtin(&env, Provider::Codex);
+        let ag_target = Target::builtin(&env, Provider::Antigravity);
+        assert!(native_install(&env, &lock, &plugin, &ag_target).is_err());
+        let claude = native_install(&env, &lock, &plugin, &claude_target).unwrap();
         let dir = env.marketplace_dir().to_string_lossy().into_owned();
         assert_eq!(
             runs(&claude),
@@ -1141,10 +1210,10 @@ mod tests {
                 .is_file()
         );
         let lock = Lock::read(&env.lock_file()).unwrap();
-        assert!(lock.native("p@m").contains(&Provider::Claude));
+        assert!(lock.native("p@m").contains(&Agent::Claude));
 
         // A second agent reuses the copy.
-        let codex = native_install(&env, &lock, &plugin, Provider::Codex).unwrap();
+        let codex = native_install(&env, &lock, &plugin, &codex_target).unwrap();
         assert!(!codex.iter().any(|a| matches!(a, Action::Copy { .. })));
         assert_eq!(
             runs(&codex),
@@ -1164,7 +1233,7 @@ mod tests {
         lock.plugins.insert(
             "p@m".into(),
             PluginPin {
-                native: BTreeSet::from([Provider::Claude]),
+                native: BTreeSet::from([Agent::Claude]),
                 ..PluginPin::default()
             },
         );
@@ -1194,11 +1263,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let env = Env::at(home.path());
         let plugin = installed(&env, true);
+        let settings = Settings::default();
         let mut lock = Lock::default();
         lock.plugins.insert(
             "p@m".into(),
             PluginPin {
-                native: BTreeSet::from([Provider::Codex]),
+                native: BTreeSet::from([Agent::Codex]),
                 ..PluginPin::default()
             },
         );
@@ -1207,15 +1277,33 @@ mod tests {
         on.set(Kind::Plugin, "p@m", Agent::Claude, true);
         let off = Profile::new("off", vec![Agent::Claude, Agent::Codex]);
         assert_eq!(
-            native_changes(&lock, std::slice::from_ref(&plugin), &on, &off),
+            native_changes(
+                &env,
+                &settings,
+                &lock,
+                std::slice::from_ref(&plugin),
+                &on,
+                &off
+            ),
             [Action::SetCodexPlugin {
                 id: "p@xolkit".into(),
-                enabled: false
+                enabled: false,
+                dir: None,
             }]
         );
-        assert!(native_changes(&lock, std::slice::from_ref(&plugin), &on, &on).is_empty());
+        assert!(
+            native_changes(
+                &env,
+                &settings,
+                &lock,
+                std::slice::from_ref(&plugin),
+                &on,
+                &on
+            )
+            .is_empty()
+        );
         // Setting a profile sets every native plugin, so a half-done switch is set right.
-        assert_eq!(native_steps(&lock, &[plugin], &on).len(), 1);
+        assert_eq!(native_steps(&env, &settings, &lock, &[plugin], &on).len(), 1);
     }
 
     #[test]

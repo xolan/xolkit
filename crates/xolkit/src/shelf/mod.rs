@@ -33,8 +33,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use xolkit_core::{
-    Action as Step, Agent, Env, FetchedPlugin, FetchedSkill, Kind, Library, Offer, Provider,
-    Registration, Settings, SkillHit, clean_old_exe, clean_staging, native_toggle, registration,
+    Action as Step, Agent, Env, FetchedPlugin, FetchedSkill, Kind, Library, Offer, Registration,
+    Settings, SkillHit, clean_old_exe, clean_staging, native_toggle, registration,
     strip_frontmatter,
 };
 use xolkit_daemon::{Request, Status};
@@ -131,10 +131,10 @@ pub struct Shelf {
     page: Page,
     /// Everything in `~/.xolkit`, as last read.
     library: Library,
-    /// How xolkit is registered with each agent.
-    registrations: BTreeMap<Provider, Registration>,
-    /// Where each agent installed on this computer shows it is.
-    found: BTreeMap<Provider, PathBuf>,
+    /// How xolkit is registered with each built-in or custom target.
+    registrations: BTreeMap<Agent, Registration>,
+    /// Where each built-in or custom target installed on this computer shows it is.
+    found: BTreeMap<Agent, PathBuf>,
     load_error: Option<SharedString>,
     loading: bool,
     busy: bool,
@@ -175,6 +175,9 @@ pub struct Shelf {
     import_input: Entity<TextareaState>,
     /// Where a marketplace repository is typed on Discover → Plugins.
     marketplace_input: Entity<InputState>,
+    /// Fields of the add/edit alternative config path dialog in Settings.
+    custom_agent_name: Entity<InputState>,
+    custom_agent_dir: Entity<InputState>,
     server_form: servers::ServerInputs,
     has_token: bool,
     /// The result of the last GitHub access check, e.g. the hourly request limit.
@@ -207,6 +210,10 @@ impl Shelf {
         });
         let marketplace_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("owner/repository"));
+        let custom_agent_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Claude (work)"));
+        let custom_agent_dir =
+            cx.new(|cx| InputState::new(window, cx).placeholder("~/.claude-work"));
         let subscription = cx.subscribe(&filter, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.list_scroll.set_offset(Point::default());
@@ -255,6 +262,8 @@ impl Shelf {
             profile_name,
             import_input,
             marketplace_input,
+            custom_agent_name,
+            custom_agent_dir,
             server_form: servers::ServerInputs::new(window, cx),
             has_token: false,
             access_status: None,
@@ -305,13 +314,14 @@ impl Shelf {
                         clean_staging(&env);
                     }
                     let library = Library::load(&env)?;
-                    let found = Provider::ALL
-                        .into_iter()
-                        .filter_map(|p| Some((p, env.locate(p)?)))
+                    let targets = library.settings.targets(&env);
+                    let found = targets
+                        .iter()
+                        .filter_map(|t| Some((t.agent.clone(), env.locate_target(t)?)))
                         .collect();
-                    let registrations = Provider::ALL
-                        .into_iter()
-                        .map(|p| (p, registration(&env, p, &exe)))
+                    let registrations = targets
+                        .iter()
+                        .map(|t| (t.agent.clone(), registration(&env, t, &exe)))
                         .collect();
                     anyhow::Ok((library, found, registrations))
                 })
@@ -448,13 +458,16 @@ impl Shelf {
     ) {
         let mut settings = self.settings().clone();
         let mut extra = Vec::new();
-        for &agent in agents {
-            settings.active_mut().set(kind, name, agent, on);
+        for agent in agents {
+            settings.active_mut().set(kind, name, agent.clone(), on);
             if kind == Kind::Plugin
-                && let (Some(provider), Some(plugin)) = (agent.provider(), self.plugin(name))
-                && self.library.lock.native(name).contains(&provider)
+                && let Some(plugin) = self.plugin(name)
+                && self.library.lock.native(name).contains(agent)
+                && let Some(target) = settings
+                    .target(&self.env, agent)
+                    .filter(|t| t.provider.supports_native())
             {
-                extra.push(native_toggle(plugin, provider, on));
+                extra.push(native_toggle(plugin, &target, on));
             }
         }
         self.save_settings(settings, extra, None, window, cx);
@@ -794,10 +807,10 @@ impl Shelf {
 
     /// Column titles for the agents the profile serves, after an "All" column when there are
     /// several.
-    fn agent_columns(&self) -> Vec<&'static str> {
-        let all = (self.agents().len() > 1).then_some("All");
+    fn agent_columns(&self) -> Vec<String> {
+        let all = (self.agents().len() > 1).then(|| "All".to_owned());
         all.into_iter()
-            .chain(self.agents().iter().map(|a| a.label()))
+            .chain(self.agents().iter().map(|a| self.settings().agent_label(a)))
             .collect()
     }
 
@@ -813,7 +826,7 @@ impl Shelf {
         let profile = self.settings().active();
         let mut switches = Vec::new();
         if agents.len() > 1 {
-            let all_on = agents.iter().all(|&a| profile.switched_on(kind, name, a));
+            let all_on = agents.iter().all(|a| profile.switched_on(kind, name, a));
             let (name, agents) = (name.to_owned(), agents.clone());
             switches.push(self.switch(
                 format!("{kind:?}-all-{name}"),
@@ -827,13 +840,14 @@ impl Shelf {
         }
         for agent in agents {
             let name = name.to_owned();
+            let label = self.settings().agent_label(&agent);
             switches.push(self.switch(
                 format!("{kind:?}-{}-{name}", agent.key()),
-                profile.switched_on(kind, &name, agent),
+                profile.switched_on(kind, &name, &agent),
                 locked,
-                agent.label(),
+                label,
                 cx.listener(move |this, on: &bool, window, cx| {
-                    this.set_item(kind, &name, &[agent], *on, window, cx)
+                    this.set_item(kind, &name, std::slice::from_ref(&agent), *on, window, cx)
                 }),
             ));
         }
@@ -869,7 +883,7 @@ impl Shelf {
     }
 
     /// Column titles over the per-row controls.
-    fn column_header(&self, columns: &[&'static str], cx: &mut Context<Self>) -> impl IntoElement {
+    fn column_header(&self, columns: &[impl AsRef<str>], cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .px_4()
             .py_1()
@@ -879,11 +893,13 @@ impl Shelf {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(div().flex_1().child("Name"))
-            .children(
-                columns
-                    .iter()
-                    .map(|label| div().w(px(COLUMN)).text_center().child(*label)),
-            )
+            .children(columns.iter().map(|label| {
+                div()
+                    .w(px(COLUMN))
+                    .text_center()
+                    .truncate()
+                    .child(label.as_ref().to_owned())
+            }))
     }
 
     fn switch(
@@ -891,7 +907,7 @@ impl Shelf {
         id: String,
         checked: bool,
         disabled: bool,
-        label: &'static str,
+        label: impl Into<SharedString>,
         on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
         cell()
@@ -1103,7 +1119,7 @@ impl Render for Shelf {
 }
 
 /// Width of a control column on the right of a row.
-const COLUMN: f32 = 64.;
+const COLUMN: f32 = 76.;
 
 fn cell() -> Div {
     div().w(px(COLUMN)).flex().justify_center()
