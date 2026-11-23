@@ -326,9 +326,11 @@ impl Settings {
             env.tilde(&default_dir),
             provider.name()
         );
-        if let Some(ix) = self.custom_agents.iter().position(|a| {
-            a.provider == provider && env.expand_tilde(&a.dir) == expanded
-        }) && Some(ix) != editing
+        if let Some(ix) = self
+            .custom_agents
+            .iter()
+            .position(|a| a.provider == provider && env.expand_tilde(&a.dir) == expanded)
+            && Some(ix) != editing
         {
             bail!(
                 "“{}” already uses {}.",
@@ -543,7 +545,10 @@ mod tests {
                 Agent::Other
             ]
         );
-        assert_eq!(settings.agent_label(&Agent::Custom("claude-two".into())), "Claude (two)");
+        assert_eq!(
+            settings.agent_label(&Agent::Custom("claude-two".into())),
+            "Claude (two)"
+        );
         assert_eq!(settings.router.len(), 3);
         assert_eq!(settings.get("theme"), Some("xolkit Dark"));
         assert_eq!(settings.github, GitHubAccess::Token);
@@ -616,7 +621,9 @@ mod tests {
         let agent = Agent::Custom("claude-two".into());
         settings.router.push(agent.clone());
         settings.active_mut().set_agent(agent.clone(), true);
-        settings.active_mut().set(Kind::Skill, "s", agent.clone(), true);
+        settings
+            .active_mut()
+            .set(Kind::Skill, "s", agent.clone(), true);
         settings
             .update_custom_agent(&env, ix, "Claude Work", Provider::Claude, "~/.claude-work")
             .unwrap();

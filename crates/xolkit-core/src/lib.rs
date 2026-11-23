@@ -199,8 +199,7 @@ pub fn valid_custom_agent_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 32
         && !matches!(id, "claude" | "codex" | "antigravity" | "other")
-        && id.as_bytes()[0].is_ascii_lowercase()
-            | id.as_bytes()[0].is_ascii_digit()
+        && id.as_bytes()[0].is_ascii_lowercase() | id.as_bytes()[0].is_ascii_digit()
         && id
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')

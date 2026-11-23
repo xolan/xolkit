@@ -791,7 +791,11 @@ impl Shelf {
                     Some(target) => match self.found.get(&agent) {
                         Some(place) => format!("Found at {}", self.env.tilde(place)),
                         None if target.custom_dir.is_some() => {
-                            format!("{} · {} (folder not created yet)", target.provider.name(), self.env.tilde(&target.dir))
+                            format!(
+                                "{} · {} (folder not created yet)",
+                                target.provider.name(),
+                                self.env.tilde(&target.dir)
+                            )
                         }
                         None => "Not found on this computer".to_owned(),
                     },
@@ -807,16 +811,18 @@ impl Shelf {
                         )))
                         .checked(on)
                         .disabled(self.busy)
-                        .on_change(cx.listener(move |this, on: &bool, window, cx| {
-                            let agent = agent.clone();
-                            let order = order.clone();
-                            this.edit_profile(
-                                ix,
-                                move |p| p.set_agent_in_order(agent, *on, &order),
-                                window,
-                                cx,
-                            )
-                        })),
+                        .on_change(cx.listener(
+                            move |this, on: &bool, window, cx| {
+                                let agent = agent.clone();
+                                let order = order.clone();
+                                this.edit_profile(
+                                    ix,
+                                    move |p| p.set_agent_in_order(agent, *on, &order),
+                                    window,
+                                    cx,
+                                )
+                            },
+                        )),
                     )
                     .child(
                         v_flex()

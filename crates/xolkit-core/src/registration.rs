@@ -59,14 +59,11 @@ pub fn registration(env: &Env, target: &Target, exe: &Path) -> Registration {
         Provider::Codex => read_toml(&target_env.codex_config()).ok().and_then(|doc| {
             let server = doc.get("mcp_servers")?.get(XOLKIT)?;
             let command = server.get("command")?.as_str()?.to_owned();
-            let args = server
-                .get("args")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|item| item.as_str().map(str::to_owned))
-                        .collect()
-                });
+            let args = server.get("args").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect()
+            });
             Some((command, args))
         }),
         Provider::Antigravity => read_json(&target_env.antigravity_mcp_config())
@@ -76,7 +73,9 @@ pub fn registration(env: &Env, target: &Target, exe: &Path) -> Registration {
     match entry {
         None => Registration::Missing,
         Some((command, _)) if Path::new(&command) != exe => Registration::Other(command),
-        Some((command, Some(args))) if !args.is_empty() && !args_match_agent(&args, &target.agent) => {
+        Some((command, Some(args)))
+            if !args.is_empty() && !args_match_agent(&args, &target.agent) =>
+        {
             Registration::Other(format!("{command} {}", args.join(" ")))
         }
         Some(_) => Registration::Current,
